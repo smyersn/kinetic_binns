@@ -1,0 +1,1 @@
+Diffusion coeffs = tensor([1.4806e-09, 1.8188e-04], device='cuda:0', grad_fn=<WhereBackward0>)

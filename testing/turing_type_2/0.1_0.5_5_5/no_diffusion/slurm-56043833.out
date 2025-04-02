@@ -1,0 +1,4 @@
+  File "/work/users/s/m/smyersn/elston/projects/kinetics_binns/modules/analysis/analysis.py", line 57
+    diff_coeffs=params[:2]
+                ^^^^^^^^^^
+SyntaxError: invalid syntax. Perhaps you forgot a comma?

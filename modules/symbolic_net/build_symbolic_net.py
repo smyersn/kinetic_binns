@@ -9,7 +9,7 @@ from modules.activations.softplus_relu import softplus_relu
 from modules.utils.numpy_torch_conversion import to_torch
 from modules.symbolic_net.individual import individual
 from modules.symbolic_net.custom_norm import custom_norm
-from modules.genetic_algorithm.custom_deap_functions import (
+from modules.genetic_algorithm.genetic_algorithm_base.custom_deap_functions import (
     calculate_poly_terms, calculate_hill_terms)
 
 
@@ -54,34 +54,35 @@ class symbolic_net(nn.Module):
         self.edges = edges
         self.density_weight = density_weight
         
+        self.device = device
+        
         # K and n in Hill functions shouldn't be negative
         self.param_min = torch.cat((torch.full((len(self.poly_terms),), -param_bounds),
                                torch.full((2 * len(self.hill_terms),), -param_bounds),
                                torch.full((2 * len(self.hill_terms),), 0),
                                torch.full((2 * len(self.hill_terms),), 0)), 
-                             dim=0).to(device)
+                             dim=0).to(self.device)
         
         # n in Hill function shouldn't exceed 5
         self.param_max = torch.cat((torch.full((len(self.poly_terms),), param_bounds),
                                torch.full((2 * len(self.hill_terms),), param_bounds),
                                torch.full((2 * len(self.hill_terms),), param_bounds),
                                torch.full((2 * len(self.hill_terms),), 5)), 
-                             dim=0).to(device)
+                             dim=0).to(self.device)
     
-        random_vals = torch.rand(self.num_params).to(device)
+        random_vals = torch.rand(self.num_params).to(self.device)
 
-        self.params = nn.Parameter(self.param_min + (self.param_max - self.param_min) * random_vals).to(device)
+        self.params = nn.Parameter(self.param_min + (self.param_max - self.param_min) * random_vals).to(self.device)
         self.individual = individual(self.params, self.species, self.degree)
         
     def forward(self, input):
-        self.individual = individual(self.params, self.species, self.degree,
-                                     self.hist, self.edges)
+        self.individual = individual(self.params, self.species, self.degree)
 
         output = self.individual.predict_f(input)
 
         return output
     
-    def loss(self, x_true, pred, true):
+    def loss(self, x, pred, true):
         self.MSE_loss = 0
         self.F_loss = 0
         self.param_loss = 0
@@ -92,7 +93,6 @@ class symbolic_net(nn.Module):
         self.squared_error = (pred - true.view(-1))**2
         
         # F loss and param loss
-        
         self.F_loss += self.F_weight * torch.relu(self.F_min - pred)**2
         self.F_loss += self.F_weight * torch.relu(pred - self.F_max)**2
         
@@ -105,8 +105,8 @@ class symbolic_net(nn.Module):
             self.l1reg_loss += self.l1_reg * l1_norm
                                 
         if self.density_weight != 0:
-            density = calc_density(x_true, self.hist, self.edges)
-            self.squared_error *= (density * self.density_weight)
+            density = calc_density(x, self.hist, self.edges)
+            self.squared_error *= (density.to(self.device) * self.density_weight)
             
         total_loss = (torch.mean(self.squared_error) + self.l1reg_loss + torch.mean(self.F_loss) + torch.mean(self.param_loss))
 

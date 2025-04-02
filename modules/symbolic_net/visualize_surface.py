@@ -5,8 +5,6 @@ sys.path.append(repo_start)
 
 from modules.utils.imports import *
 from modules.utils.numpy_torch_conversion import *
-from modules.generate_data.simulate_system import reaction
-from modules.loaders.format_data import format_data_general
     
 def visualize_surface(model_dir, u_triangle_mesh, v_triangle_mesh, F_true,
                       F_mlp, filename=None):
@@ -64,8 +62,8 @@ def visualize_surface(model_dir, u_triangle_mesh, v_triangle_mesh, F_true,
         camera=dict(eye=dict(x=1, y=-2.5, z=1)),),
                     
         scene2=dict(
-        xaxis_title='[A] (uM)',
-        yaxis_title='[B] (uM)',
+        xaxis_title='[u] (uM)',
+        yaxis_title='[v] (uM)',
         zaxis_title='F*',
         xaxis = dict(
             tick0 = 0,
@@ -87,7 +85,5 @@ def visualize_surface(model_dir, u_triangle_mesh, v_triangle_mesh, F_true,
 
     fig.show()
     
-    if filename is not None:
+    if filename:
         fig.write_image(f'{model_dir}/{filename}.png')
-    else:
-        fig.write_image(f'{model_dir}/f_mlp_surface.png')

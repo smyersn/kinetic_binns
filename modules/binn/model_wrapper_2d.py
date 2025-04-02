@@ -151,6 +151,7 @@ class model_wrapper():
                
         # loop over epochs
         for epoch in range(initial_epoch, initial_epoch + epochs):
+            # print('training')
             #
             # training step
             #
@@ -319,6 +320,7 @@ class model_wrapper():
             # validation step
             #
             if validation_data is not None:
+                # print('validation')
                 
                 self.train = False
                 self.val = True
@@ -333,7 +335,10 @@ class model_wrapper():
                 
                 # loop over validation batches
                 for idx in range(val_batches_per_epoch):
-                    # print(f'val: {idx}')
+                    # print('start of val loop:', flush=True)
+                    # print(torch.cuda.memory_summary(abbreviated=True), flush=True)
+
+                    self.optimizer.zero_grad()
                     # callback at beginning of batch
                     if callbacks is not None:
                         for c in callbacks:
@@ -343,7 +348,7 @@ class model_wrapper():
                     # stop loop if validation_steps exceeded
                     if validation_steps is not None:
                         if idx >= validation_steps:
-                            break
+                            break                  
                     
                     # extract input and output batches
                     start = idx * val_batch_size
@@ -352,6 +357,8 @@ class model_wrapper():
                         stop = -1
                     x_true = x_val[start:stop].data.clone()
                     y_true = y_val[start:stop].data.clone()
+                    # print('after setting batch:', flush=True)
+                    # print(torch.cuda.memory_summary(abbreviated=True), flush=True)
                     
                     # require gradients
                     x_true.requires_grad = True
@@ -361,7 +368,9 @@ class model_wrapper():
                         x_true, y_true = self.augmentation(x_true, y_true)
                     
                     # run the model
-                    y_pred = self.model(x_true)
+                    y_pred = self.model(x_true).data
+                    # print('after making precition:', flush=True)
+                    # print(torch.cuda.memory_summary(abbreviated=True), flush=True)
                     
                     # comptue loss
                     val_loss, val_gls_loss, val_pde_loss = self.loss(y_pred, y_true, density_weight, hist, edges)
@@ -390,6 +399,10 @@ class model_wrapper():
                             if c.on_batch_end:
                                 c(self)
 
+                    # print('after calculating loss:', flush=True)
+                    # print(torch.cuda.memory_summary(abbreviated=True), flush=True)
+
+    
                 # update book keeping for this epoch
                 self.val_loss = self.val_loss.cpu().detach().numpy()
                 self.val_gls_loss = self.val_gls_loss.cpu().detach().numpy()

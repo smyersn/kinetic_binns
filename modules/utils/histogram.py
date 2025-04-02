@@ -36,6 +36,6 @@ def calc_density(uv, hist, edges):
     y_bin_indices = torch.clamp(y_bin_indices, 0, hist.shape[0] - 1)
 
     # Step 2: Gather densities from the histogram using the bin indices
-    density = hist[y_bin_indices, x_bin_indices]
+    density = hist[y_bin_indices.to('cpu'), x_bin_indices.to('cpu')]
                 
     return density

@@ -9,7 +9,7 @@ from modules.symbolic_net.model_wrapper import model_wrapper
 from modules.symbolic_net.build_symbolic_net import symbolic_net
 from modules.utils.training_test_split import training_test_split
 from modules.analysis.generate_loss_curves import generate_loss_curves
-from modules.generate_data.simulate_system import reaction
+from modules.generate_data.simulate_system import wave_pinning_reaction
 from modules.symbolic_net.write_terms import write_terms
 from modules.symbolic_net.visualize_surface import visualize_surface
 from modules.symbolic_net.individual import individual
@@ -141,8 +141,10 @@ for child_dir in child_dirs:
         predicted_vals = ind.predict_f(torch.from_numpy(training_data[:, :-1]))
         
         # Calculate AIC
+        # aic, bic = ind.abic(uv, true_vals, predicted_vals, 
+        #                     density_weight, hist, edges)
         aic, bic = ind.abic(uv, true_vals, predicted_vals, 
-                            density_weight, hist, edges)
+                            0, None, None)
         
         individuals.append((child_dir, ind.params, aic, bic))
 

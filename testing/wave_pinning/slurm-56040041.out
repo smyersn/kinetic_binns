@@ -1,0 +1,10 @@
+Traceback (most recent call last):
+  File "/work/users/s/m/smyersn/elston/projects/kinetics_binns/modules/analysis/analysis.py", line 73, in <module>
+    visualize_surface(model, dimensions, species, reaction, params, dir_name, training_data_path)
+  File "/work/users/s/m/smyersn/elston/projects/kinetics_binns/modules/analysis/../../modules/analysis/visualize_surface.py", line 21, in visualize_surface
+    F_true = reaction(u_triangle_mesh, v_triangle_mesh, params[2:])
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/users/s/m/smyersn/elston/projects/kinetics_binns/modules/analysis/../../modules/generate_data/simulate_system.py", line 40, in wave_pinning
+    a, b, k = params
+    ^^^^^^^
+ValueError: not enough values to unpack (expected 3, got 2)

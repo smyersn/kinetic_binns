@@ -5,7 +5,7 @@ sys.path.append(repo_start)
 
 from modules.utils.imports import *
 from modules.utils.histogram import calc_density
-from modules.genetic_algorithm.custom_deap_functions import (
+from modules.genetic_algorithm.genetic_algorithm_base.custom_deap_functions import (
     calculate_poly_terms, calculate_hill_terms)
 
 np.set_printoptions(threshold=sys.maxsize)
@@ -166,8 +166,8 @@ class individual():
         
         if density_weight != 0:
             density = calc_density(uv, hist, edges)
-            print(density_weight)
-            print(torch.cat((uv, density.unsqueeze(-1)), dim=1)[:1000, :])
+            # print(density_weight)
+            # print(torch.cat((uv, density.unsqueeze(-1)), dim=1)[:1000, :])
             residuals *= (density * density_weight)
         
         rss = torch.sum(residuals ** 2)

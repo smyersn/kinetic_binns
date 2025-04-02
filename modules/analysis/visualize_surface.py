@@ -5,11 +5,11 @@ sys.path.append(repo_start)
 
 from modules.utils.imports import *
 from modules.utils.numpy_torch_conversion import *
-from modules.binn.build_binns_2d_diffusion import BINN
+from modules.binn.build_binns import BINN
 from modules.loaders.format_data import format_data_general
-from modules.generate_data.simulate_system import reaction
+from modules.generate_data.simulate_system import *
 
-def visualize_surface(model, device, dimensions, species, model_dir, training_data_path):
+def visualize_surface(model, dimensions, species, reaction, params, model_dir, training_data_path):
     
     # Load and format training data
     training_data = format_data_general(dimensions, species, training_data_path)
@@ -18,8 +18,7 @@ def visualize_surface(model, device, dimensions, species, model_dir, training_da
     u_triangle_mesh, v_triangle_mesh = lltriangle(u, v)
 
     # Calculate true reaction surface
-    a, b, k = 1, 1, 0.01
-    F_true = reaction(u_triangle_mesh, v_triangle_mesh, a, b, k)
+    F_true = reaction(u_triangle_mesh, v_triangle_mesh, params[2:])
 
     # Calculate MLP reaction surface
     uv = np.column_stack((np.ravel(u_triangle_mesh), np.ravel(v_triangle_mesh)))
@@ -76,7 +75,7 @@ def visualize_surface(model, device, dimensions, species, model_dir, training_da
             tick0 = 0,
             dtick = 2,
             tickfont = dict(size=18),
-            range=[-1.5, 11]),
+            range=[-4, 11]),
 
         camera=dict(eye=dict(x=1, y=-2.5, z=1)),),
                     
@@ -96,7 +95,7 @@ def visualize_surface(model, device, dimensions, species, model_dir, training_da
             tick0 = 0,
             dtick = 2,
             tickfont = dict(size=18),
-            range=[-1.5, 11]),
+            range=[-4, 11]),
 
         camera=dict(eye=dict(x=1, y=-2.5, z=1))))
 

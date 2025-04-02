@@ -1,6 +1,6 @@
 import torch
 
-def custom_norm(w, a):
+def custom_norm(w, a=0.05):
     # Compute the absolute values of w
     abs_w = torch.abs(w)
     

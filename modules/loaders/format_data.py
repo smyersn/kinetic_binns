@@ -4,42 +4,6 @@ import matplotlib.animation as animation
 import itertools
 from modules.loaders.visualize_training_data import *
 
-def format_data(file, plot=True):
-    # load in zip file with np arrays
-    npz = np.load(file)
-    x = npz['arr_0']
-    u = npz['arr_1']
-    v = npz['arr_2']
-    t = npz['arr_3']
-    
-    # format data ([[x,t], [u], [v]]) 
-    input = []
-    output_u = []
-    output_v = []
-
-    for a in x:
-        for b in t:
-            input.append([a, b])
-
-    for a, b in zip(u.T, v.T):
-        for c, d in zip(a, b):
-            output_u.append(c)
-            output_v.append(d)
-
-    # Convert from lists to reshaped arrays
-    input = np.array(input)
-    output_u = np.reshape(output_u, (len(output_u), 1))
-    output_v = np.reshape(output_v, (len(output_v), 1))
-    
-    # Get shapes
-    shape_u = output_u.shape
-    shape_v = output_v.shape
-    
-    if plot:
-        plot_steady_state(x, u, v)
-    
-    return input, output_u, output_v, shape_u, shape_v
-
 def format_data_general(dimensions, species, file=None, x_array=None, 
                         t_array=None, u_array=None, v_array=None):
     if file is not None:

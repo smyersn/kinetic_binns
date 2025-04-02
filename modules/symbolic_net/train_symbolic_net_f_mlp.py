@@ -11,7 +11,7 @@ from modules.symbolic_net.build_symbolic_net import symbolic_net
 from modules.utils.training_test_split import training_test_split
 from modules.analysis.generate_loss_curves import generate_loss_curves
 from modules.loaders.format_data import format_data_general
-from modules.generate_data.simulate_system import reaction
+from modules.generate_data.simulate_system import wave_pinning_reaction
 from modules.symbolic_net.write_terms import write_terms
 from modules.symbolic_net.visualize_surface import visualize_surface
 from modules.symbolic_net.individual import individual
@@ -83,6 +83,13 @@ uv = training_data[:, -2:]
 u_triangle_mesh, v_triangle_mesh = lltriangle(uv[:, 0], uv[:, 1])
 u, v = np.ravel(u_triangle_mesh), np.ravel(v_triangle_mesh)
 
+# Generate data density histogram from simulation if density weight is nonzero
+hist = None
+edges = None
+
+if density_weight != 0:
+    hist, edges = create_data_histogram(torch.from_numpy(uv), device)   
+
 # Calculate true surface to fit (F_mlp)
 uv = np.column_stack((u, v))
 F_true = to_numpy(model.model.reaction(to_torch(uv)[:, None])).flatten()
@@ -95,18 +102,11 @@ training_data = training_data_nans[mask]
 
 # Split training data
 x_train, y_train, x_val, y_val = training_test_split(training_data, 1, device)
-
-# generate histogram for training data if density weight is nonzero
-hist = None
-edges = None
-
-if density_weight != 0:
-    hist, edges = create_data_histogram(x_train, device)   
-
     
 # initialize model and compile
 sym_net = symbolic_net(species, degree, param_bounds, device, l1_reg,
-                       nonzero_term_reg, hist, edges, density_weight)
+                       nonzero_term_reg, density_weight, hist, edges)
+
 sym_net.to(device)
 
 # initialize optimizer
@@ -129,7 +129,7 @@ train_loss_dict, val_loss_dict = model.fit(
     callbacks=None,
     verbose=1,
     validation_data=[x_val, y_val],
-    early_stopping=10000,
+    early_stopping=5000,
     rel_save_thresh=rel_save_thresh,
     density_weight=density_weight,
     hist=hist,

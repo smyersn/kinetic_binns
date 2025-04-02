@@ -1,0 +1,24 @@
+Progress: 0%
+/work/users/s/m/smyersn/elston/projects/kinetics_binns/modules/generate_data/../../modules/generate_data/simulate_system.py:48: RuntimeWarning: overflow encountered in multiply
+  F = a * u**2 * v - b * u
+/work/users/s/m/smyersn/elston/projects/kinetics_binns/modules/generate_data/../../modules/generate_data/simulate_system.py:48: RuntimeWarning: overflow encountered in square
+  F = a * u**2 * v - b * u
+/work/users/s/m/smyersn/elston/projects/kinetics_binns/modules/generate_data/../../modules/generate_data/simulate_system.py:64: RuntimeWarning: invalid value encountered in add
+  u = u + (Du * Lu + F) * dt
+/work/users/s/m/smyersn/elston/projects/kinetics_binns/modules/generate_data/../../modules/generate_data/simulate_system.py:65: RuntimeWarning: invalid value encountered in add
+  v = v + (Dv * Lv - F) * dt
+/work/users/s/m/smyersn/elston/projects/kinetics_binns/modules/generate_data/../../modules/generate_data/simulate_system.py:19: RuntimeWarning: invalid value encountered in add
+  grid = (-4 * M + np.roll(M, 1, axis=0) + np.roll(M, -1, axis=0) +
+/work/users/s/m/smyersn/elston/projects/kinetics_binns/modules/generate_data/../../modules/generate_data/simulate_system.py:65: RuntimeWarning: overflow encountered in multiply
+  v = v + (Dv * Lv - F) * dt
+/work/users/s/m/smyersn/elston/projects/kinetics_binns/modules/generate_data/../../modules/generate_data/simulate_system.py:65: RuntimeWarning: invalid value encountered in subtract
+  v = v + (Dv * Lv - F) * dt
+Progress: 0%
+Progress: 0%
+Progress: 0%
+Progress: 0%
+Progress: 0%
+Progress: 0%
+Progress: 0%
+Progress: 0%
+Progress: 0%

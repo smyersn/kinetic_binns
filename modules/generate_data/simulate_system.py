@@ -6,8 +6,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 
-from modules.loaders.visualize_training_data import plot_animation
+from modules.loaders.visualize_training_data import animate_data
 from modules.utils.numpy_torch_conversion import *
+from modules.loaders.format_data import format_data_general
 
 # Define 2-dimensional Laplacian
 def laplace(M, dx, dim):
@@ -34,47 +35,47 @@ def calc_squared_wavenumbers(L, N, Du, Dv):
     
     return ksqu, ksqv
 
-# Define reaction
-def wave_pinning_reaction(u, v, params):
+# Define reactions
+def wave_pinning(uv, params=(1, 1, 0.01)):
+    u, v = uv[:, 0], uv[:, 1]
     a, b, k = params
     
     F = (a * u**2 * v) / (1 + k * u**2) - b * u
     return F
 
-def alex_reaction(u, v, params):
+def turing_type(uv, params=(1, 1)):
+    u, v = uv[:, 0], uv[:, 1]
     a, b = params
     
     F = a * u**2 * v - b * u
     return F
 
 # Define update functions for simulation
-def update_laplace(reaction_fn, u0, v0, params, Du, Dv, dt, dx, points, dim, nn=None,
-              diffusion=False):
-    if nn:
-        F = to_numpy(nn.reaction(to_torch(
-            np.column_stack((u0, v0)))[:, None]))
-        F = np.reshape(F, (points,)*dim)
+def update_laplace(u, v, reaction, Du, Dv, dt, dx, points, dim, params=None):
+    if params:
+        F = reaction(np.column_stack((u.ravel(), v.ravel())), params)
+        
     else:
-        F = reaction_fn(u0, v0, params)
-
-
-    Lu = laplace(u0, dx, dim)
-    Lv = laplace(v0, dx, dim)
+        F = to_numpy(reaction(to_torch(np.column_stack((u.ravel(), v.ravel())))))
+        
+    F = np.reshape(F, (points,)*dim)
+        
+    Lu = laplace(u, dx, dim)
+    Lv = laplace(v, dx, dim)
     
-    u1 = u0 + (Du * Lu + F) * dt
-    v1 = v0 + (Dv * Lv - F) * dt
+    u = u + (Du * Lu + F) * dt
+    v = v + (Dv * Lv - F) * dt
     
-    return u1, v1
+    return u, v
 
-def update_fourier(reaction_fn, u0, v0, params, Du, Dv, dt, ksqu, ksqv, points, nn=None,
-              diffusion=False):
+def update_fourier(reaction, u0, v0, params, dt, ksqu, ksqv, points, nn=None):
     if nn:
         F = to_numpy(nn.reaction(to_torch(
             np.column_stack((u0.ravel(), v0.ravel())))[:, None]))
-        F = np.reshape(F, (points,)*2)
+        F = np.reshape(F, (points,)*2)            
 
     else:
-        F = reaction_fn(u0, v0, params)
+        F = reaction(u0, v0, params)
         
     u1r = u0 + F * dt
     v1r = v0 - F * dt
@@ -93,7 +94,7 @@ def generate_initial_conditions(u0, v0, N, dim, spikes=0, custom=False,
         u = np.full(N, u0) - np.cos(2 * spikes * np.pi * np.arange(N) / N) * 0.1 
         v = np.full(N, v0)
         
-    if custom and dim == 1:
+    elif custom and dim == 1:
         # Generate custom initial conditions from file 
         initial_data_path = '../../data/custom_initial_state.csv'
         initial_data = np.loadtxt(initial_data_path, delimiter=',')
@@ -108,35 +109,24 @@ def generate_initial_conditions(u0, v0, N, dim, spikes=0, custom=False,
         u = np.interp(xi, xp, up)
         v = np.interp(xi, xp, vp)
         
-    if random and dim == 1: 
+    elif random and dim == 1: 
         # Generate initial conditions with random noise
         u = u0 * (np.random.rand(N) * 2)
         v = v0 * np.ones(N)
         
-    if dim > 1:
+    elif dim > 1:
         u = (np.random.rand(*(N,) * dim) + 0.5) * u0
         v = np.ones((N,) * dim) * v0
 
     return u, v
     
-def simulate(u0, v0, L, N, T, dim, params, reaction_fn, Du=0.01, Dv=1, nn=None, 
-             diffusion=False, npz_path=None, early_stop=True):
+def simulate(u0, v0, L, N, T, dim, reaction, params=None, Du=0.01, Dv=1, 
+             save_name=None, early_stop=True):
     
-    if diffusion == True:
-        D = nn.diffusion_fitter()
-        Du = D[0].detach().numpy()
-        Dv = D[1].detach().numpy()
-
     # Define system parameters
-    if dim == 1:
-        dt = 0.0001
-        ss_tolerance = 0.005
-        dx = L / N
-    else:
-        dt = 0.0001
-        ss_tolerance = 0.05
-        ksqu, ksqv = calc_squared_wavenumbers(L, N, Du, Dv)
-        dx = L / N
+    dt = 0.0001
+    dx = L / N
+    ss_tolerance = 0.005 if dim == 1 else 0.05
                 
     nits = int(T / dt)
     half_sec_nits = 0.5 / dt
@@ -155,37 +145,62 @@ def simulate(u0, v0, L, N, T, dim, params, reaction_fn, Du=0.01, Dv=1, nn=None,
     
     # Solve
     for t in range(nits):
+        
         if t % (nits // 10) == 0:
-            print(f"Progress: {int((t / nits) * 100)}%", flush=True)
-        if t % half_sec_nits == 0:
-            u_array[int(t/half_sec_nits), Ellipsis] = u
-            v_array[int(t/half_sec_nits), Ellipsis] = v
-            t_array[int(t / half_sec_nits)] = t * dt
+            print(f"Progress: {(t / nits) * 100}%", flush=True)
             
-            if early_stop == True:        
-                if t > 0 and np.max(np.abs(u_array[int(t/half_sec_nits)] - u_array[int(t/half_sec_nits)-1])) < ss_tolerance:
+        if t % half_sec_nits == 0:
+            time_step = int(t / half_sec_nits)
+            u_array[time_step, Ellipsis] = u
+            v_array[time_step, Ellipsis] = v
+            t_array[time_step] = t * dt
+            
+            if early_stop == True:
+                current_save = u_array[time_step]
+                last_save = u_array[time_step-1]
+                
+                # Early stop if change over last 0.5 seconds below ss_tolerance
+                if t > 0 and np.max(np.abs(current_save - last_save)) < ss_tolerance:
                     print(f'Steady state at t = {t * dt}', flush=True)
                     break
-        
-        u, v = update_laplace(reaction_fn, u, v, params, Du, Dv, dt, dx, N, dim, nn, diffusion)
+                
+        u, v = update_laplace(u, v, reaction, Du, Dv, dt, dx, N, dim, params)
 
     # Remove zeros from arrays due to reaching steady state
     u_array = u_array[~np.all(u_array == 0, axis=1)]
     v_array = v_array[~np.all(v_array == 0, axis=1)]
     t_array = np.trim_zeros(t_array, 'b')    
     
-    if npz_path is not None:
-        np.savez(npz_path, x_array, u_array, v_array, t_array)
+    if save_name:
+        np.savez(save_name, x_array, u_array, v_array, t_array)
+                
     else:
         return x_array, u_array, v_array, t_array
     
-if __name__ == '__main__':
-    species_totals = [1, 1.0246]
-    species_totals_high_u = [4, 1]
-    species_totals_high_v = [1, 4]
-    species_totals_high_equal = [4, 4.0246]
-    params = [1, 1, 0.01]
+if __name__ == '__main__':   
+    # Define initial conditions
+    u0 = 1
+    v0 = 1.0246
     
-    x, u, v, t = simulate(species_totals_high_equal, params, 100, 500, 10, random=True)
-    np.savez('../../data/high_equal_random_data', x_random, u_random, v_random, t_random)
-    plot_animation(x, u, v, t, save = True, name = 'high_equal_random')
+    # Define parameters
+    N = 200
+    L = 10
+    T = 100
+    dim = 2
+    
+    # Define reaction
+    reaction = turing_type
+    params = [1, 1]
+    Du, Dv = 0.01, 1
+    
+    # Calculate initial conditions for grid
+    save_name = '/work/users/s/m/smyersn/elston/projects/kinetics_binns/data/2d/turing_type'
+    
+    u0, v0 = generate_initial_conditions(u0, v0, N, dim, random=True)
+    
+    # Simulate
+    simulate(u0, v0, L, N, T, dim, reaction, params, Du, Dv, save_name=save_name)
+    
+    sim_formatted = format_data_general(dim, 2, file=f'{save_name}.npz')
+
+    animate_data(sim_formatted, dim, 2, name=save_name)
