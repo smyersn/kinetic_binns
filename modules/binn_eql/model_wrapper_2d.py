@@ -27,10 +27,6 @@ class model_wrapper():
         y       (tensor/generator): Target data.
         batch_size           (int): Batch size.
         epochs               (int): Total number of epochs.
-        verbose              (int): How much info to print to the screen:
-                                        0: No updates
-                                        1: Update after every epoch
-                                        2: Update after every batch
         validation_data     (list): Input and target validation data.
         shuffle             (bool): Whether to shuffle data each epoch.
         class_weight        (list): NOT IMPLEMENTED
@@ -94,28 +90,19 @@ class model_wrapper():
             y=None,
             batch_size=None,
             epochs=1,
-            verbose=1,
-            callbacks=None,
             validation_data=None,
             shuffle=True,
-            class_weight=None,
-            sample_weight=None,
             initial_epoch=0,
             steps_per_epoch=None,
             validation_steps=None,
-            validation_freq=1,
             early_stopping=None,
             best_train_loss=None,
             best_val_loss=None,
             include_val_aug=False,
-            include_val_reg=False,
             lr_dec_epoch=None,
             lr_dec_prop=1.0,
             rel_save_thresh=0.0,
-            ewc=None,
-            density_weight=0,
-            hist=None,
-            edges=None):
+            fine_tune=False):
         
         # compute train batch size
         if batch_size is None:
@@ -135,32 +122,17 @@ class model_wrapper():
                 val_batch_size = len(x_val)
         
         # initialize book keeping
-        train_length = len(x)
-        if validation_data is not None:
-            val_length = len(validation_data[0]) 
         start_time = time.time()
         last_improved = 0
         best_train_loss = 1e12 if best_train_loss is None else best_train_loss
         best_val_loss = 1e12 if best_val_loss is None else best_val_loss
-        
-        # callback at beginning of training
-        if callbacks is not None:
-            for c in callbacks:
-                if c.on_train_begin:
-                    c(self)
-               
+                       
         # loop over epochs
         for epoch in range(initial_epoch, initial_epoch + epochs):
             # training step            
             self.train = True
             self.val = False
-            
-            # callback at beginning of epoch
-            if callbacks is not None:
-                for c in callbacks:
-                    if c.on_epoch_begin:
-                        c(self)
-            
+                    
             self.model.train()
             epoch_start_time = time.time()
             
@@ -171,13 +143,7 @@ class model_wrapper():
                 x, y = x[p].data, y[p].data
             
             # loop over training batches
-            for idx in range(train_batches_per_epoch):
-                # callback at beginning of batch
-                if callbacks is not None:
-                    for c in callbacks:
-                        if c.on_batch_begin:
-                            c(self)
-                
+            for idx in range(train_batches_per_epoch):                
                 # stop loop if steps_per_epoch exceeded
                 if steps_per_epoch is not None:
                     if idx >= steps_per_epoch:
@@ -227,9 +193,22 @@ class model_wrapper():
                     # compute backward pass
                     self.train_loss.backward(retain_graph=True)
                     
-                    for name, param in self.model.named_parameters():
-                        if param.grad is not None and torch.isnan(param.grad).any():
-                            print(f"NaN detected in gradient of {name}")
+                    if fine_tune == True:
+                        for param in self.model.parameters():
+                            if param.grad is not None:
+                                # Create a mask: 1 where param is nonzero, 0 where it is zero
+                                mask = (param.data != 0).float()
+                                # Apply the mask to the gradient (in-place operation)
+                                param.grad.data.mul_(mask)
+                                
+                        for param in self.model.surface_fitter.parameters():
+                            if param.grad is not None:
+                                param.grad.zero_()
+
+                    
+                    # for name, param in self.model.named_parameters():
+                    #     if param.grad is not None and torch.isnan(param.grad).any():
+                    #         print(f"NaN detected in gradient of {name}")
 
                     return self.train_loss, self.train_gls_loss, self.train_pde_loss, self.train_reg_loss
 
@@ -248,33 +227,7 @@ class model_wrapper():
                 # wait for GPU computations to finish
                 if x.device != torch.device('cpu'):
                     torch.cuda.synchronize()
-                
-                # print batch statistics
-                if verbose == 2:
-                    elapsed, remaining, ms_per_iter = time_remaining(
-                        current_iter=idx+1, 
-                        total_iter=train_batches_per_epoch, 
-                        start_time=epoch_start_time, 
-                        previous_time=batch_start_time, 
-                        ops_per_iter=batch_size)
-                    
-                    sys.stdout.write(('\r\x1b[KEpoch {0} {1}/{2}' + 
-                                    ' | {3} ms ' + 
-                                    ' | Train loss = {4:1.4e}' + 
-                                    ' | Remaining = ').format(
-                        epoch+1,
-                        idx+1,
-                        train_batches_per_epoch,
-                        ms_per_iter,
-                        np.mean(self.train_loss)) + remaining + '          ')
-                    sys.stdout.flush()
-                        
-                    # callback at ending of batch
-                    if callbacks is not None:
-                        for c in callbacks:
-                            if c.on_batch_end:
-                                c(self)
-                                                               
+                                                                                                       
             # update book keeping for this epoch
             self.train_loss_dict['loss'].append(np.mean(self.train_loss))
             self.train_loss_dict['gls'].append(np.mean(self.train_gls_loss))
@@ -292,20 +245,6 @@ class model_wrapper():
                 # optionally save model and optimizer
                 if self.save_best_train:
                     self.save(self.save_name+'_best_train')
-
-            # print readout
-            if verbose == 2:
-                sys.stdout.write(('\r\x1b[KEpoch {0}' + 
-                                  ' {1}/{2}' + 
-                                  ' | {3} ms ' + 
-                                  ' | Train loss = {4:1.4e}' + 
-                                  ' | Elapsed = ').format(
-                    epoch+1,
-                    train_batches_per_epoch,
-                    train_batches_per_epoch,
-                    ms_per_iter,
-                    np.mean(self.train_loss_dict['loss'][-1])) + elapsed + '       ')
-                sys.stdout.flush()
                 
             #
             # validation step
@@ -327,11 +266,6 @@ class model_wrapper():
                 # loop over validation batches
                 for idx in range(val_batches_per_epoch):
                     self.optimizer.zero_grad()
-                    # callback at beginning of batch
-                    if callbacks is not None:
-                        for c in callbacks:
-                            if c.on_batch_begin:
-                                c(self)
                     
                     # stop loop if validation_steps exceeded
                     if validation_steps is not None:
@@ -368,12 +302,6 @@ class model_wrapper():
                     if x.device != torch.device('cpu'):
                         torch.cuda.synchronize()
                         
-                    # callback at ending of batch
-                    if callbacks is not None:
-                        for c in callbacks:
-                            if c.on_batch_end:
-                                c(self)
-    
                 # update book keeping for this epoch
                 self.val_loss = self.val_loss.cpu().detach().numpy()
                 self.val_gls_loss = self.val_gls_loss.cpu().detach().numpy()
@@ -396,7 +324,10 @@ class model_wrapper():
                     
                     # optionally save model and optimizer
                     if self.save_best_val:
-                        self.save(self.save_name+'_best_val')
+                        if fine_tune:
+                            self.save(self.save_name+'_best_val_fine_tuned')
+                        else:
+                            self.save(self.save_name+'_best_val')
                     
                     # update early stopper
                     last_improved = epoch
@@ -408,59 +339,6 @@ class model_wrapper():
                     improved = ''
             
             # update user
-            if verbose == 1:
-                
-                # times
-                elapsed, remaining, ms = time_remaining(
-                    current_iter=epoch+1,
-                    total_iter=initial_epoch+epochs,
-                    start_time=start_time,
-                    previous_time=epoch_start_time,
-                    ops_per_iter=batch_size)
-                
-                # prints
-                if epoch % 1000 == 0:
-                    p = 'Epoch {0}'.format(epoch)
-                    p += ' | Train loss = {0:1.4e}'.format(self.train_loss_dict['loss'][-1])
-                    if validation_data is not None:
-                        p += ' | Val loss = {0:1.4e}'.format(self.val_loss_dict['loss'][-1])
-                    p += ' | Remaining = ' + remaining + '           '
-                    #sys.stdout.write(p)
-                    print(p, flush=True)
-                
-            # final print readout for verbose 2
-            if verbose == 2:
-                sys.stdout.write(('\r\x1b[KEpoch {0} {1}/{2}' + 
-                                  ' | Train loss = {3:1.4e}' + 
-                                  ' | Val loss = {4:1.4e}').format(
-                    epoch+1,
-                    train_batches_per_epoch,
-                    train_batches_per_epoch,
-                    self.self.train_loss_dict['loss'][-1],
-                    self.val_loss_dict['loss'][-1]))
-                print(improved + '                 ')
-                
-            # optional early stopping
-            if early_stopping is not None:
-                if epoch - last_improved >= early_stopping:
-                    break
-                    
-            # optional learning rate annealing
-            if lr_dec_epoch is not None:
-                if np.mod(epoch, lr_dec_epoch) == 0 and epoch != 0:
-                    for param_group in self.optimizer.param_groups:
-                        param_group['lr'] *= lr_dec_prop
-                        
-            # callback at ending of epoch
-            if callbacks is not None:
-                for c in callbacks:
-                    if c.on_epoch_end:
-                        c(self)
-                
-        # final print readout for verbose 1
-        if verbose == 1:
-            
-            # times
             elapsed, remaining, ms = time_remaining(
                 current_iter=epoch+1,
                 total_iter=initial_epoch+epochs,
@@ -469,26 +347,49 @@ class model_wrapper():
                 ops_per_iter=batch_size)
             
             # prints
-            if self.save_best_val:
-                idx = np.argmin(self.val_loss_dict['loss'])
-            elif self.save_best_train:
-                idx = np.argmin(self.self.train_loss_dict['loss'])
-            else:
-                idx = -1
-            p = 'Epoch {0}'.format(epoch)
-            p += ' | Train loss = {0:1.4e}'.format(self.train_loss_dict['loss'][idx])
-            if validation_data is not None:
-                p += ' | Val loss = {0:1.4e}'.format(self.val_loss_dict['loss'][idx])
-            p += ' | Elapsed = ' + elapsed + '           '
-            #sys.stdout.write(p)
-            print(p, flush=True)
+            if epoch % 1000 == 0:
+                p = 'Epoch {0}'.format(epoch)
+                p += ' | Train loss = {0:1.4e}'.format(self.train_loss_dict['loss'][-1])
+                if validation_data is not None:
+                    p += ' | Val loss = {0:1.4e}'.format(self.val_loss_dict['loss'][-1])
+                p += ' | Remaining = ' + remaining + '           '
+                #sys.stdout.write(p)
+                print(p, flush=True)
+                
+            # optional early stopping
+            if early_stopping is not None:
+                if epoch - last_improved >= early_stopping and epoch >= 10000:
+                    break
+                    
+            # optional learning rate annealing
+            if lr_dec_epoch is not None:
+                if np.mod(epoch, lr_dec_epoch) == 0 and epoch != 0:
+                    for param_group in self.optimizer.param_groups:
+                        param_group['lr'] *= lr_dec_prop
+                        
+        # final print readout
+        elapsed, remaining, ms = time_remaining(
+            current_iter=epoch+1,
+            total_iter=initial_epoch+epochs,
+            start_time=start_time,
+            previous_time=epoch_start_time,
+            ops_per_iter=batch_size)
+        
+        # prints
+        if self.save_best_val:
+            idx = np.argmin(self.val_loss_dict['loss'])
+        elif self.save_best_train:
+            idx = np.argmin(self.self.train_loss_dict['loss'])
+        else:
+            idx = -1
+        p = 'Epoch {0}'.format(epoch)
+        p += ' | Train loss = {0:1.4e}'.format(self.train_loss_dict['loss'][idx])
+        if validation_data is not None:
+            p += ' | Val loss = {0:1.4e}'.format(self.val_loss_dict['loss'][idx])
+        p += ' | Elapsed = ' + elapsed + '           '
+        #sys.stdout.write(p)
+        print(p, flush=True)
             
-        # callback at ending of training
-        if callbacks is not None:
-            for c in callbacks:
-                if c.on_train_end:
-                    c(self)
-
         return self.train_loss_dict, self.val_loss_dict
                 
     def predict(self, inputs):

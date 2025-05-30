@@ -25,7 +25,7 @@ class HillFunction(nn.Module):
         if self.increasing:
             hill_feat = x_n / (1 + K * x_n)          
         else:
-            hill_feat = 1 - (x_n / (1 + K * x_n))
+            hill_feat = (1 / K) - (x_n / (1 + K * x_n))
  
         return hill_feat
 
@@ -51,8 +51,8 @@ class PolynomialFeatures(nn.Module):
         # Concatenate polynomial features
         poly_feats = torch.cat(features * self.duplicates, dim=1)
 
-        if torch.isnan(poly_feats).any():
-            print('poly nans')
+        # if torch.isnan(poly_feats).any():
+        #     print('poly nans')
 
         return poly_feats
     
@@ -97,8 +97,8 @@ class HillFeatures(nn.Module):
         # Concatenate increasing and decreasing hill features
         hill_feats = torch.cat(inc_features + dec_features, dim=1)
         
-        if torch.isnan(hill_feats).any():
-            print('hill nans')
+        # if torch.isnan(hill_feats).any():
+        #     print('hill nans')
 
         return hill_feats
 
@@ -138,8 +138,8 @@ class EQLLayer(nn.Module):
         nn.init.uniform_(self.fc.weight, a=-param_bounds, b=param_bounds)
 
     def forward(self, x):
-        if torch.isnan(x).any():
-            print('input nans')
+        # if torch.isnan(x).any():
+        #     print('input nans')
 
         poly_feats = self.poly(x)
         hill_feats = self.hill(x)

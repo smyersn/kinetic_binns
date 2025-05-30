@@ -1,3 +1,4 @@
+import torch
 from torch.autograd import grad
 
 def gradient(outputs, inputs, order=1):
@@ -22,7 +23,7 @@ def gradient(outputs, inputs, order=1):
 
     # compute gradients sequentially until order is reached
     for i in range(order):
-        grads = grad(outputs, inputs, create_graph=True)[0]
+        grads = grad(outputs, inputs, create_graph=True, retain_graph=True)[0]
         #grads = grad(outputs, inputs, create_graph=True)
         outputs = grads.sum()
 

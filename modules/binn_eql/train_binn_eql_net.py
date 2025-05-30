@@ -31,8 +31,10 @@ diff_coeffs = [float(x) for x in config['diff_coeffs'].strip("()").split()]
 # Symbolic Net params
 duplicates = int(config['duplicates'])
 degree = int(config['degree'])
-l05_reg = float(config['l05_reg'])
-l1_reg = float(config['l1_reg'])
+gls_weight=float(config['gls_weight'])
+pde_weight=float(config['pde_weight'])
+l05_weight = float(config['l05_weight'])
+l1_weight = float(config['l1_weight'])
 param_bounds = float(config['param_bounds'])
 
 dir_name = sys.argv[1]
@@ -64,8 +66,10 @@ binn = BINN(
     data=x_train.cpu(), 
     diff_coeffs=diff_coeffs,
     degree=degree,
-    l05_reg=l05_reg,
-    l1_reg=l1_reg,
+    gls_weight=gls_weight,
+    pde_weight=pde_weight,
+    l05_weight=l05_weight,
+    l1_weight=l1_weight,
     param_bounds=param_bounds)
 
 binn.to(device)
@@ -87,10 +91,8 @@ train_loss_dict, val_loss_dict = model.fit(
     y=y_train,
     batch_size=int(0.05*len(training_data)),
     epochs=epochs,
-    callbacks=None,
-    verbose=1,
     validation_data=[x_val, y_val],
-    early_stopping=1000,
+    early_stopping=500,
     rel_save_thresh=rel_save_thresh)
 
 generate_loss_curves(train_loss_dict, val_loss_dict, dir_name)

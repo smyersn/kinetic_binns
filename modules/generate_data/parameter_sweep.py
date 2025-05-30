@@ -25,12 +25,12 @@ if __name__ == '__main__':
     species = 2
     
     # Define reaction
-    reaction_fn = turing_type
+    reaction_fn = wave_pinning
     Du, Dv = float(sys.argv[1]), float(sys.argv[2])
-    params = [float(sys.argv[3]), float(sys.argv[4])]
+    params = [float(sys.argv[3]), float(sys.argv[4]), float(sys.argv[5])]
     
     # Calculate initial conditions for grid
-    save_name = f'/work/users/s/m/smyersn/elston/projects/kinetics_binns/data/2d/turing_type_200/du_{Du}_dv_{Dv}_a_{params[0]}_b_{params[1]}'
+    save_name = f'/work/users/s/m/smyersn/elston/projects/kinetics_binns/data/2d/wave_pinning/du_{Du}_dv_{Dv}_a_{params[0]}_b_{params[1]}_k_{params[2]}'
     
     u0, v0 = generate_initial_conditions(u0, v0, N, dim, random=True)
     

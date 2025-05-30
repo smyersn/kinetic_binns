@@ -87,7 +87,7 @@ def animate_data(training_data, dimensions, species, name=None):
     # Create animation
     anim = animation.FuncAnimation(fig, animate, frames=range(len(frames)), init_func=init, repeat=True)
     
-    if name is not None:
+    if name:
         writergif = animation.PillowWriter(fps=5)
         anim.save(f'{name}.gif', writer=writergif)
 

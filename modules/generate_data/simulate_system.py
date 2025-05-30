@@ -63,6 +63,11 @@ def update_laplace(u, v, reaction, Du, Dv, dt, dx, points, dim, params=None):
     Lu = laplace(u, dx, dim)
     Lv = laplace(v, dx, dim)
     
+    # print((Du * Lu * dt)[:10])
+    # print((F * dt)[:10])
+    # print((Dv * Lv * dt)[:10])
+    # print((-F * dt)[:10])
+    
     u = u + (Du * Lu + F) * dt
     v = v + (Dv * Lv - F) * dt
     
@@ -122,7 +127,6 @@ def generate_initial_conditions(u0, v0, N, dim, spikes=0, custom=False,
     
 def simulate(u0, v0, L, N, T, dim, reaction, params=None, Du=0.01, Dv=1, 
              save_name=None, early_stop=True):
-    
     # Define system parameters
     dt = 0.0001
     dx = L / N
