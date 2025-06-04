@@ -15,7 +15,6 @@ class model_wrapper():
         loss         (callable): Loss function that inputs (pred, true).
         regularizer  (callable): Regularization that inputs (model, inputs, 
                                   true, pred).
-        augmentation (callable): Augmentation that inputs x and y.
         scheduler    (callable): Learning rate scheduler.
         save_name      (string): Model name for saving model/opt weights.
         save_best_train  (bool): Indicator for saving on best train loss.
@@ -32,13 +31,10 @@ class model_wrapper():
         class_weight        (list): NOT IMPLEMENTED
         sample_weight       (list): NOT IMPLEMENTED
         initial_epoch        (int): Initial epoch to start training.
-        steps_per_epoch      (int): Train batches before moving to next epoch.
-        validation_steps     (int): Val batches before moving to next epoch.
         validation_freq      (int): NOT IMPLEMENTED
         early_stopping       (int): Number of epochs since validation improved.
         best_train_loss    (float): Best loss on training set.
         best_val_loss      (float): Best loss on validation set.
-        include_val_aug     (bool): Inclusion of augmentation in val step.
         include_val_reg     (bool): Inclusion of regularizer in val loss.
         lr_dec_epoch         (int): Decrease lr after this many epochs.
         lr_dec_prop        (float): Value <= 1 to multiply learning rate.
@@ -53,8 +49,8 @@ class model_wrapper():
                  model,
                  optimizer,
                  loss,
+                 dir_name,
                  regularizer=None,
-                 augmentation=None,
                  scheduler=None,
                  save_name=None,
                  save_best_train=False,
@@ -65,8 +61,8 @@ class model_wrapper():
         self.model = model
         self.optimizer = optimizer
         self.loss = loss
+        self.dir_name = dir_name
         self.regularizer = regularizer
-        self.augmentation = augmentation
         self.scheduler = scheduler
         self.save_name = save_name
         self.save_best_train = save_best_train
@@ -86,153 +82,140 @@ class model_wrapper():
             self.save_reg = False
         
     def fit(self,
-            x=None,
-            y=None,
+            train_loader,
+            val_loader,
+            device='cpu',
             batch_size=None,
             epochs=1,
-            validation_data=None,
-            shuffle=True,
             initial_epoch=0,
-            steps_per_epoch=None,
-            validation_steps=None,
             early_stopping=None,
             best_train_loss=None,
             best_val_loss=None,
-            include_val_aug=False,
             lr_dec_epoch=None,
             lr_dec_prop=1.0,
             rel_save_thresh=0.0,
             fine_tune=False):
-        
-        # compute train batch size
-        if batch_size is None:
-            batch_size = len(x)
-        train_batches_per_epoch = int(len(x)/batch_size)
-        if train_batches_per_epoch == 0:
-            train_batches_per_epoch = 1
-            batch_size = len(x)        
-        
-        # compute validation batch size
-        if validation_data is not None:
-            x_val, y_val = validation_data[0], validation_data[1]
-            val_batch_size = batch_size
-            val_batches_per_epoch = int(len(x_val)/val_batch_size)
-            if val_batches_per_epoch == 0:
-                val_batches_per_epoch = 1
-                val_batch_size = len(x_val)
-        
+                
         # initialize book keeping
         start_time = time.time()
         last_improved = 0
         best_train_loss = 1e12 if best_train_loss is None else best_train_loss
-        best_val_loss = 1e12 if best_val_loss is None else best_val_loss
-                       
+        best_val_loss = 1e12 if best_val_loss is None else best_val_loss        
+        
+        # Create trivial mask for pruning
+        mask_shape = self.model.reaction.eql_layer.fc.weight.shape
+        mask = torch.ones(mask_shape, dtype=torch.float32, device=device)
+                    
         # loop over epochs
         for epoch in range(initial_epoch, initial_epoch + epochs):
+            epoch_init = time.time()
+            #           
             # training step            
+            #
             self.train = True
             self.val = False
                     
             self.model.train()
             epoch_start_time = time.time()
             
-            # shuffle training data, note the use of .data to detach the 
-            # data to prevent the computational graph from growing
-            if shuffle:
-                p = np.random.permutation(len(x))
-                x, y = x[p].data, y[p].data
-            
-            # loop over training batches
-            for idx in range(train_batches_per_epoch):                
-                # stop loop if steps_per_epoch exceeded
-                if steps_per_epoch is not None:
-                    if idx >= steps_per_epoch:
-                        break
+            # Prune model and print equation
+            if epoch > 0 and epoch % 10000 == 0:
+                fn = f'{self.dir_name}/equation.txt'
+                file = open(fn, 'a')
                 
-                batch_start_time = time.time()
+                self.model.prune()
+                
+                file.write(f'Pruned Equation Epoch {epoch}\n')
+                for term in self.model.generate_equation():
+                    file.write(f'{term}\n')
+                file.write(f'\n')
+
+                file.close()
+                
+                # Clear momentum and ADAM buffers
+                fc_weight = self.model.reaction.eql_layer.fc.weight  # shape: [out_dim, in_dim], or [num_terms] for 1×N
+                for group in self.optimizer.param_groups:
+                    for p in group['params']:
+                        if p is fc_weight:
+                            state = self.optimizer.state[p]
+
+                            # Build a mask: 1 where weight ≠ 0, 0 where weight == 0
+                            # Will also be used to zero grads for pruned parameters
+                            mask = (fc_weight.data != 0).float()
+
+                            exp = state['exp_avg']
+                            with torch.no_grad():
+                                exp.mul_(mask)
+                            exp_sq = state['exp_avg_sq']
+                            with torch.no_grad():
+                                exp_sq.mul_(mask)
+            
+            # Create lists for epoch training losses
+            train_losses = []
+            train_gls_losses = []
+            train_pde_losses = []
+            train_reg_losses = []
+            print(f'epoch init: {time.time() - epoch_init}')
+            end_of_loop = None
+            # loop over training batches
+            for batch_x_train , batch_y_train in train_loader:                     
+                batch_init = time.time() 
+                if end_of_loop:
+                    print(f'loop lag: {batch_init - end_of_loop}')
+
+                # Move to GPU
+                batch_x_train = batch_x_train.to(device)
+                batch_y_train = batch_y_train.to(device)
+                print(f'train batch init: {time.time() - batch_init}')
                 
                 # computes loss
-                def closure():
-                    
+                def closure():  
+                    compute_loss = time.time()                                        
                     # zero out gradients
                     self.optimizer.zero_grad()
-                    
-                    # zero-initialize losses
-                    self.train_loss = 0
-                    self.train_gls_loss = 0
-                    self.train_pde_loss = 0
-                    self.train_reg_loss = 0
-
-                    # extract input and output batches, NOTE: we use .data to
-                    # detach the current batches from their history in order
-                    # to prevent the computational graph from growing in memory
-                    start = idx * batch_size
-                    stop = (idx+1) * batch_size
-                    if idx+1 == train_batches_per_epoch:
-                        stop = -1
-                    x_true = x[start:stop].data.clone()
-                    y_true = y[start:stop].data.clone()
-                    
-                    # optional augmentations
-                    if self.augmentation is not None:
-                        x_true, y_true = self.augmentation(x_true, y_true)
-
+                                        
                     # require gradients
-                    x_true.requires_grad = True
-
+                    batch_x_train.requires_grad = True
+                    
                     # run the model
-                    y_pred = self.model(x_true)
-
+                    y_pred = self.model(batch_x_train)
+                                        
                     # compute loss and optional regularization
-                    train_loss, train_gls_loss, train_pde_loss, train_reg_loss = self.loss(y_pred, y_true)
-                    self.train_loss += train_loss
-                    self.train_gls_loss += train_gls_loss
-                    self.train_pde_loss += train_pde_loss
-                    self.train_reg_loss += train_reg_loss
-                    
+                    train_loss, train_gls_loss, train_pde_loss, train_reg_loss = self.loss(y_pred, batch_y_train)
+                               
+                    print(f'compute train loss: {time.time() - compute_loss}')  
+                    backward_pass = time.time()
+                                               
                     # compute backward pass
-                    self.train_loss.backward(retain_graph=True)
+                    train_loss.backward(retain_graph=True)
                     
-                    if fine_tune == True:
-                        for param in self.model.parameters():
-                            if param.grad is not None:
-                                # Create a mask: 1 where param is nonzero, 0 where it is zero
-                                mask = (param.data != 0).float()
-                                # Apply the mask to the gradient (in-place operation)
-                                param.grad.data.mul_(mask)
-                                
-                        for param in self.model.surface_fitter.parameters():
-                            if param.grad is not None:
-                                param.grad.zero_()
-
+                    self.model.reaction.eql_layer.fc.weight.grad.data.mul_(mask)
+                                        
+                    train_losses.append(train_loss.cpu().detach().numpy() * len(batch_x_train))
+                    train_gls_losses.append(train_gls_loss.cpu().detach().numpy() * len(batch_x_train))
+                    train_pde_losses.append(train_pde_loss.cpu().detach().numpy() * len(batch_x_train))
+                    train_reg_losses.append(train_reg_loss.cpu().detach().numpy() * len(batch_x_train))
+                    print(f'train backward pass: {time.time() - backward_pass}') 
                     
-                    # for name, param in self.model.named_parameters():
-                    #     if param.grad is not None and torch.isnan(param.grad).any():
-                    #         print(f"NaN detected in gradient of {name}")
-
-                    return self.train_loss, self.train_gls_loss, self.train_pde_loss, self.train_reg_loss
-
                 # update model parameters
                 if self.scheduler is None:
                     self.optimizer.step(closure=closure)
                 else:
                     self.scheduler.step(closure())
                 
-                # update book keeping for this batch
-                self.train_loss = self.train_loss.cpu().detach().numpy()
-                self.train_gls_loss = self.train_gls_loss.cpu().detach().numpy()
-                self.train_pde_loss = self.train_pde_loss.cpu().detach().numpy()
-                self.train_reg_loss = self.train_reg_loss.cpu().detach().numpy()
-                                
+                cuda_synch = time.time()                               
                 # wait for GPU computations to finish
-                if x.device != torch.device('cpu'):
+                if batch_x_train.device != torch.device('cpu'):
                     torch.cuda.synchronize()
-                                                                                                       
+                print(f'cuda train sync: {time.time() - cuda_synch}')
+                end_of_loop = time.time()
+                
+            book_keeping = time.time()                                                                                          
             # update book keeping for this epoch
-            self.train_loss_dict['loss'].append(np.mean(self.train_loss))
-            self.train_loss_dict['gls'].append(np.mean(self.train_gls_loss))
-            self.train_loss_dict['pde'].append(np.mean(self.train_pde_loss))
-            self.train_loss_dict['reg'].append(np.mean(self.train_reg_loss))
+            self.train_loss_dict['loss'].append(np.sum(train_losses) / len(train_loader.dataset))
+            self.train_loss_dict['gls'].append(np.sum(train_gls_losses) / len(train_loader.dataset))
+            self.train_loss_dict['pde'].append(np.sum(train_pde_losses) / len(train_loader.dataset))
+            self.train_loss_dict['reg'].append(np.sum(train_reg_losses) / len(train_loader.dataset))
             
             # if train error improved
             rel_diff = (best_train_loss - self.train_loss_dict['loss'][-1])
@@ -245,98 +228,77 @@ class model_wrapper():
                 # optionally save model and optimizer
                 if self.save_best_train:
                     self.save(self.save_name+'_best_train')
+            print(f'train book keeping: {time.time() - book_keeping}')
                 
             #
             # validation step
-            #
-            if validation_data is not None:
-                # print('validation')
-                
-                self.train = False
-                self.val = True
-                
-                self.model.eval()
-                
-                # zero-initialize losses
-                self.val_loss = 0
-                self.val_gls_loss = 0
-                self.val_pde_loss = 0
-                self.val_reg_loss = 0
-                
-                # loop over validation batches
-                for idx in range(val_batches_per_epoch):
-                    self.optimizer.zero_grad()
-                    
-                    # stop loop if validation_steps exceeded
-                    if validation_steps is not None:
-                        if idx >= validation_steps:
-                            break                  
-                    
-                    # extract input and output batches
-                    start = idx * val_batch_size
-                    stop = (idx+1) * val_batch_size
-                    if idx+1 == val_batches_per_epoch:
-                        stop = -1
-                    x_true = x_val[start:stop].data.clone()
-                    y_true = y_val[start:stop].data.clone()
-                    
-                    # require gradients
-                    x_true.requires_grad = True
-                    
-                    # optional augmentations
-                    if self.augmentation is not None and include_val_aug:
-                        x_true, y_true = self.augmentation(x_true, y_true)
-                    
-                    # run the model
-                    y_pred = self.model(x_true).data
-                    
-                    # comptue loss
-                    val_loss, val_gls_loss, val_pde_loss, val_reg_loss = self.loss(y_pred, y_true)
-                    self.val_loss += val_loss
-                    self.val_gls_loss += val_gls_loss
-                    self.val_pde_loss += val_pde_loss
-                    self.val_reg_loss += val_reg_loss
-                    
-                    
-                    # wait for GPU computations to finish
-                    if x.device != torch.device('cpu'):
-                        torch.cuda.synchronize()
-                        
-                # update book keeping for this epoch
-                self.val_loss = self.val_loss.cpu().detach().numpy()
-                self.val_gls_loss = self.val_gls_loss.cpu().detach().numpy()
-                self.val_pde_loss = self.val_pde_loss.cpu().detach().numpy()
-                self.val_reg_loss = self.val_reg_loss.cpu().detach().numpy()
+            #                
+            self.train = False
+            self.val = True
+            
+            self.model.eval()
+            
+            # Create lists for epoch training losses
+            val_losses = []
+            val_gls_losses = []
+            val_pde_losses = []
+            val_reg_losses = []
+            
+            # loop over validation batches
+            for batch_x_val, batch_y_val in val_loader:     
+                # Move to GPU
+                batch_x_val = batch_x_val.to(device)
+                batch_y_val = batch_y_val.to(device)
+           
+                self.optimizer.zero_grad()
+                                                
+                # require gradients
+                batch_x_val.requires_grad = True
                                 
-                self.val_loss_dict['loss'].append(np.mean(self.val_loss))
-                self.val_loss_dict['gls'].append(np.mean(self.val_gls_loss))
-                self.val_loss_dict['pde'].append(np.mean(self.val_pde_loss))
-                self.val_loss_dict['reg'].append(np.mean(self.val_reg_loss))
-
+                # run the model
+                y_pred = self.model(batch_x_val).data
                 
-                # if validation error improved
-                rel_diff = (best_val_loss - self.val_loss_dict['loss'][-1])
-                rel_diff /= best_val_loss
-                if rel_diff > rel_save_thresh:
-                    
-                    # update best validation loss
-                    best_val_loss = self.val_loss_dict['loss'][-1]
-                    
-                    # optionally save model and optimizer
-                    if self.save_best_val:
-                        if fine_tune:
-                            self.save(self.save_name+'_best_val_fine_tuned')
-                        else:
-                            self.save(self.save_name+'_best_val')
-                    
-                    # update early stopper
-                    last_improved = epoch
-                    
-                    improved = ' *'
-                    
-                else:
-                    
-                    improved = ''
+                # comptue loss
+                val_loss, val_gls_loss, val_pde_loss, val_reg_loss = self.loss(y_pred, batch_y_val)
+                
+                val_losses.append(val_loss.cpu().detach().numpy() * len(batch_x_train))
+                val_gls_losses.append(val_gls_loss.cpu().detach().numpy() * len(batch_x_train))
+                val_pde_losses.append(val_pde_loss.cpu().detach().numpy() * len(batch_x_train))
+                val_reg_losses.append(val_reg_loss.cpu().detach().numpy() * len(batch_x_train))
+                
+                # wait for GPU computations to finish
+                if batch_x_val.device != torch.device('cpu'):
+                    torch.cuda.synchronize()
+                                                   
+            # update book keeping for this epoch
+            self.val_loss_dict['loss'].append(np.sum(val_losses) / len(val_loader.dataset))
+            self.val_loss_dict['gls'].append(np.sum(val_gls_losses) / len(val_loader.dataset))
+            self.val_loss_dict['pde'].append(np.sum(val_pde_losses) / len(val_loader.dataset))
+            self.val_loss_dict['reg'].append(np.sum(val_reg_losses) / len(val_loader.dataset))
+
+            # if validation error improved
+            rel_diff = (best_val_loss - self.val_loss_dict['loss'][-1])
+            rel_diff /= best_val_loss
+            if rel_diff > rel_save_thresh:
+                
+                # update best validation loss
+                best_val_loss = self.val_loss_dict['loss'][-1]
+                
+                # optionally save model and optimizer
+                if self.save_best_val:
+                    if fine_tune:
+                        self.save(self.save_name+'_best_val_fine_tuned')
+                    else:
+                        self.save(self.save_name+'_best_val')
+                
+                # update early stopper
+                last_improved = epoch
+                
+                improved = ' *'
+                
+            else:
+                
+                improved = ''
             
             # update user
             elapsed, remaining, ms = time_remaining(
@@ -346,19 +308,21 @@ class model_wrapper():
                 previous_time=epoch_start_time,
                 ops_per_iter=batch_size)
             
+            print(f'total epoch length: {time.time() - epoch_init}')
+
             # prints
             if epoch % 1000 == 0:
                 p = 'Epoch {0}'.format(epoch)
                 p += ' | Train loss = {0:1.4e}'.format(self.train_loss_dict['loss'][-1])
-                if validation_data is not None:
-                    p += ' | Val loss = {0:1.4e}'.format(self.val_loss_dict['loss'][-1])
+                p += ' | Val loss = {0:1.4e}'.format(self.val_loss_dict['loss'][-1])
                 p += ' | Remaining = ' + remaining + '           '
                 #sys.stdout.write(p)
                 print(p, flush=True)
                 
             # optional early stopping
             if early_stopping is not None:
-                if epoch - last_improved >= early_stopping and epoch >= 10000:
+                # if epoch - last_improved >= early_stopping and epoch >= 10000:
+                if epoch - last_improved >= early_stopping:
                     break
                     
             # optional learning rate annealing
@@ -384,8 +348,7 @@ class model_wrapper():
             idx = -1
         p = 'Epoch {0}'.format(epoch)
         p += ' | Train loss = {0:1.4e}'.format(self.train_loss_dict['loss'][idx])
-        if validation_data is not None:
-            p += ' | Val loss = {0:1.4e}'.format(self.val_loss_dict['loss'][idx])
+        p += ' | Val loss = {0:1.4e}'.format(self.val_loss_dict['loss'][idx])
         p += ' | Elapsed = ' + elapsed + '           '
         #sys.stdout.write(p)
         print(p, flush=True)

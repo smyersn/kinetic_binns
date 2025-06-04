@@ -1,12 +1,15 @@
-import torch
+import torch, time
 import torch.nn as nn
 import torch.nn.functional as F
 
 from modules.binn.build_mlp import build_mlp
 from modules.utils.gradient import gradient
+from modules.utils.triangle import lltriangle
+from modules.utils.numpy_torch_conversion import *
 from modules.activations.softplus_relu import softplus_relu
 from modules.symbolic_net.custom_norm import custom_norm
 from modules.binn_eql.build_eql_layer import EQLLayer
+
 
 class D_PARAMS(nn.Module):
     
@@ -95,9 +98,9 @@ class BINN(nn.Module):
     
     '''
     
-    def __init__(self, dimensions, species, duplicates=1, data=None, 
+    def __init__(self, dimensions, species, train_loader, duplicates=1,
                  diff_coeffs=None, degree=2, gls_weight=1, pde_weight=1, 
-                 l05_weight=0, l1_weight=0, param_bounds=10):
+                 l05_weight=0.01, param_bounds=10):
         
         super().__init__()
         self.dimensions = dimensions        
@@ -106,6 +109,18 @@ class BINN(nn.Module):
         self.diff_coeffs = diff_coeffs
         self.degree = degree
         self.param_bounds = param_bounds
+        
+        # Get x and y vals from training data for sampling and pruning
+        xs = []
+        ys = []
+
+        if train_loader is not None: 
+            for batch_x , batch_y in train_loader:
+                xs.append(batch_x)
+                ys.append(batch_y)
+                
+            self.x_train = torch.cat(xs, dim=0)
+            self.y_train = torch.cat(ys, dim=0)
 
         # diffusion fitter
         if not self.diff_coeffs:
@@ -129,16 +144,10 @@ class BINN(nn.Module):
         self.coeff_max = self.reaction.max
         
         # input extrema
-        if data is not None:
-            self.x_min = float(torch.min(data[:, :self.dimensions]).item())
-            self.x_max = float(torch.max(data[:, :self.dimensions]).item())
-            self.t_min = float(torch.min(data[:, self.dimensions]).item())
-            self.t_max = float(torch.max(data[:, self.dimensions]).item())
-        else:
-            self.x_min = 0
-            self.x_max = 10
-            self.t_min = 0
-            self.t_max = 25
+        self.x_min = float(torch.min(self.x_train[:, :self.dimensions]).item())
+        self.x_max = float(torch.max(self.x_train[:, :self.dimensions]).item())
+        self.t_min = float(torch.min(self.x_train[:, self.dimensions]).item())
+        self.t_max = float(torch.max(self.x_train[:, self.dimensions]).item())
             
         # loss weights
         # self.gls_weight = 1e0
@@ -147,7 +156,6 @@ class BINN(nn.Module):
         self.gls_weight = gls_weight
         self.pde_weight = pde_weight
         self.l05_weight = l05_weight
-        self.l1_weight = l1_weight
         self.param_weight = 1e10 / self.param_bounds
         
         # proportionality constant
@@ -256,14 +264,9 @@ class BINN(nn.Module):
             self.D_loss += torch.mean(self.D_weight * torch.relu(D - self.D_max)**2)
             
         # Sparsity Regularization
-        if self.l05_weight:
-            l05_norm = custom_norm(coeffs, 0.01)
-            self.sparsity_loss += self.l05_weight * l05_norm
-            
-        if self.l1_weight:
-            l1_norm = torch.norm(coeffs, p=1)
-            self.sparsity_loss += self.l1_weight * l1_norm        
-        
+        l05_norm = custom_norm(coeffs, 0.01)
+        self.sparsity_loss += self.l05_weight * l05_norm
+                    
         return torch.mean(self.coeff_loss + self.D_loss + self.sparsity_loss)
 
     def loss(self, pred, true):
@@ -273,16 +276,15 @@ class BINN(nn.Module):
         
         # load cached inputs from forward pass
         inputs = self.inputs
-     
+        
         self.gls_loss_val = self.gls_weight*self.gls_loss(pred, true)
-
+       
         # randomly sample from input domain for PDE loss
-        x = torch.rand(self.num_samples, self.dimensions, requires_grad=True) 
-        x = x*(self.x_max - self.x_min) + self.x_min
-        t = torch.rand(self.num_samples, 1, requires_grad=True)
-        t = t*(self.t_max - self.t_min) + self.t_min
-        inputs_rand = torch.cat([x, t], dim=1).float().to(inputs.device)
-        # inputs_rand = torch.cat([x, t], dim=1).float()
+        x = torch.empty(self.num_samples, self.dimensions, dtype=torch.float32, device=inputs.device).uniform_(0, 1)
+        x = x * (self.x_max - self.x_min) + self.x_min
+        t = torch.empty(self.num_samples, 1, dtype=torch.float32, device=inputs.device).uniform_(0, 1)
+        t = t * (self.t_max - self.t_min) + self.t_min
+        inputs_rand = torch.cat([x, t], dim=1).requires_grad_()
         
         # predict surface fitter at sampled locations
         outputs_rand = self.surface_fitter(inputs_rand)
@@ -292,9 +294,6 @@ class BINN(nn.Module):
         
         # compute loss from regularization
         self.reg_loss_val += self.reg_loss()
-        
-        if torch.isnan((self.gls_loss_val + self.pde_loss_val + self.reg_loss_val)):
-            print("NaN in loss")
 
         return (self.gls_loss_val + self.pde_loss_val + self.reg_loss_val), self.gls_loss_val, self.pde_loss_val, self.reg_loss_val
 
@@ -492,8 +491,24 @@ class BINN(nn.Module):
                             self.reaction.eql_layer.fc.weight[0] = updated_coeffs
                             
                     else:
-                        break
-         
+                        break       
+                    
+    def prune(self):
+        # Create triangle mesh from min and max uv vals seen in train set
+        u_triangle_mesh, v_triangle_mesh = lltriangle(to_numpy(self.y_train[:, -2:]), 
+                                                        to_numpy(self.y_train[:, -1:]))
+        # Create 1d arrays from meshes
+        u_triangle, v_triangle = np.ravel(u_triangle_mesh), np.ravel(v_triangle_mesh)
+
+        # Create separate variables for arrays containing and not containing nans
+        uv_nans = np.stack((u_triangle, v_triangle), axis=1)
+        mask = ~np.isnan(uv_nans).any(axis=1)
+        uv = torch.from_numpy(uv_nans[mask]).to(self.y_train.device)
+        
+        # Prune
+        self.remove_insignificant_terms(uv)
+        self.fix_cheating_hill_functions(uv)
+
     def generate_equation(self):
         # Unpack coefficients
         poly_coeffs, hill_coeffs_inc, hill_coeffs_dec = self.unpack_coeffs()      
