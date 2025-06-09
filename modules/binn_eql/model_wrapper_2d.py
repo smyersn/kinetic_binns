@@ -1,7 +1,15 @@
-import torch, time, sys, pdb
+import torch, time, sys, pdb, os
 import numpy as np
+import psutil
 
 from modules.utils.time_remaining import *
+
+def print_memory_usage(str):
+    """ Helper function to print process RAM usage. """
+    process = psutil.Process(os.getpid())
+    mem_info = process.memory_info()
+    print(f"{str} | Process RAM: {mem_info.rss / 1024**2:.2f} MB")
+
 
 class model_wrapper():
    
@@ -59,6 +67,7 @@ class model_wrapper():
                  save_reg=False):
         
         self.model = model
+        self.species = self.model.species
         self.optimizer = optimizer
         self.loss = loss
         self.dir_name = dir_name
@@ -82,9 +91,8 @@ class model_wrapper():
             self.save_reg = False
         
     def fit(self,
-            train_loader,
-            val_loader,
-            device='cpu',
+            train_data,
+            val_data,
             batch_size=None,
             epochs=1,
             initial_epoch=0,
@@ -104,11 +112,11 @@ class model_wrapper():
         
         # Create trivial mask for pruning
         mask_shape = self.model.reaction.eql_layer.fc.weight.shape
-        mask = torch.ones(mask_shape, dtype=torch.float32, device=device)
+        mask = torch.ones(mask_shape, dtype=torch.float32, 
+                          device=train_data.device)
                     
         # loop over epochs
         for epoch in range(initial_epoch, initial_epoch + epochs):
-            epoch_init = time.time()
             #           
             # training step            
             #
@@ -119,7 +127,7 @@ class model_wrapper():
             epoch_start_time = time.time()
             
             # Prune model and print equation
-            if epoch > 0 and epoch % 10000 == 0:
+            if epoch > 0 and epoch % 20000 == 0:
                 fn = f'{self.dir_name}/equation.txt'
                 file = open(fn, 'a')
                 
@@ -131,91 +139,84 @@ class model_wrapper():
                 file.write(f'\n')
 
                 file.close()
-                
-                # Clear momentum and ADAM buffers
-                fc_weight = self.model.reaction.eql_layer.fc.weight  # shape: [out_dim, in_dim], or [num_terms] for 1×N
-                for group in self.optimizer.param_groups:
-                    for p in group['params']:
-                        if p is fc_weight:
-                            state = self.optimizer.state[p]
+                                
+                fc_weight = self.model.reaction.eql_layer.fc.weight
 
-                            # Build a mask: 1 where weight ≠ 0, 0 where weight == 0
-                            # Will also be used to zero grads for pruned parameters
-                            mask = (fc_weight.data != 0).float()
+                # Generate mask w/ zeros at positions of pruned parameters
+                with torch.no_grad(): # Ensure this operation doesn't track gradients
+                    mask = (fc_weight.data != 0).float()
 
-                            exp = state['exp_avg']
-                            with torch.no_grad():
-                                exp.mul_(mask)
-                            exp_sq = state['exp_avg_sq']
-                            with torch.no_grad():
-                                exp_sq.mul_(mask)
+                # Clear optimizer state for pruned parameters
+                for param_group in self.optimizer.param_groups:
+                    for param in param_group['params']:
+                        if param is fc_weight: # Only target the specific pruned layer
+                            if param in self.optimizer.state:
+                                state = self.optimizer.state[param]
+                                if 'exp_avg' in state:
+                                    state['exp_avg'].mul_(mask)
+                                if 'exp_avg_sq' in state:
+                                    state['exp_avg_sq'].mul_(mask)
             
             # Create lists for epoch training losses
-            train_losses = []
-            train_gls_losses = []
-            train_pde_losses = []
-            train_reg_losses = []
-            print(f'epoch init: {time.time() - epoch_init}')
-            end_of_loop = None
-            # loop over training batches
-            for batch_x_train , batch_y_train in train_loader:                     
-                batch_init = time.time() 
-                if end_of_loop:
-                    print(f'loop lag: {batch_init - end_of_loop}')
+            train_losses = 0
+            train_gls_losses = 0
+            train_pde_losses = 0
+            train_reg_losses = 0
 
-                # Move to GPU
-                batch_x_train = batch_x_train.to(device)
-                batch_y_train = batch_y_train.to(device)
-                print(f'train batch init: {time.time() - batch_init}')
+            # Shuffle training data
+            perm = torch.randperm(train_data.size(0))
+            
+            # loop over training batches
+            for i in range(0, len(train_data), batch_size):
+                idx = perm[i:i+batch_size]
+                x_true = train_data[idx, :-self.species].data.clone()
+                y_true = train_data[idx, -self.species:].data.clone()
                 
-                # computes loss
-                def closure():  
-                    compute_loss = time.time()                                        
-                    # zero out gradients
-                    self.optimizer.zero_grad()
-                                        
-                    # require gradients
-                    batch_x_train.requires_grad = True
-                    
-                    # run the model
-                    y_pred = self.model(batch_x_train)
-                                        
-                    # compute loss and optional regularization
-                    train_loss, train_gls_loss, train_pde_loss, train_reg_loss = self.loss(y_pred, batch_y_train)
-                               
-                    print(f'compute train loss: {time.time() - compute_loss}')  
-                    backward_pass = time.time()
-                                               
-                    # compute backward pass
-                    train_loss.backward(retain_graph=True)
-                    
-                    self.model.reaction.eql_layer.fc.weight.grad.data.mul_(mask)
-                                        
-                    train_losses.append(train_loss.cpu().detach().numpy() * len(batch_x_train))
-                    train_gls_losses.append(train_gls_loss.cpu().detach().numpy() * len(batch_x_train))
-                    train_pde_losses.append(train_pde_loss.cpu().detach().numpy() * len(batch_x_train))
-                    train_reg_losses.append(train_reg_loss.cpu().detach().numpy() * len(batch_x_train))
-                    print(f'train backward pass: {time.time() - backward_pass}') 
-                    
-                # update model parameters
-                if self.scheduler is None:
-                    self.optimizer.step(closure=closure)
-                else:
-                    self.scheduler.step(closure())
+                # zero out gradients
+                self.optimizer.zero_grad()
+                                    
+                # require gradients
+                x_true.requires_grad = True
                 
-                cuda_synch = time.time()                               
-                # wait for GPU computations to finish
-                if batch_x_train.device != torch.device('cpu'):
-                    torch.cuda.synchronize()
-                print(f'cuda train sync: {time.time() - cuda_synch}')
-                end_of_loop = time.time()
+                # run the model
+                y_pred = self.model(x_true)
+                # print(f'pred: {torch.isnan(y_pred).any()}')
+                                    
+                # compute loss and optional regularization
+                train_loss, train_gls_loss, train_pde_loss, train_reg_loss = self.loss(y_pred, y_true)
+                # print(f'loss: {torch.isnan(train_loss).any()}, gls: {torch.isnan(train_gls_loss).any()}, pde: {torch.isnan(train_pde_loss).any()}, reg: {torch.isnan(train_reg_loss).any()},')
+                                                                            
+                # compute backward pass and update weights
+                train_loss.backward()
                 
-            book_keeping = time.time()                                                                                          
+                # fc_weight_grad = self.model.reaction.eql_layer.fc.weight.grad
+                # if fc_weight_grad is not None:
+                #     print(f"GRAD BEFORE MASKING for fc_weight: is_nan: {torch.isnan(fc_weight_grad).any()}, is_inf: {torch.isinf(fc_weight_grad).any()}")
+                #     # You might want to print the actual grad values for a few pruned and unpruned weights
+                #     # print(fc_weight_grad) 
+
+                #     self.model.reaction.eql_layer.fc.weight.grad.data.mul_(mask)
+                #     print(f"GRAD AFTER MASKING for fc_weight: is_nan: {torch.isnan(fc_weight_grad).any()}, is_inf: {torch.isinf(fc_weight_grad).any()}")
+                #     # print(fc_weight_grad)
+                # else:
+                #     print("GRAD IS NONE for fc_weight")
+
+                self.model.reaction.eql_layer.fc.weight.grad.data.mul_(mask)
+                                    
+                self.optimizer.step()
+                
+                # Update losses
+                train_losses += train_loss.item() * len(x_true)
+                train_gls_losses += train_gls_loss.item() * len(x_true)
+                train_pde_losses += train_pde_loss.item() * len(x_true)
+                train_reg_losses += train_reg_loss.item() * len(x_true)
+
+            # print_memory_usage('After training loop')                    
             # update book keeping for this epoch
-            self.train_loss_dict['loss'].append(np.sum(train_losses) / len(train_loader.dataset))
-            self.train_loss_dict['gls'].append(np.sum(train_gls_losses) / len(train_loader.dataset))
-            self.train_loss_dict['pde'].append(np.sum(train_pde_losses) / len(train_loader.dataset))
-            self.train_loss_dict['reg'].append(np.sum(train_reg_losses) / len(train_loader.dataset))
+            self.train_loss_dict['loss'].append(np.sum(train_losses) / len(train_data))
+            self.train_loss_dict['gls'].append(np.sum(train_gls_losses) / len(train_data))
+            self.train_loss_dict['pde'].append(np.sum(train_pde_losses) / len(train_data))
+            self.train_loss_dict['reg'].append(np.sum(train_reg_losses) / len(train_data))
             
             # if train error improved
             rel_diff = (best_train_loss - self.train_loss_dict['loss'][-1])
@@ -228,8 +229,7 @@ class model_wrapper():
                 # optionally save model and optimizer
                 if self.save_best_train:
                     self.save(self.save_name+'_best_train')
-            print(f'train book keeping: {time.time() - book_keeping}')
-                
+
             #
             # validation step
             #                
@@ -239,42 +239,41 @@ class model_wrapper():
             self.model.eval()
             
             # Create lists for epoch training losses
-            val_losses = []
-            val_gls_losses = []
-            val_pde_losses = []
-            val_reg_losses = []
+            val_losses = 0
+            val_gls_losses = 0
+            val_pde_losses = 0
+            val_reg_losses = 0
+            
+            # Don't shuffle val data
+            no_perm  = torch.arange(val_data.size(0))
             
             # loop over validation batches
-            for batch_x_val, batch_y_val in val_loader:     
-                # Move to GPU
-                batch_x_val = batch_x_val.to(device)
-                batch_y_val = batch_y_val.to(device)
-           
+            for i in range(0, len(val_data), batch_size):
+                idx = no_perm[i:i+batch_size]
+                x_true = train_data[idx, :-self.species].data.clone()
+                y_true = train_data[idx, -self.species:].data.clone()
+                           
                 self.optimizer.zero_grad()
                                                 
                 # require gradients
-                batch_x_val.requires_grad = True
+                x_true.requires_grad = True
                                 
                 # run the model
-                y_pred = self.model(batch_x_val).data
+                y_pred = self.model(x_true).data
                 
                 # comptue loss
-                val_loss, val_gls_loss, val_pde_loss, val_reg_loss = self.loss(y_pred, batch_y_val)
+                val_loss, val_gls_loss, val_pde_loss, val_reg_loss = self.loss(y_pred, y_true)
                 
-                val_losses.append(val_loss.cpu().detach().numpy() * len(batch_x_train))
-                val_gls_losses.append(val_gls_loss.cpu().detach().numpy() * len(batch_x_train))
-                val_pde_losses.append(val_pde_loss.cpu().detach().numpy() * len(batch_x_train))
-                val_reg_losses.append(val_reg_loss.cpu().detach().numpy() * len(batch_x_train))
-                
-                # wait for GPU computations to finish
-                if batch_x_val.device != torch.device('cpu'):
-                    torch.cuda.synchronize()
-                                                   
+                val_losses += val_loss.item() * len(x_true)
+                val_gls_losses += val_gls_loss.item() * len(x_true)
+                val_pde_losses += val_pde_loss.item() * len(x_true)
+                val_reg_losses += val_reg_loss.item() * len(x_true)
+
             # update book keeping for this epoch
-            self.val_loss_dict['loss'].append(np.sum(val_losses) / len(val_loader.dataset))
-            self.val_loss_dict['gls'].append(np.sum(val_gls_losses) / len(val_loader.dataset))
-            self.val_loss_dict['pde'].append(np.sum(val_pde_losses) / len(val_loader.dataset))
-            self.val_loss_dict['reg'].append(np.sum(val_reg_losses) / len(val_loader.dataset))
+            self.val_loss_dict['loss'].append(np.sum(val_losses) / len(val_data))
+            self.val_loss_dict['gls'].append(np.sum(val_gls_losses) / len(val_data))
+            self.val_loss_dict['pde'].append(np.sum(val_pde_losses) / len(val_data))
+            self.val_loss_dict['reg'].append(np.sum(val_reg_losses) / len(val_data))
 
             # if validation error improved
             rel_diff = (best_val_loss - self.val_loss_dict['loss'][-1])
@@ -308,7 +307,7 @@ class model_wrapper():
                 previous_time=epoch_start_time,
                 ops_per_iter=batch_size)
             
-            print(f'total epoch length: {time.time() - epoch_init}')
+            # print(f'total epoch length: {time.time() - epoch_start_time}')
 
             # prints
             if epoch % 1000 == 0:
@@ -330,7 +329,7 @@ class model_wrapper():
                 if np.mod(epoch, lr_dec_epoch) == 0 and epoch != 0:
                     for param_group in self.optimizer.param_groups:
                         param_group['lr'] *= lr_dec_prop
-                        
+
         # final print readout
         elapsed, remaining, ms = time_remaining(
             current_iter=epoch+1,

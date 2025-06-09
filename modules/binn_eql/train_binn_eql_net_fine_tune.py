@@ -74,14 +74,14 @@ F_true = wave_pinning(uv_nans, params).reshape(501, 501)
 
 # Split training data
 batch_size=int(0.1*len(training_data))
-train_loader, val_loader = training_test_split(training_data, batch_size, species)
-# x_train, y_train, x_val, y_val = training_test_split(training_data, dimensions, device)
+# train_loader, val_loader = training_test_split(training_data, batch_size, species)
+train_data, val_data = training_test_split(training_data, device)
 
 # initialize model and compile
 binn = BINN(
     dimensions=dimensions,
     species=species, 
-    train_loader=train_loader, 
+    train_data=train_data, 
     duplicates=duplicates,
     diff_coeffs=diff_coeffs,
     degree=degree,
@@ -105,9 +105,8 @@ model = model_wrapper(
 
 # train jointly
 train_loss_dict, val_loss_dict = model.fit(
-    train_loader=train_loader,
-    val_loader=val_loader,
-    device=device,
+    train_data=train_data,
+    val_data=val_data,
     batch_size=batch_size,
     epochs=epochs,
     early_stopping=2500,
