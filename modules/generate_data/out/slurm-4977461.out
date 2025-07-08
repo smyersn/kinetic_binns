@@ -1,0 +1,20 @@
+Traceback (most recent call last):
+  File "/work/users/s/m/smyersn/elston/projects/kinetics_binns/modules/generate_data/simulate_gpu.py", line 124, in <module>
+    u_array, t_array = simulate_surface(wave_pinning, params)
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/users/s/m/smyersn/elston/projects/kinetics_binns/modules/generate_data/simulate_gpu.py", line 79, in simulate_surface
+    lap_u = conv(u[None, None, :, :]).squeeze() / dx**2
+            ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/users/s/m/smyersn/miniconda3/envs/binns/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/users/s/m/smyersn/miniconda3/envs/binns/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/users/s/m/smyersn/miniconda3/envs/binns/lib/python3.11/site-packages/torch/nn/modules/conv.py", line 554, in forward
+    return self._conv_forward(input, self.weight, self.bias)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/users/s/m/smyersn/miniconda3/envs/binns/lib/python3.11/site-packages/torch/nn/modules/conv.py", line 538, in _conv_forward
+    return F.conv2d(
+           ^^^^^^^^^
+RuntimeError: Input type (torch.FloatTensor) and weight type (torch.cuda.FloatTensor) should be the same or input should be a MKLDNN tensor and weight is a dense tensor

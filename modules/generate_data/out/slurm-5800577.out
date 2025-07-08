@@ -1,0 +1,6 @@
+Progress: 0.0%
+Progress: 10.0%
+Progress: 20.0%
+Progress: 30.0%
+Progress: 40.0%
+slurmstepd: error: *** JOB 5800577 ON dgx01 CANCELLED AT 2025-06-18T14:48:54 ***

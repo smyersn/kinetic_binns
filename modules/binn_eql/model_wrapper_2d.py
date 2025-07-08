@@ -4,13 +4,6 @@ import psutil
 
 from modules.utils.time_remaining import *
 
-def print_memory_usage(str):
-    """ Helper function to print process RAM usage. """
-    process = psutil.Process(os.getpid())
-    mem_info = process.memory_info()
-    print(f"{str} | Process RAM: {mem_info.rss / 1024**2:.2f} MB")
-
-
 class model_wrapper():
    
     '''
@@ -101,17 +94,17 @@ class model_wrapper():
             best_val_loss=None,
             lr_dec_epoch=None,
             lr_dec_prop=1.0,
-            rel_save_thresh=0.0,
-            fine_tune=False):
+            rel_save_thresh=0.0):
                 
         # initialize book keeping
         start_time = time.time()
         last_improved = 0
+        last_pruned = 0
         best_train_loss = 1e12 if best_train_loss is None else best_train_loss
         best_val_loss = 1e12 if best_val_loss is None else best_val_loss        
         
         # Create trivial mask for pruning
-        mask_shape = self.model.reaction.eql_layer.fc.weight.shape
+        mask_shape = self.model.reaction.eql_layer.fc.raw_weight.shape
         mask = torch.ones(mask_shape, dtype=torch.float32, 
                           device=train_data.device)
                     
@@ -127,11 +120,13 @@ class model_wrapper():
             epoch_start_time = time.time()
             
             # Prune model and print equation
-            if epoch > 0 and epoch % 20000 == 0:
+            if epoch > 0 and epoch % 25000 == 0:
+                last_pruned = epoch 
+                
                 fn = f'{self.dir_name}/equation.txt'
                 file = open(fn, 'a')
                 
-                self.model.prune()
+                self.model.prune(thresh=2)
                 
                 file.write(f'Pruned Equation Epoch {epoch}\n')
                 for term in self.model.generate_equation():
@@ -140,7 +135,7 @@ class model_wrapper():
 
                 file.close()
                                 
-                fc_weight = self.model.reaction.eql_layer.fc.weight
+                fc_weight = self.model.reaction.eql_layer.fc.raw_weight
 
                 # Generate mask w/ zeros at positions of pruned parameters
                 with torch.no_grad(): # Ensure this operation doesn't track gradients
@@ -180,28 +175,14 @@ class model_wrapper():
                 
                 # run the model
                 y_pred = self.model(x_true)
-                # print(f'pred: {torch.isnan(y_pred).any()}')
                                     
                 # compute loss and optional regularization
                 train_loss, train_gls_loss, train_pde_loss, train_reg_loss = self.loss(y_pred, y_true)
-                # print(f'loss: {torch.isnan(train_loss).any()}, gls: {torch.isnan(train_gls_loss).any()}, pde: {torch.isnan(train_pde_loss).any()}, reg: {torch.isnan(train_reg_loss).any()},')
                                                                             
                 # compute backward pass and update weights
                 train_loss.backward()
                 
-                # fc_weight_grad = self.model.reaction.eql_layer.fc.weight.grad
-                # if fc_weight_grad is not None:
-                #     print(f"GRAD BEFORE MASKING for fc_weight: is_nan: {torch.isnan(fc_weight_grad).any()}, is_inf: {torch.isinf(fc_weight_grad).any()}")
-                #     # You might want to print the actual grad values for a few pruned and unpruned weights
-                #     # print(fc_weight_grad) 
-
-                #     self.model.reaction.eql_layer.fc.weight.grad.data.mul_(mask)
-                #     print(f"GRAD AFTER MASKING for fc_weight: is_nan: {torch.isnan(fc_weight_grad).any()}, is_inf: {torch.isinf(fc_weight_grad).any()}")
-                #     # print(fc_weight_grad)
-                # else:
-                #     print("GRAD IS NONE for fc_weight")
-
-                self.model.reaction.eql_layer.fc.weight.grad.data.mul_(mask)
+                self.model.reaction.eql_layer.fc.raw_weight.grad.data.mul_(mask)
                                     
                 self.optimizer.step()
                 
@@ -211,7 +192,6 @@ class model_wrapper():
                 train_pde_losses += train_pde_loss.item() * len(x_true)
                 train_reg_losses += train_reg_loss.item() * len(x_true)
 
-            # print_memory_usage('After training loop')                    
             # update book keeping for this epoch
             self.train_loss_dict['loss'].append(np.sum(train_losses) / len(train_data))
             self.train_loss_dict['gls'].append(np.sum(train_gls_losses) / len(train_data))
@@ -228,6 +208,7 @@ class model_wrapper():
                 
                 # optionally save model and optimizer
                 if self.save_best_train:
+                    self.model.prune(thresh=2)
                     self.save(self.save_name+'_best_train')
 
             #
@@ -285,10 +266,8 @@ class model_wrapper():
                 
                 # optionally save model and optimizer
                 if self.save_best_val:
-                    if fine_tune:
-                        self.save(self.save_name+'_best_val_fine_tuned')
-                    else:
-                        self.save(self.save_name+'_best_val')
+                    self.model.prune(thresh=2)
+                    self.save(self.save_name+'_best_val')
                 
                 # update early stopper
                 last_improved = epoch
@@ -307,8 +286,6 @@ class model_wrapper():
                 previous_time=epoch_start_time,
                 ops_per_iter=batch_size)
             
-            # print(f'total epoch length: {time.time() - epoch_start_time}')
-
             # prints
             if epoch % 1000 == 0:
                 p = 'Epoch {0}'.format(epoch)
@@ -320,8 +297,7 @@ class model_wrapper():
                 
             # optional early stopping
             if early_stopping is not None:
-                # if epoch - last_improved >= early_stopping and epoch >= 10000:
-                if epoch - last_improved >= early_stopping:
+                if epoch - last_improved >= early_stopping and epoch > last_pruned+5000:
                     break
                     
             # optional learning rate annealing

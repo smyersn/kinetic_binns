@@ -1,0 +1,52 @@
+Progress: 0.0%
+tensor([[[0., 0., 0.,  ..., 0., 0., 0.],
+         [0., 0., 0.,  ..., 0., 0., 0.],
+         [0., 0., 0.,  ..., 0., 0., 0.],
+         ...,
+         [0., 0., 0.,  ..., 0., 0., 0.],
+         [0., 0., 0.,  ..., 0., 0., 0.],
+         [0., 0., 0.,  ..., 0., 0., 0.]],
+
+        [[0., 0., 0.,  ..., 0., 0., 0.],
+         [0., 0., 0.,  ..., 0., 0., 0.],
+         [0., 0., 0.,  ..., 0., 0., 0.],
+         ...,
+         [0., 0., 0.,  ..., 0., 0., 0.],
+         [0., 0., 0.,  ..., 0., 0., 0.],
+         [0., 0., 0.,  ..., 0., 0., 0.]]])
+tensor([[[0.9785, 0.9619, 0.9629,  ..., 1.1266, 1.0774, 1.0206],
+         [0.9725, 0.9673, 0.9768,  ..., 1.0867, 1.0449, 1.0011],
+         [0.9908, 0.9970, 1.0121,  ..., 1.0520, 1.0240, 1.0010],
+         ...,
+         [0.9918, 0.9688, 0.9557,  ..., 1.0957, 1.0559, 1.0207],
+         [0.9967, 0.9725, 0.9642,  ..., 1.1396, 1.0899, 1.0380],
+         [0.9927, 0.9696, 0.9649,  ..., 1.1516, 1.0996, 1.0397]],
+
+        [[1.0116, 1.0122, 1.0127,  ..., 1.0097, 1.0103, 1.0110],
+         [1.0117, 1.0122, 1.0127,  ..., 1.0099, 1.0105, 1.0111],
+         [1.0118, 1.0122, 1.0126,  ..., 1.0103, 1.0108, 1.0113],
+         ...,
+         [1.0114, 1.0120, 1.0125,  ..., 1.0096, 1.0102, 1.0108],
+         [1.0114, 1.0121, 1.0126,  ..., 1.0095, 1.0101, 1.0108],
+         [1.0115, 1.0121, 1.0126,  ..., 1.0095, 1.0101, 1.0108]]])
+Traceback (most recent call last):
+  File "/work/users/s/m/smyersn/elston/projects/kinetics_binns/modules/generate_data/simulate_gpu.py", line 126, in <module>
+    u_array, t_array = simulate_surface(wave_pinning, params)
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/users/s/m/smyersn/elston/projects/kinetics_binns/modules/generate_data/simulate_gpu.py", line 74, in simulate_surface
+    diff = np.max(np.abs(current_save - last_save))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/users/s/m/smyersn/miniconda3/envs/binns/lib/python3.11/site-packages/numpy/core/fromnumeric.py", line 2810, in max
+    return _wrapreduction(a, np.maximum, 'max', axis, None, out,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/users/s/m/smyersn/miniconda3/envs/binns/lib/python3.11/site-packages/numpy/core/fromnumeric.py", line 86, in _wrapreduction
+    return reduction(axis=axis, out=out, **passkwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: max() received an invalid combination of arguments - got (out=NoneType, axis=NoneType, ), but expected one of:
+ * ()
+ * (Tensor other)
+ * (int dim, bool keepdim = False)
+      didn't match because some of the keywords were incorrect: out, axis
+ * (name dim, bool keepdim = False)
+      didn't match because some of the keywords were incorrect: out, axis
+

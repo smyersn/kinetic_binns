@@ -98,16 +98,19 @@ def simulate_surface(training_data, model):
     device = 'cuda'
     
     xt = training_data[:, :dimensions+1]
-    points = len(np.unique(training_data[:, 0]))
+    points = int(torch.unique(xt[:, 0]).numel())
     ic = training_data[training_data[:, dimensions] == 0]
+    
+    u0 = ic[:, dimensions + 1]                      # shape: (points**dimensions,)
+    v0 = ic[:, dimensions + 2]
 
-    u = torch.tensor(np.reshape(ic[:, dimensions+1], (points,)*dimensions)).float().to(device)
-    v = torch.tensor(np.reshape(ic[:, dimensions+2], (points,)*dimensions)).float().to(device)
+    grid_shape = [points] * dimensions
+    u = u0.reshape(*grid_shape).float().to(device)  # (points, points, ..., points)
+    v = v0.reshape(*grid_shape).float().to(device)
 
     # --- Parameters ---
-    T = np.max(xt[:, dimensions])
-    # T=5
-    L = np.max(xt[:, 0])
+    T = float(xt[:, dimensions].max().item())       # max time
+    L = float(xt[:, 0].max().item())                # max x-coordinate
 
     nx, ny = u.shape                 # grid size
     dx, dy = L / nx, L / ny  

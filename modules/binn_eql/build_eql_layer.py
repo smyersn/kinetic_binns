@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from modules.binn_eql.bounded_linear_layer import BoundedLinear
        
 class HillFunction(nn.Module):
     def __init__(self, param_bounds, increasing=True):
@@ -134,8 +135,7 @@ class EQLLayer(nn.Module):
 
         self.total_features = self.num_poly_features + self.num_hill_features
                 
-        self.fc = nn.Linear(self.total_features, 1, bias=False)
-        nn.init.uniform_(self.fc.weight, a=-param_bounds, b=param_bounds)
+        self.fc = BoundedLinear(self.total_features, 1, param_bounds)
 
     def forward(self, x):
         # if torch.isnan(x).any():

@@ -1,4 +1,4 @@
-import sys, os
+import sys, os, re
 import importlib
 file_dir = os.path.dirname(os.path.realpath(__file__))
 repo_start = f'{file_dir}/../../'
@@ -7,7 +7,7 @@ sys.path.append(repo_start)
 from modules.utils.imports import *
 from modules.binn_eql.model_wrapper_2d import model_wrapper
 from modules.binn_eql.build_binn_eql_net import BINN
-from modules.loaders.format_data import format_data_general
+from modules.loaders.format_data import format_data_general, format_data_torch
 from modules.loaders.visualize_training_data import animate_data
 from modules.utils.noise_and_interpolate import noise_and_interpolate
 from modules.utils.training_test_split import training_test_split
@@ -49,7 +49,9 @@ rel_save_thresh = 0.01
 device = 'cuda'
 
 # Load training data (columns: x*dimensions, t, species concentrations)
-training_data = format_data_general(dimensions, species, file=training_data_path)
+data = torch.load(training_data_path)
+u_array, x_array, t_array = data['u_array'], data['x_array'], data['t_array']
+training_data = format_data_torch(u_array, x_array, t_array)
 
 # Add noise to training data if specified in config file
 if epsilon != 0 or points != 0:
@@ -57,9 +59,18 @@ if epsilon != 0 or points != 0:
 
 animate_data(training_data, dimensions, species, name=f'{dir_name}/training_data')
 
+
+
+########
+# DO TRIANGLE BS IN PYTORCH
+########
+
+
+
+
 # Create triangle mesh from min and max uv vals seen in training data
-u_triangle_mesh, v_triangle_mesh = lltriangle(training_data[:, -2:], 
-                                                training_data[:, -1:])
+u_triangle_mesh, v_triangle_mesh = lltriangle(to_numpy(training_data[:, -2:]), 
+                                                to_numpy(training_data[:, -1:]))
 # Create 1d arrays from meshes
 u_triangle, v_triangle = np.ravel(u_triangle_mesh), np.ravel(v_triangle_mesh)
 
@@ -68,8 +79,16 @@ uv_nans = np.stack((u_triangle, v_triangle), axis=1)
 mask = ~np.isnan(uv_nans).any(axis=1)
 uv = torch.from_numpy(uv_nans[mask]).to(device)
 
+# Get params for calculating true surface
+filename = os.path.basename(training_data_path)
+numbers = re.findall(r'(?<=_)(?:\d*\.\d+|\d+)', filename)
+
+if len(numbers) == 3:
+    params = list(map(float, numbers))
+else:
+    params = 1, 1, 0.01
+    
 # Generate true surface
-params = 1, 1, 0.01
 F_true = wave_pinning(uv_nans, params).reshape(501, 501)
 
 # Split training data
@@ -109,15 +128,13 @@ train_loss_dict, val_loss_dict = model.fit(
     val_data=val_data,
     batch_size=batch_size,
     epochs=epochs,
-    early_stopping=2500,
+    early_stopping=2000,
     rel_save_thresh=rel_save_thresh)
 
 generate_loss_curves(train_loss_dict, val_loss_dict, dir_name, 20, 'training_loss_curves')
 
 # Load and prune final model
 model.load(f"{dir_name}/binn_best_val_model", device=device)
-model.model.remove_insignificant_terms(uv)
-model.model.fix_cheating_hill_functions(uv)
 
 # Print final equation
 fn = f'{dir_name}/equation.txt'

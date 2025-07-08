@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "/work/users/s/m/smyersn/elston/projects/kinetics_binns/modules/generate_data/simulate_gpu.py", line 124, in <module>
+    u_array, t_array = simulate_surface(wave_pinning, params)
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/users/s/m/smyersn/elston/projects/kinetics_binns/modules/generate_data/simulate_gpu.py", line 65, in simulate_surface
+    u_array[i] = torch.stack([u, v], dim=0)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: expected Tensor as element 0 in argument 0, but got numpy.ndarray

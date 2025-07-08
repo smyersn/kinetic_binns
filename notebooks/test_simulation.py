@@ -1,13 +1,7 @@
-import torch
-print(torch.__version__)           # Should end with +cu118
-print(torch.cuda.is_available())   # Should be True (on a GPU node)
-
-import torchdiffeq
 import sys, os
-import time
 import importlib
 from IPython.display import HTML
-from torchdiffeq import odeint
+# from torchdiffeq import odeint
 repo_start = f'../'
 sys.path.append(repo_start)
 
@@ -23,8 +17,30 @@ from modules.binn_eql.simulate_surface import simulate_surface
 from modules.generate_data.simulate_system import generate_initial_conditions, simulate
 from modules.loaders.visualize_training_data import animate_data
 
+def animate_new_sim(u_array, t_array, name=None): 
+    fig, ax = plt.subplots()
+    u_plot = ax.imshow(u_array[0, 0, :, :], cmap='viridis')
+    u_plot.set_clim(vmin=u_array[:, 0, :, :].min(),
+                    vmax=u_array[:, 0, :, :].max())
+    cbar = plt.colorbar(u_plot, ax=ax)
+    
+    # Define update function
+    def animate(frame):
+        u_plot.set_array(u_array[frame, 0, :, :])
+        ax.set_title(f'T = {t_array[frame]}')
+        
+    # Create animation
+    anim = animation.FuncAnimation(fig, animate, frames=range(len(u_array)), repeat=True)
+    
+    if name:
+        writergif = animation.PillowWriter(fps=5)
+        anim.save(f'{name}.gif', writer=writergif)
+
+    return anim
+
 # load params from configuration file
-dir_name = '/work/users/s/m/smyersn/elston/projects/kinetics_binns/development/binn_eql_net/runs/debugging/17_fine_tuning/binn_eql_gls_1_pde_1_l05_0.01_repeat_33'
+dir_name = '/work/users/s/m/smyersn/elston/projects/kinetics_binns/development/binn_eql_net/runs/debugging/23_longer_fine_tuning/binn_eql_gls_1_pde_1_repeat_12'
+save_name = '12'
 config = {}
 exec(Path(f'{dir_name}/config.cfg').read_text(encoding="utf8"), {}, config)
 
@@ -50,9 +66,6 @@ param_bounds = float(config['param_bounds'])
 # Set training hyperparameters
 epochs = int(1e6)
 rel_save_thresh = 0.01
-
-# Get GPU
-# device = 'cpu'
 device = 'cuda'
 
 # Load training data (columns: x*dimensions, t, species concentrations)
@@ -74,20 +87,19 @@ mask = ~np.isnan(uv_nans).any(axis=1)
 uv = torch.from_numpy(uv_nans[mask]).to(device)
 
 # Split training data
-x_train, y_train, x_val, y_val = training_test_split(training_data, dimensions, device)
+train_data, val_data = training_test_split(training_data, device)
 
 # initialize model and compile
 binn = BINN(
     dimensions=dimensions,
     species=species, 
+    train_data=train_data, 
     duplicates=duplicates,
-    data=x_train.cpu(), 
     diff_coeffs=diff_coeffs,
     degree=degree,
     gls_weight=gls_weight,
     pde_weight=pde_weight,
     l05_weight=l05_weight,
-    l1_weight=l1_weight,
     param_bounds=param_bounds)
 
 binn.to(device)
@@ -100,106 +112,84 @@ model = model_wrapper(
     model=binn,
     optimizer=opt,
     loss=binn.loss,
-    augmentation=None,
+    dir_name=dir_name,
     save_name=f'{dir_name}/binn')
 
+# model.load(f"{dir_name}/binn_best_val_model", device=device)
 model.load(f"{dir_name}/binn_best_val_fine_tuned_model", device=device)
-model.model.remove_insignificant_terms(uv)
-model.model.fix_cheating_hill_functions(uv)
 
-# Format initial conditions
+# --- Initial Conditions ---
+xt = training_data[:, :dimensions+1]
+points = len(np.unique(training_data[:, 0]))
 ic = training_data[training_data[:, dimensions] == 0]
 
-x_vals = ic[:, 0]
-y_vals = ic[:, 1]
-u_vals = ic[:, 3]
-v_vals = ic[:, 4]
+u = torch.tensor(np.reshape(ic[:, dimensions+1], (points,)*dimensions)).float().to(device)
+v = torch.tensor(np.reshape(ic[:, dimensions+2], (points,)*dimensions)).float().to(device)
 
-# Identify unique sorted grid points
-x_unique = np.sort(np.unique(x_vals))
-y_unique = np.sort(np.unique(y_vals))
+# --- Parameters ---
+T = np.max(xt[:, dimensions])
+L = np.max(xt[:, 0])
 
-H, W = len(y_unique), len(x_unique)  # H: rows (y), W: cols (x)
+nx, ny = u.shape                 # grid size
+dx, dy = L / nx, L / ny  
+dt = 0.0001                       # time step
+nits = int(T / dt)                # number of time steps
+du, dv = model.model.diff_coeffs  # diffusion rates
 
-# Build mapping from (x, y) to grid indices
-x_to_idx = {x: i for i, x in enumerate(x_unique)}
-y_to_idx = {y: i for i, y in enumerate(y_unique)}
+# --- Laplacian kernel (5-point stencil) ---
+laplace_kernel = torch.tensor([[0, 1, 0],
+                               [1, -4, 1],
+                               [0, 1, 0]], dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)
 
-# Initialize empty grid tensors
-u_grid = np.zeros((H, W))
-v_grid = np.zeros((H, W))
+# conv = nn.Conv2d(1, 1, 3, padding=1, bias=False)
 
-# Fill in the grid
-for row in ic:
-    x, y, _, u, v = row
-    i, j = y_to_idx[y], x_to_idx[x]
-    u_grid[i, j] = u
-    v_grid[i, j] = v
+conv = nn.Conv2d(
+    in_channels=1,
+    out_channels=1,
+    kernel_size=3,
+    padding=1,
+    padding_mode='circular',
+    bias=False)
 
-# Stack channels and add batch dimension
-u0 = np.stack([u_grid, v_grid], axis=0)         # shape: (2, H, W)
-u0 = torch.tensor(u0, dtype=torch.float32).unsqueeze(0)  # shape: (1, 2, H, W)
+conv.weight.data = laplace_kernel
+conv.weight.requires_grad = False
+conv = conv.to(device)
 
-# Calculate dx
-x_vals = np.sort(np.unique(ic[:, 0]))
-dx = np.min(np.diff(x_vals))
+# --- Neural network for reaction ---
+reaction = model.model.reaction.eval()
 
-class RDESystem(torch.nn.Module):
-    def __init__(self, reaction_model, diff_coeffs, dx):
-        super().__init__()
-        self.reaction = reaction_model
-        self.diff_coeffs = torch.tensor(diff_coeffs, device=u0.device).view(1, 2, 1, 1)
-        self.dx2 = dx ** 2
+# --- Storage ---
+half_sec_nits = int(0.5 / dt)
+half_secs = int(nits / half_sec_nits) + 1
 
-    def forward(self, t, u):
-        # --- Diffusion ---
-        lap_kernel = torch.tensor([[[[0, 1, 0],
-                        [1, -4, 1],
-                        [0, 1, 0]]]], dtype=torch.float32)
-        lap_kernel = lap_kernel.expand(2, 1, 3, 3)  # (out_channels, in_channels/groups, H, W)
+u_array = torch.zeros((half_secs, 2, nx, ny))
+t_array = torch.arange(0, T + 0.5, 0.5)
 
-        laplace_u = self.diff_coeffs * (torch.nn.functional.conv2d(u, lap_kernel, padding=1, groups=2) / self.dx2)
+# Track time point in storage array
+i = 0
 
-        # --- Reaction ---
-        u_flat = u0.squeeze(0).permute(1, 2, 0).reshape(-1, 2)  # shape: (H*W, 2)
-        reaction_u_flat = self.reaction(u_flat)  # shape: (H*W, 1)
-        reaction_u = reaction_u_flat.reshape(H, W, 1).permute(2, 0, 1).unsqueeze(0)  # shape: (1, 1, H, W)
-        reaction_u = torch.cat([reaction_u, -reaction_u], dim=1)  # shape: (1, 2, H, W)
-class RDESystem(torch.nn.Module):
-    def __init__(self, reaction_model, diff_coeffs, dx):
-        super().__init__()
-        self.reaction = reaction_model
-        self.diff_coeffs = torch.tensor(diff_coeffs, device=u0.device).view(1, 2, 1, 1)
-        self.dx2 = dx ** 2
-
-    def forward(self, t, u):
-        # --- Diffusion ---
-        lap_kernel = torch.tensor([[[[0, 1, 0],
-                        [1, -4, 1],
-                        [0, 1, 0]]]], dtype=torch.float32)
-        lap_kernel = lap_kernel.expand(2, 1, 3, 3)  # (out_channels, in_channels/groups, H, W)
-
-        laplace_u = self.diff_coeffs * (torch.nn.functional.conv2d(u, lap_kernel, padding=1, groups=2) / self.dx2)
-
-        # --- Reaction ---
-        u_flat = u0.squeeze(0).permute(1, 2, 0).reshape(-1, 2)  # shape: (H*W, 2)
-        reaction_u_flat = self.reaction(u_flat)  # shape: (H*W, 1)
-        reaction_u = reaction_u_flat.reshape(H, W, 1).permute(2, 0, 1).unsqueeze(0)  # shape: (1, 1, H, W)
-        reaction_u = torch.cat([reaction_u, -reaction_u], dim=1)  # shape: (1, 2, H, W)
-
-        return laplace_u + reaction_u
+# --- Simulation loop ---
+for t in range(nits):
     
-reaction = model.model.reaction
-diff_coeffs = model.model.diff_coeffs
+    # Update storage every half second
+    if t % half_sec_nits == 0:
+        u_array[i] = torch.stack([u, v], dim=0)
+        i += 1
 
-T = 10
-dt = 0.0001
-t = torch.arange(0, T + dt, dt)
+    # Compute Laplacian (diffusion)
+    lap_u = conv(u[None, None, :, :]).squeeze() / dx**2
+    lap_v = conv(v[None, None, :, :]).squeeze() / dx**2
 
-start = time.time()
+    # Reaction term
+    uv = torch.column_stack((u.flatten(), v.flatten()))
+    with torch.no_grad():
+        ruv = reaction(uv).view(nx, ny)
+    
+    # Euler update
+    u = u + dt * (du * lap_u + ruv)
+    v = v + dt * (dv * lap_v - ruv)        
 
-solution = odeint(RDESystem(reaction, diff_coeffs, dx), u0, t, method='rk4')
-
-end = time.time()
-
-print(f"Elapsed time: {((end - start)/60):.4f} minutes")
+    if t % (nits // 10) == 0:
+        print(f"Progress: {(t / nits) * 100}%", flush=True)     
+        
+anim = animate_new_sim(u_array, t_array, save_name)

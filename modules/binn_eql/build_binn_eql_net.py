@@ -30,18 +30,19 @@ class D_PARAMS(nn.Module):
         D (torch tensor): predicted diffusivities with shape (N, 1)
     '''
     
-    def __init__(self, input_features=2):
+    def __init__(self, input_features=2, param_bounds=10):
         
         super().__init__()
         self.input_features = input_features
-        self.activation = softplus_relu()
+        self.param_bounds = param_bounds
+        self.activation = nn.Sigmoid()
         self.min = 0
         self.max = 10
         self.params = nn.Parameter(torch.rand(self.input_features))
         # self.params = nn.Parameter(torch.tensor([0.01, 1]))
         
     def forward(self):     
-        D = self.activation(self.params)
+        D = self.activation(self.params) * self.param_bounds
         return D
 
 class uv_MLP(nn.Module):
@@ -63,13 +64,20 @@ class uv_MLP(nn.Module):
     
     def __init__(self, input_features, layers=[128, 128, 128, 2]):
         
+        # super().__init__()
+        # self.mlp = build_mlp(
+        #     input_features=input_features, 
+        #     layers=layers,
+        #     activation=nn.Sigmoid(), 
+        #     linear_output=False,
+        #     output_activation=softplus_relu())
         super().__init__()
         self.mlp = build_mlp(
             input_features=input_features, 
             layers=layers,
-            activation=nn.Sigmoid(), 
+            activation=nn.Tanh(), 
             linear_output=False,
-            output_activation=softplus_relu())
+            output_activation=nn.Softplus())
     
     def forward(self, inputs):
         outputs = self.mlp(inputs)
@@ -113,7 +121,7 @@ class BINN(nn.Module):
         
         # diffusion fitter
         if not self.diff_coeffs:
-            self.diffusion_fitter = D_PARAMS(input_features=self.species)
+            self.diffusion_fitter = D_PARAMS(self.species, param_bounds)
             
             # diffusion extrema
             self.D_min = self.diffusion_fitter.min
@@ -236,45 +244,12 @@ class BINN(nn.Module):
     def reg_loss(self):
         # Calculate coefficient loss
         coeffs = self.reaction.eql_layer.fc.weight
-        coeff_loss = torch.mean(self.param_weight * (coeffs - coeffs.clamp(self.coeff_min, self.coeff_max))**2)
-
-        # Calculate diffusion coeff loss
-        if not self.diff_coeffs:
-            D = self.diffusion_fitter()
-            D_loss = torch.mean(self.D_weight * (D - coeffs.clamp(self.D_min, self.D_max))**2)
-        else:
-            D_loss = torch.tensor(0.0, device=coeffs.device)
 
         # Sparsity Regularization
         l05_norm = custom_norm(coeffs, 0.01)
         sparsity_loss = self.l05_weight * l05_norm
 
-        return coeff_loss + D_loss + sparsity_loss
-  
-    # def reg_loss(self):
-    #     # constraints on learned parameters
-    #     self.coeff_loss = 0
-    #     self.D_loss = 0
-    #     self.sparsity_loss = 0
-        
-    #     # Get coefficients for terms
-    #     coeffs = self.reaction.eql_layer.fc.weight
-
-    #     self.coeff_loss += torch.mean(self.param_weight * torch.relu(self.coeff_min - coeffs)**2)
-    #     self.coeff_loss += torch.mean(self.param_weight * torch.relu(coeffs - self.coeff_max)**2)
-                
-    #     if not self.diff_coeffs:
-    #         D = self.diffusion_fitter()
-
-    #         self.D_loss += torch.mean(self.D_weight * torch.relu(self.D_min - D)**2)
-    #         self.D_loss += torch.mean(self.D_weight * torch.relu(D - self.D_max)**2)
-            
-    #     # Sparsity Regularization
-    #     l05_norm = custom_norm(coeffs, 0.01)
-    #     self.sparsity_loss += self.l05_weight * l05_norm
-                    
-    #     return torch.mean(self.coeff_loss + self.D_loss + self.sparsity_loss)
-    
+        return sparsity_loss    
 
     def loss(self, pred, true):
         self.gls_loss_val = 0
@@ -384,10 +359,9 @@ class BINN(nn.Module):
                 Ks_dec.append(torch.sigmoid(hill_func.raw_K).item() * self.param_bounds)
                 
         return ns_inc, ns_dec, Ks_inc, Ks_dec
-    
-    def remove_insignificant_terms(self, uv):
-        # removes all terms from individual that have minor impact on total
-        # surface shape and magnitude        
+            
+    def remove_insignificant_terms(self, uv, thresh):
+        # removes all terms from individual that have minor impact on surface
         poly_feats = self.reaction.eql_layer.poly(uv)
         hill_feats = self.reaction.eql_layer.hill(uv)
         feats = torch.cat([poly_feats, hill_feats], dim=1)
@@ -395,21 +369,25 @@ class BINN(nn.Module):
         weights = self.reaction.eql_layer.fc.weight[0]
         weighted_feats = feats * weights  
         
-        surface = weighted_feats.sum(dim=1)      
+        surface = weighted_feats.sum(dim=1)  
         
-        for i in range(len(weights)):
-            if weights[i] != 0:
-                surface_wo_feat = surface - weighted_feats[:, i]
-                rmse = torch.sqrt(torch.mean((surface - surface_wo_feat)**2))
-                # surface_range = torch.max(surface) - torch.min(surface)
-                surface_range = torch.mean(torch.abs(surface))
-                coeff = rmse / surface_range
+        # Calculate RMSE if any feature is removed
+        rmse = torch.sqrt((weighted_feats**2).mean(dim=0))          # [M]
+        
+        # Determine which features are insignificant
+        surface_range = torch.mean(torch.abs(surface))              # scalar
 
-                if coeff < 1.5:
-                    with torch.no_grad():
-                        self.reaction.eql_layer.fc.weight[0][i] = 0
-            
-    def fix_cheating_hill_functions(self, uv):
+        # Calculate coefficient of variation
+        coeffs = rmse / surface_range                               # [M]
+
+        # build boolean mask of insignificant features
+        mask = (coeffs < thresh)
+                                
+        # zero them out insignificant features
+        with torch.no_grad():
+            self.reaction.eql_layer.fc.raw_weight[0][mask] = 0
+
+    def fix_cheating_hill_functions(self, uv, thresh):
         # Symbolic net sometimes "cheats" by approximating polynomial terms with
         # increasing Hill functions. This method corrects for this mistake.
         
@@ -431,16 +409,23 @@ class BINN(nn.Module):
                 n = ns_inc[i]
                 K = Ks_inc[i]
                 
-                specie = uv[:, term[0]]
+                hill_specie = uv[:, term[0]]
                 
-                # check that denominator is roughly constant
-                denom_vals = 1 + K * specie**n
+                # check if difference between hill function and corresponding
+                # polynomial function is insignificant
+                hill_surface = hill_specie**n / (1 + K * hill_specie**n)
+                poly_surface = hill_specie**n
+                rmse = torch.sqrt(((poly_surface - hill_surface)**2).mean(dim=0))
                 
-                if denom_vals.std() < 0.25:
+                print(rmse)
+                
+                if rmse < thresh:
                     n = int(torch.round(torch.tensor(n)))
                     
                     # find corresponding polynomial term Hill function is approximating
                     # with cheating
+                    hill_idx = len(poly_terms) + i
+                    
                     if len(term) == 1:
                         poly_term = (term[0],) * n
                     if len(term) > 1:
@@ -449,17 +434,14 @@ class BINN(nn.Module):
                     if poly_term in poly_terms:    
                         poly_idx = poly_terms.index(poly_term)
                         
-                        with torch.no_grad():                   
-                            # Change poly coefficient to cheating Hill coefficient
-                            poly_coeffs[poly_idx] = poly_coeffs[poly_idx] + hill_coeffs_inc[i]
-                            
-                            # Make cheating Hill coefficient 0
-                            hill_coeffs_inc[i] = 0
-                            
-                            # Gather updated coefficients, update model params
-                            updated_coeffs = torch.cat((poly_coeffs, hill_coeffs_inc, hill_coeffs_dec))
-                            
-                            self.reaction.eql_layer.fc.weight[0] = updated_coeffs
+                        with torch.no_grad(): 
+                            # get poly raw weight from weight      
+                            weight = poly_coeffs[poly_idx] + hill_coeffs_inc[i]           
+                            sig = (weight + self.param_bounds) / (2 * self.param_bounds)
+                            poly_raw_weight = torch.log(sig / (1 - sig))
+
+                            self.reaction.eql_layer.fc.raw_weight[0][poly_idx] = poly_raw_weight
+                            self.reaction.eql_layer.fc.raw_weight[0][hill_idx] = 0
                             
                     else:
                         break
@@ -472,12 +454,14 @@ class BINN(nn.Module):
                 
                 hill_specie = uv[:, term[0]]
                 poly_specie = uv[:, term[-1]]
-                                
-                # check that dec Hill vals roughly equal to poly vals
-                hill_vals = (hill_coeffs_dec[i] * poly_specie) * ((1 / K) - hill_specie**n / (1 + K * hill_specie**n))
-                poly_vals = hill_coeffs_dec[i] * poly_specie * (1 / K)
+
+                # check if difference between hill function and corresponding
+                # polynomial function is insignificant
+                hill_surface = (hill_coeffs_dec[i] * poly_specie) * ((1 / K) - hill_specie**n / (1 + K * hill_specie**n))
+                poly_surface = hill_coeffs_dec[i] * poly_specie * (1 / K)
+                rmse = torch.sqrt(((poly_surface - hill_surface)**2).mean(dim=0))
                 
-                if (hill_vals - poly_vals).std() < 0.25:                    
+                if rmse < thresh:                    
                     # find corresponding polynomial term Hill function is approximating
                     # with cheating
                     poly_term = (term[-1],)
@@ -499,22 +483,14 @@ class BINN(nn.Module):
                             
                     else:
                         break       
-                    
-    def prune(self):
-        # Create triangle mesh from min and max uv vals seen in train set
-        u_triangle_mesh, v_triangle_mesh = lltriangle(to_numpy(self.train_data[:, -2]), 
-                                                        to_numpy(self.train_data[:, -1]))
-        # Create 1d arrays from meshes
-        u_triangle, v_triangle = np.ravel(u_triangle_mesh), np.ravel(v_triangle_mesh)
-
-        # Create separate variables for arrays containing and not containing nans
-        uv_nans = np.stack((u_triangle, v_triangle), axis=1)
-        mask = ~np.isnan(uv_nans).any(axis=1)
-        uv = torch.from_numpy(uv_nans[mask]).to(self.train_data)
+                              
+    def prune(self, thresh):       
+        # Get uv values from training data
+        uv = self.train_data[:, -2:]
 
         # Prune
-        self.remove_insignificant_terms(uv)
-        self.fix_cheating_hill_functions(uv)
+        self.remove_insignificant_terms(uv, thresh)
+        self.fix_cheating_hill_functions(uv, thresh)
 
     def generate_equation(self):
         # Unpack coefficients
