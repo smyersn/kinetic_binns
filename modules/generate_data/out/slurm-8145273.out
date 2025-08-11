@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "/work/users/s/m/smyersn/elston/projects/kinetics_binns/modules/generate_data/simulate_gpu.py", line 122, in <module>
+    diff_coeffs = [float(sys.argv[2]), float(sys.argv[3])]
+                         ~~~~~~~~^^^
+IndexError: list index out of range

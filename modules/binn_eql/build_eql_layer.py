@@ -135,7 +135,10 @@ class EQLLayer(nn.Module):
 
         self.total_features = self.num_poly_features + self.num_hill_features
                 
-        self.fc = BoundedLinear(self.total_features, 1, param_bounds)
+        # self.fc = BoundedLinear(self.total_features, 1, param_bounds)
+        self.fc = nn.Linear(self.total_features, 1, bias=False)
+        nn.init.uniform_(self.fc.weight, a=-param_bounds, b=param_bounds)
+
 
     def forward(self, x):
         # if torch.isnan(x).any():

@@ -116,7 +116,12 @@ def simulate_surface(training_data, model):
     dx, dy = L / nx, L / ny  
     dt = 0.0001                       # time step
     nits = int(T / dt)                # number of time steps
-    du, dv = model.model.diff_coeffs  # diffusion rates
+    
+    if model.model.diff_coeffs:
+        du, dv = model.model.diff_coeffs  # diffusion rates
+    else:        
+        with torch.no_grad():
+            du, dv = model.model.diffusion_fitter()
 
     # --- Laplacian kernel (5-point stencil) ---
     laplace_kernel = torch.tensor([[0, 1, 0],

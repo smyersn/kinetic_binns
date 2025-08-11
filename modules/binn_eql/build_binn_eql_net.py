@@ -35,14 +35,20 @@ class D_PARAMS(nn.Module):
         super().__init__()
         self.input_features = input_features
         self.param_bounds = param_bounds
-        self.activation = nn.Sigmoid()
-        self.min = 0
-        self.max = 10
-        self.params = nn.Parameter(torch.rand(self.input_features))
-        # self.params = nn.Parameter(torch.tensor([0.01, 1]))
+
+        # 1) Sample initial diffusivities in [0, D_max]
+        D0 = torch.rand(input_features) * param_bounds  # shape = (species,)
+
+        # 2) Invert softplus: raw = ln(exp(D0) - 1)
+        #    Use log1p for numerical stability: exp(D0) - 1 = expm1(D0)
+        raw0 = torch.log(torch.expm1(D0))
+
+        # 3) Register as a single learnable parameter
+        self.raw = nn.Parameter(raw0)
         
     def forward(self):     
-        D = self.activation(self.params) * self.param_bounds
+        # D = self.activation(self.params) * self.param_bounds
+        D = F.softplus(self.raw)
         return D
 
 class uv_MLP(nn.Module):
@@ -63,21 +69,21 @@ class uv_MLP(nn.Module):
     '''
     
     def __init__(self, input_features, layers=[128, 128, 128, 2]):
-        
-        # super().__init__()
-        # self.mlp = build_mlp(
-        #     input_features=input_features, 
-        #     layers=layers,
-        #     activation=nn.Sigmoid(), 
-        #     linear_output=False,
-        #     output_activation=softplus_relu())
+    # def __init__(self, input_features, layers=[256, 256, 256, 256, 2]):
         super().__init__()
         self.mlp = build_mlp(
             input_features=input_features, 
             layers=layers,
-            activation=nn.Tanh(), 
+            activation=nn.Sigmoid(), 
             linear_output=False,
-            output_activation=nn.Softplus())
+            output_activation=softplus_relu())
+        # super().__init__()
+        # self.mlp = build_mlp(
+        #     input_features=input_features, 
+        #     layers=layers,
+        #     activation=nn.Tanh(), 
+        #     linear_output=False,
+        #     output_activation=nn.Softplus())
     
     def forward(self, inputs):
         outputs = self.mlp(inputs)
@@ -107,8 +113,8 @@ class BINN(nn.Module):
     '''
     
     def __init__(self, dimensions, species, train_data, duplicates=1,
-                 diff_coeffs=None, degree=2, gls_weight=1, pde_weight=1, 
-                 l05_weight=0.01, param_bounds=10):
+                 diff_coeffs=None, uv_layers=None, degree=2, gls_weight=1, 
+                 pde_weight=1, l05_weight=0.01, param_bounds=10):
         
         super().__init__()
         self.dimensions = dimensions        
@@ -124,14 +130,17 @@ class BINN(nn.Module):
             self.diffusion_fitter = D_PARAMS(self.species, param_bounds)
             
             # diffusion extrema
-            self.D_min = self.diffusion_fitter.min
-            self.D_max = self.diffusion_fitter.max
+            self.D_min = 0
+            self.D_max = self.diffusion_fitter.param_bounds
             
             # loss weight
             self.D_weight = 1e10 / self.D_max
                 
         # surface fitter
-        self.surface_fitter = uv_MLP(input_features=dimensions+1)
+        if uv_layers:
+            self.surface_fitter = uv_MLP(input_features=dimensions+1, layers=uv_layers)
+        else:
+            self.surface_fitter = uv_MLP(input_features=dimensions+1)
         
         # reaction
         self.reaction = F_EQL(species, duplicates, self.param_bounds)
@@ -169,27 +178,14 @@ class BINN(nn.Module):
         self.inputs = inputs
         return self.surface_fitter(self.inputs)
     
-    # def gls_loss(self, pred, true):
-    #     residual = (pred - true)**2
-    #     residual *= pred.abs().clamp(min=1.0)**(-self.gamma)
-
-    #     return torch.mean(residual)
     
     def gls_loss(self, pred, true):
         
         residual = (pred - true)**2
-        
-        # # add weight to initial condition
-        # residual *= torch.where(self.inputs[:, self.dimensions][:, None]==0, 
-        #                         self.IC_weight*torch.ones_like(pred), 
-        #                         torch.ones_like(pred))
-        
-        # # proportional GLS weighting
-        # residual *= pred.abs().clamp(min=1.0)**(-self.gamma)
-        
+                
         return torch.mean(residual)
     
-    def pde_loss(self, inputs, outputs):
+    def pde_loss(self, inputs, outputs, epoch):
         # unpack outputs
         u = outputs.clone()
         
@@ -230,32 +226,46 @@ class BINN(nn.Module):
         RHS_v = lap_v - F
         pde_loss = (LHS_u - RHS_u)**2 + (LHS_v - RHS_v)**2
         
-        # print(f'Du, Dv: {Du, Dv}')
-        # print(f'xtuv: {torch.concat([inputs, u], dim=1)[:20]}')
-        # print(f'LHSU RHSU: {torch.concat([LHS_u, RHS_u], dim=1)[:20]}')
-        # print(f'RHSU, LAPU, F: {torch.concat([RHS_u, lap_u, F], dim=1)[:20]}')
-        # print(f'LHSV RHSV: {torch.concat([LHS_v, RHS_v], dim=1)[:20]}')
-        # print(f'RHSV, LAPV, -F: {torch.concat([RHS_v, lap_v, -F], dim=1)[:20]}')
-        # print(f'loss: {pde_loss[:20]}')
-        # print(f'mean loss: {torch.mean(pde_loss)}')
+        # if epoch % 1000 == 0:
+        #     print(f'PDE LOSS START:')
+        #     print(f'Du, Dv: {Du, Dv}')
+        #     print(f'xtuv: {torch.concat([inputs, u], dim=1)[:20]}')
+        #     print(f'LHSU RHSU: {torch.concat([LHS_u, RHS_u], dim=1)[:20]}')
+        #     print(f'RHSU, LAPU, F: {torch.concat([RHS_u, lap_u, F], dim=1)[:20]}')
+        #     print(f'LHSV RHSV: {torch.concat([LHS_v, RHS_v], dim=1)[:20]}')
+        #     print(f'RHSV, LAPV, -F: {torch.concat([RHS_v, lap_v, -F], dim=1)[:20]}')
+        #     print(f'loss: {pde_loss[:20]}')
+        #     print(f'pde loss: {torch.mean(pde_loss)}\n')
 
         return torch.mean(pde_loss)
     
-    def reg_loss(self):
+    def reg_loss(self, epoch):
         # Calculate coefficient loss
         coeffs = self.reaction.eql_layer.fc.weight
+        coeff_loss = torch.mean(self.param_weight * (coeffs - coeffs.clamp(self.coeff_min, self.coeff_max))**2)
+
+        # Calculate diffusion coeff loss
+        if not self.diff_coeffs:
+            D = self.diffusion_fitter()
+            D_loss = torch.mean(self.D_weight * (D - D.clamp(self.D_min, self.D_max))**2)
+        else:
+            D_loss = torch.tensor(0.0, device=coeffs.device)
 
         # Sparsity Regularization
         l05_norm = custom_norm(coeffs, 0.01)
         sparsity_loss = self.l05_weight * l05_norm
-
-        return sparsity_loss    
-
-    def loss(self, pred, true):
-        self.gls_loss_val = 0
-        self.pde_loss_val = 0       
-        self.reg_loss_val = 0
         
+        # if epoch % 1000 == 0:
+        #     print(f'REG LOSS START')
+        #     print(f'coeffs: {coeffs}')
+        #     print(f'coeff loss: {coeff_loss}')
+        #     print(f'D: {D}')
+        #     print(f'D loss: {D_loss}')
+        #     print(f'sparsity loss: {sparsity_loss}\n')
+
+        return coeff_loss + D_loss + sparsity_loss
+
+    def loss(self, pred, true, epoch):
         # load cached inputs from forward pass
         inputs = self.inputs
         
@@ -272,10 +282,37 @@ class BINN(nn.Module):
         outputs_rand = self.surface_fitter(inputs_rand)
         
         # compute PDE loss at sampled locations
-        self.pde_loss_val += self.pde_weight*self.pde_loss(inputs_rand, outputs_rand)
+        self.pde_loss_val = self.pde_weight*self.pde_loss(inputs_rand, outputs_rand, epoch)
         
         # compute loss from regularization
-        self.reg_loss_val += self.reg_loss()
+        self.reg_loss_val = self.reg_loss(epoch)
+        
+        # # load cached inputs from forward pass
+        # inputs = self.inputs
+
+        # if epoch < 5000:
+        #     self.gls_loss_val = self.gls_weight*self.gls_loss(pred, true)
+        #     self.pde_loss_val = torch.tensor(0).to(inputs.device)
+        #     self.reg_loss_val = torch.tensor(0).to(inputs.device)
+            
+        # else:
+        #     self.gls_loss_val = torch.tensor(0).to(inputs.device)
+            
+        #     # randomly sample from input domain for PDE loss
+        #     x = torch.empty(self.num_samples, self.dimensions, dtype=torch.float32, device=inputs.device).uniform_(0, 1)
+        #     x = x * (self.x_max - self.x_min) + self.x_min
+        #     t = torch.empty(self.num_samples, 1, dtype=torch.float32, device=inputs.device).uniform_(0, 1)
+        #     t = t * (self.t_max - self.t_min) + self.t_min
+        #     inputs_rand = torch.cat([x, t], dim=1).requires_grad_()
+            
+        #     # predict surface fitter at sampled locations
+        #     outputs_rand = self.surface_fitter(inputs_rand)
+            
+        #     # compute PDE loss at sampled locations
+        #     self.pde_loss_val = self.pde_weight*self.pde_loss(inputs_rand, outputs_rand, epoch)
+            
+        #     # compute loss from regularization
+        #     self.reg_loss_val = self.reg_loss(epoch)
 
         return (self.gls_loss_val + self.pde_loss_val + self.reg_loss_val), self.gls_loss_val, self.pde_loss_val, self.reg_loss_val
 
@@ -370,22 +407,55 @@ class BINN(nn.Module):
         weighted_feats = feats * weights  
         
         surface = weighted_feats.sum(dim=1)  
-        
+                
         # Calculate RMSE if any feature is removed
         rmse = torch.sqrt((weighted_feats**2).mean(dim=0))          # [M]
+        # print(f'rmse: {rmse}')
         
         # Determine which features are insignificant
         surface_range = torch.mean(torch.abs(surface))              # scalar
-
+        # print(f'surface range: {surface_range}')
+        
         # Calculate coefficient of variation
         coeffs = rmse / surface_range                               # [M]
-
+        # print(f'coeffs: {coeffs}')
+        
         # build boolean mask of insignificant features
         mask = (coeffs < thresh)
                                 
         # zero them out insignificant features
         with torch.no_grad():
-            self.reaction.eql_layer.fc.raw_weight[0][mask] = 0
+            # self.reaction.eql_layer.fc.raw_weight[0][mask] = 0
+            self.reaction.eql_layer.fc.weight[0][mask] = 0
+            
+            
+            
+        # # removes all terms from individual that have minor impact on surface
+        # poly_feats = self.reaction.eql_layer.poly(uv)
+        # hill_feats = self.reaction.eql_layer.hill(uv)
+        # feats = torch.cat([poly_feats, hill_feats], dim=1)
+
+        # weights = self.reaction.eql_layer.fc.weight[0]
+        # weighted_feats = feats * weights 
+        
+        # surface = weighted_feats.sum(dim=1)        
+                        
+        # # Calculate RMSE if any feature is removed
+        # rmse = torch.sqrt((weighted_feats**2).mean(dim=0))          # [M]
+        
+        # # Determine which features are insignificant
+        # surface_range = torch.max(surface) - torch.min(surface)             # scalar
+
+        # # Calculate coefficient of variation
+        # coeffs = rmse / surface_range                               # [M]
+
+        # # build boolean mask of insignificant features
+        # mask = (coeffs < thresh)
+                                
+        # # zero them out insignificant features
+        # with torch.no_grad():
+        #     # self.reaction.eql_layer.fc.raw_weight[0][mask] = 0
+        #     self.reaction.eql_layer.fc.weight[0][mask] = 0
 
     def fix_cheating_hill_functions(self, uv, thresh):
         # Symbolic net sometimes "cheats" by approximating polynomial terms with
@@ -416,9 +486,7 @@ class BINN(nn.Module):
                 hill_surface = hill_specie**n / (1 + K * hill_specie**n)
                 poly_surface = hill_specie**n
                 rmse = torch.sqrt(((poly_surface - hill_surface)**2).mean(dim=0))
-                
-                print(rmse)
-                
+                                
                 if rmse < thresh:
                     n = int(torch.round(torch.tensor(n)))
                     
@@ -436,12 +504,14 @@ class BINN(nn.Module):
                         
                         with torch.no_grad(): 
                             # get poly raw weight from weight      
-                            weight = poly_coeffs[poly_idx] + hill_coeffs_inc[i]           
-                            sig = (weight + self.param_bounds) / (2 * self.param_bounds)
-                            poly_raw_weight = torch.log(sig / (1 - sig))
+                            # weight = poly_coeffs[poly_idx] + hill_coeffs_inc[i]           
+                            # sig = (weight + self.param_bounds) / (2 * self.param_bounds)
+                            # poly_raw_weight = torch.log(sig / (1 - sig))
 
-                            self.reaction.eql_layer.fc.raw_weight[0][poly_idx] = poly_raw_weight
-                            self.reaction.eql_layer.fc.raw_weight[0][hill_idx] = 0
+                            # self.reaction.eql_layer.fc.raw_weight[0][poly_idx] = poly_raw_weight
+                            # self.reaction.eql_layer.fc.raw_weight[0][hill_idx] = 0
+                            self.reaction.eql_layer.fc.weight[0][poly_idx] = poly_coeffs[poly_idx] + hill_coeffs_inc[i]
+                            self.reaction.eql_layer.fc.weight[0][hill_idx] = 0
                             
                     else:
                         break

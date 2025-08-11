@@ -99,12 +99,11 @@ class model_wrapper():
         # initialize book keeping
         start_time = time.time()
         last_improved = 0
-        last_pruned = 0
         best_train_loss = 1e12 if best_train_loss is None else best_train_loss
         best_val_loss = 1e12 if best_val_loss is None else best_val_loss        
         
         # Create trivial mask for pruning
-        mask_shape = self.model.reaction.eql_layer.fc.raw_weight.shape
+        mask_shape = self.model.reaction.eql_layer.fc.weight.shape
         mask = torch.ones(mask_shape, dtype=torch.float32, 
                           device=train_data.device)
                     
@@ -119,14 +118,36 @@ class model_wrapper():
             self.model.train()
             epoch_start_time = time.time()
             
-            # Prune model and print equation
-            if epoch > 0 and epoch % 25000 == 0:
-                last_pruned = epoch 
-                
+            # if epoch >= 5000:
+            #     for param in self.model.surface_fitter.parameters():
+            #         param.requires_grad = False
+            #         print(param)
+                                                
+            # if epoch > 0 and epoch % 25000 == 0:
+            # # if epoch > 0 and epoch % 100 == 0:
+                                
+            #     self.model.prune(thresh=3)
+                                                
+            #     fc_weight = self.model.reaction.eql_layer.fc.weight
+
+            #     # Generate mask w/ zeros at positions of pruned parameters
+            #     with torch.no_grad(): # Ensure this operation doesn't track gradients
+            #         mask = (fc_weight.data != 0).float()
+
+            #     # Clear optimizer state for pruned parameters
+            #     for param_group in self.optimizer.param_groups:
+            #         for param in param_group['params']:
+            #             if param is fc_weight: # Only target the specific pruned layer
+            #                 if param in self.optimizer.state:
+            #                     state = self.optimizer.state[param]
+            #                     if 'exp_avg' in state:
+            #                         state['exp_avg'].mul_(mask)
+            #                     if 'exp_avg_sq' in state:
+            #                         state['exp_avg_sq'].mul_(mask)
+            
+            if epoch % 1000 == 0:  
                 fn = f'{self.dir_name}/equation.txt'
                 file = open(fn, 'a')
-                
-                self.model.prune(thresh=2)
                 
                 file.write(f'Pruned Equation Epoch {epoch}\n')
                 for term in self.model.generate_equation():
@@ -134,24 +155,7 @@ class model_wrapper():
                 file.write(f'\n')
 
                 file.close()
-                                
-                fc_weight = self.model.reaction.eql_layer.fc.raw_weight
 
-                # Generate mask w/ zeros at positions of pruned parameters
-                with torch.no_grad(): # Ensure this operation doesn't track gradients
-                    mask = (fc_weight.data != 0).float()
-
-                # Clear optimizer state for pruned parameters
-                for param_group in self.optimizer.param_groups:
-                    for param in param_group['params']:
-                        if param is fc_weight: # Only target the specific pruned layer
-                            if param in self.optimizer.state:
-                                state = self.optimizer.state[param]
-                                if 'exp_avg' in state:
-                                    state['exp_avg'].mul_(mask)
-                                if 'exp_avg_sq' in state:
-                                    state['exp_avg_sq'].mul_(mask)
-            
             # Create lists for epoch training losses
             train_losses = 0
             train_gls_losses = 0
@@ -177,12 +181,14 @@ class model_wrapper():
                 y_pred = self.model(x_true)
                                     
                 # compute loss and optional regularization
-                train_loss, train_gls_loss, train_pde_loss, train_reg_loss = self.loss(y_pred, y_true)
+                train_loss, train_gls_loss, train_pde_loss, train_reg_loss = self.loss(y_pred, y_true, epoch)
                                                                             
                 # compute backward pass and update weights
                 train_loss.backward()
                 
-                self.model.reaction.eql_layer.fc.raw_weight.grad.data.mul_(mask)
+                grad = self.model.reaction.eql_layer.fc.weight.grad
+                if grad is not None:
+                    grad.mul_(mask)
                                     
                 self.optimizer.step()
                 
@@ -208,7 +214,8 @@ class model_wrapper():
                 
                 # optionally save model and optimizer
                 if self.save_best_train:
-                    self.model.prune(thresh=2)
+                    print(f'Pruned and saved at epoch {epoch}')
+                    self.model.prune(thresh=3)
                     self.save(self.save_name+'_best_train')
 
             #
@@ -243,7 +250,7 @@ class model_wrapper():
                 y_pred = self.model(x_true).data
                 
                 # comptue loss
-                val_loss, val_gls_loss, val_pde_loss, val_reg_loss = self.loss(y_pred, y_true)
+                val_loss, val_gls_loss, val_pde_loss, val_reg_loss = self.loss(y_pred, y_true, epoch)
                 
                 val_losses += val_loss.item() * len(x_true)
                 val_gls_losses += val_gls_loss.item() * len(x_true)
@@ -266,7 +273,8 @@ class model_wrapper():
                 
                 # optionally save model and optimizer
                 if self.save_best_val:
-                    self.model.prune(thresh=2)
+                    print(f'Pruned and saved at epoch {epoch}')
+                    self.model.prune(thresh=3)
                     self.save(self.save_name+'_best_val')
                 
                 # update early stopper
@@ -297,7 +305,8 @@ class model_wrapper():
                 
             # optional early stopping
             if early_stopping is not None:
-                if epoch - last_improved >= early_stopping and epoch > last_pruned+5000:
+                # if epoch - last_improved >= early_stopping and epoch > last_pruned+2500:
+                if epoch - last_improved >= early_stopping and epoch > 10000:
                     break
                     
             # optional learning rate annealing
@@ -305,6 +314,17 @@ class model_wrapper():
                 if np.mod(epoch, lr_dec_epoch) == 0 and epoch != 0:
                     for param_group in self.optimizer.param_groups:
                         param_group['lr'] *= lr_dec_prop
+
+        # final prune
+        if self.save_best_train:
+            self.load(self.save_name+'_best_train_model')
+            self.model.prune(thresh=3)
+            self.save(self.save_name+'_best_train')
+
+        if self.save_best_val:
+            self.load(self.save_name+'_best_val_model')
+            self.model.prune(thresh=3)
+            self.save(self.save_name+'_best_val')
 
         # final print readout
         elapsed, remaining, ms = time_remaining(

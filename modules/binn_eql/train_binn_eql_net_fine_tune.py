@@ -42,7 +42,7 @@ dir_name = sys.argv[1]
 
 # Set training hyperparameters
 epochs = int(1e6)
-# epochs = 1000
+# epochs = 100
 rel_save_thresh = 0.01
 
 # Get GPU
@@ -55,7 +55,9 @@ training_data = format_data_torch(u_array, x_array, t_array)
 
 # Add noise to training data if specified in config file
 if epsilon != 0 or points != 0:
-    training_data = noise_and_interpolate(training_data, points, epsilon, dimensions, species)
+    training_data = noise_and_interpolate(training_data, points, epsilon, 
+                                          dimensions, species, 
+                                          multiplicative_noise=False)
 
 animate_data(training_data, dimensions, species, name=f'{dir_name}/training_data')
 
@@ -128,7 +130,7 @@ train_loss_dict, val_loss_dict = model.fit(
     val_data=val_data,
     batch_size=batch_size,
     epochs=epochs,
-    early_stopping=2000,
+    early_stopping=2500,
     rel_save_thresh=rel_save_thresh)
 
 generate_loss_curves(train_loss_dict, val_loss_dict, dir_name, 20, 'training_loss_curves')
@@ -146,6 +148,7 @@ for term in model.model.generate_equation():
 
 if not diff_coeffs:
     file.write(f'\nDiff. coeffs. after fine tuning:\n')
+    
     file.write(f'{[D.item() for D in model.model.diffusion_fitter()]}\n')
         
 file.close()

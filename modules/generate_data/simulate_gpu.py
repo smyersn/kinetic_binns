@@ -10,7 +10,7 @@ from modules.loaders.format_data import format_data_general
 from modules.loaders.visualize_training_data import animate_data
 from modules.generate_data.simulate_system import wave_pinning
     
-def simulate_surface(reaction, params, early_stop=True):
+def simulate_surface(reaction, params=(1, 1, 0.01), diff_coeffs=(0.01, 1), early_stop=True):
     # --- Set Parameters --- 
     dim = 2
     species = 2
@@ -23,14 +23,14 @@ def simulate_surface(reaction, params, early_stop=True):
     dx = L / N
     dt = 0.0001                       # time step
     nits = int(T / dt)                # number of time steps
-    du, dv = 0.01, 1                  # diffusion rates
+    du, dv = diff_coeffs                  # diffusion rates
 
     # --- Initial Conditions ---
     u0, v0 = 1, 1.0246
-    # u = ((torch.rand(*(N,) * dim) + 0.5) * u0).to(device)
-    # v = (torch.ones((N,) * dim) * v0).to(device)
-    u = (torch.rand(*(N,) * dim) * 3).to(device)
-    v = (torch.rand(*(N,) * dim) * 3).to(device)
+    u = ((torch.rand(*(N,) * dim) + 0.5) * u0).to(device)
+    v = (torch.ones((N,) * dim) * v0).to(device)
+    # u = (torch.rand(*(N,) * dim) * 3).to(device)
+    # v = (torch.rand(*(N,) * dim) * 3).to(device)
 
     # --- Laplacian kernel (5-point stencil) ---
     laplace_kernel = torch.tensor([[0, 1, 0],
@@ -119,10 +119,13 @@ def animate_new_sim(u_array, t_array, save_name=None):
 
 if __name__ == '__main__':  
     a = float(sys.argv[1]) 
+    diff_coeffs = [float(sys.argv[2]), float(sys.argv[3])]
+
     params = (a, 1, 0.01)
-    save_name = f'/work/users/s/m/smyersn/elston/projects/kinetics_binns/data/2d/pos_feedback_new_ic/a_{a}_b_1_k_0.01'
-        
-    u_array, x_array, t_array = simulate_surface(wave_pinning, params)
+
+    # save_name = f'/work/users/s/m/smyersn/elston/projects/kinetics_binns/data/2d/pos_feedback_new_ic/a_{a}_b_1_k_0.01'
+    save_name = f'/work/users/s/m/smyersn/elston/projects/kinetics_binns/data/2d/diff_coeffs/wave_pinning/select_torch/du_{diff_coeffs[0]}_dv_{diff_coeffs[1]}' 
+    u_array, x_array, t_array = simulate_surface(wave_pinning, params, diff_coeffs)
     torch.save({'u_array': u_array, 'x_array': x_array, 't_array': t_array}, f'{save_name}.pt')
     
     anim = animate_new_sim(u_array, t_array, f'{save_name}.gif')
