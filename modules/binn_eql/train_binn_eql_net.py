@@ -36,6 +36,7 @@ pde_weight=float(config['pde_weight'])
 l05_weight = float(config['l05_weight'])
 l1_weight = float(config['l1_weight'])
 param_bounds = float(config['param_bounds'])
+prune_thresh = float(config['prune_thresh'])
 
 dir_name = sys.argv[1]
 
@@ -89,6 +90,7 @@ model = model_wrapper(
 train_loss_dict, val_loss_dict = model.fit(
     x=x_train,
     y=y_train,
+    prune_thresh=prune_thresh,
     batch_size=int(0.05*len(training_data)),
     epochs=epochs,
     validation_data=[x_val, y_val],

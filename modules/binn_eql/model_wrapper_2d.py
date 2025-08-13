@@ -86,6 +86,7 @@ class model_wrapper():
     def fit(self,
             train_data,
             val_data,
+            prune_thresh,
             batch_size=None,
             epochs=1,
             initial_epoch=0,
@@ -100,13 +101,12 @@ class model_wrapper():
         start_time = time.time()
         last_improved = 0
         best_train_loss = 1e12 if best_train_loss is None else best_train_loss
-        best_val_loss = 1e12 if best_val_loss is None else best_val_loss        
+        best_val_loss = 1e12 if best_val_loss is None else best_val_loss      
         
-        # Create trivial mask for pruning
-        mask_shape = self.model.reaction.eql_layer.fc.weight.shape
-        mask = torch.ones(mask_shape, dtype=torch.float32, 
-                          device=train_data.device)
-                    
+        # Create trivial EQL mask (later used for pruning)
+        fc_weight = self.model.reaction.eql_layer.fc.weight
+        self.model.eql_mask = torch.ones_like(fc_weight)
+
         # loop over epochs
         for epoch in range(initial_epoch, initial_epoch + epochs):
             #           
@@ -118,34 +118,13 @@ class model_wrapper():
             self.model.train()
             epoch_start_time = time.time()
             
-            # if epoch >= 5000:
-            #     for param in self.model.surface_fitter.parameters():
-            #         param.requires_grad = False
-            #         print(param)
-                                                
-            # if epoch > 0 and epoch % 25000 == 0:
-            # # if epoch > 0 and epoch % 100 == 0:
-                                
-            #     self.model.prune(thresh=3)
-                                                
-            #     fc_weight = self.model.reaction.eql_layer.fc.weight
+            # prune every 2500 epochs    
+            if epoch % 2500 == 0 and epoch > 0:  
+                # Prune
+                print(f'Epoch {epoch}:')
+                self.prune_by_gradient_saliency(prune_thresh)
 
-            #     # Generate mask w/ zeros at positions of pruned parameters
-            #     with torch.no_grad(): # Ensure this operation doesn't track gradients
-            #         mask = (fc_weight.data != 0).float()
-
-            #     # Clear optimizer state for pruned parameters
-            #     for param_group in self.optimizer.param_groups:
-            #         for param in param_group['params']:
-            #             if param is fc_weight: # Only target the specific pruned layer
-            #                 if param in self.optimizer.state:
-            #                     state = self.optimizer.state[param]
-            #                     if 'exp_avg' in state:
-            #                         state['exp_avg'].mul_(mask)
-            #                     if 'exp_avg_sq' in state:
-            #                         state['exp_avg_sq'].mul_(mask)
-            
-            if epoch % 1000 == 0:  
+                # Print equation
                 fn = f'{self.dir_name}/equation.txt'
                 file = open(fn, 'a')
                 
@@ -164,6 +143,9 @@ class model_wrapper():
 
             # Shuffle training data
             perm = torch.randperm(train_data.size(0))
+            
+            # Initialize gradient accumulator at start of each epoch
+            grad_accum = torch.zeros_like(self.model.reaction.eql_layer.fc.weight)
             
             # loop over training batches
             for i in range(0, len(train_data), batch_size):
@@ -186,17 +168,25 @@ class model_wrapper():
                 # compute backward pass and update weights
                 train_loss.backward()
                 
-                grad = self.model.reaction.eql_layer.fc.weight.grad
-                if grad is not None:
-                    grad.mul_(mask)
-                                    
-                self.optimizer.step()
+                fc_weight = self.model.reaction.eql_layer.fc.weight
+                
+                if fc_weight.grad is not None:
+                    fc_weight.grad.data.mul_(self.model.eql_mask)   # block gradients on pruned entries
+                    grad_accum += fc_weight.grad.abs()
+
+                self.optimizer.step()                         # update
+                # immediately enforce mask to avoid any drift
+                with torch.no_grad():
+                    fc_weight.data.mul_(self.model.eql_mask)
                 
                 # Update losses
                 train_losses += train_loss.item() * len(x_true)
                 train_gls_losses += train_gls_loss.item() * len(x_true)
                 train_pde_losses += train_pde_loss.item() * len(x_true)
                 train_reg_losses += train_reg_loss.item() * len(x_true)
+                
+            # Store epoch's mean gradient for pruning
+            self._last_grads = grad_accum / (len(train_data) / batch_size)
 
             # update book keeping for this epoch
             self.train_loss_dict['loss'].append(np.sum(train_losses) / len(train_data))
@@ -214,8 +204,8 @@ class model_wrapper():
                 
                 # optionally save model and optimizer
                 if self.save_best_train:
-                    print(f'Pruned and saved at epoch {epoch}')
-                    self.model.prune(thresh=3)
+                    # print(f'Pruned and saved at epoch {epoch}')
+                    # self.model.prune(thresh=3)
                     self.save(self.save_name+'_best_train')
 
             #
@@ -273,8 +263,8 @@ class model_wrapper():
                 
                 # optionally save model and optimizer
                 if self.save_best_val:
-                    print(f'Pruned and saved at epoch {epoch}')
-                    self.model.prune(thresh=3)
+                    # print(f'Pruned and saved at epoch {epoch}')
+                    # self.model.prune(thresh=3)
                     self.save(self.save_name+'_best_val')
                 
                 # update early stopper
@@ -316,15 +306,15 @@ class model_wrapper():
                         param_group['lr'] *= lr_dec_prop
 
         # final prune
-        if self.save_best_train:
-            self.load(self.save_name+'_best_train_model')
-            self.model.prune(thresh=3)
-            self.save(self.save_name+'_best_train')
+        # if self.save_best_train:
+        #     self.load(self.save_name+'_best_train_model')
+        #     self.model.prune(thresh=3)
+        #     self.save(self.save_name+'_best_train')
 
-        if self.save_best_val:
-            self.load(self.save_name+'_best_val_model')
-            self.model.prune(thresh=3)
-            self.save(self.save_name+'_best_val')
+        # if self.save_best_val:
+        #     self.load(self.save_name+'_best_val_model')
+        #     self.model.prune(thresh=3)
+        #     self.save(self.save_name+'_best_val')
 
         # final print readout
         elapsed, remaining, ms = time_remaining(
@@ -349,7 +339,78 @@ class model_wrapper():
         print(p, flush=True)
             
         return self.train_loss_dict, self.val_loss_dict
-                
+
+    def _clear_optimizer_state_for_param(self, param, mask):
+        """Clear optimizer moving averages for param where mask==0."""
+        # mask shape should broadcast to param's shape
+        for state in (self.optimizer.state.get(param) or {},):
+            if not state:
+                continue
+            # Keys used by Adam/AdamW and similar
+            for key in ("exp_avg", "exp_avg_sq", "momentum_buffer"):
+                if key in state:
+                    try:
+                        state[key].mul_(mask)   # zeros out pruned positions
+                    except Exception:
+                        # fallback: if shapes don't match, try broadcasting or do nothing
+                        state[key] = state[key] * mask
+
+    def prune_indices_and_freeze(self, keep_mask):
+        """
+        keep_mask: tensor of same shape as fc.weight (or broadcastable) with 1=keep, 0=prune.
+        freeze_hill: if True, also freeze hill param tensors that correspond to pruned hill features.
+        """
+        fc = self.model.reaction.eql_layer.fc
+        device = fc.weight.device
+
+        # Normalize mask shape to match fc.weight
+        keep_mask = keep_mask.to(device).float()
+        if keep_mask.dim() == 1:
+            keep_mask = keep_mask.view(1, -1)  # assume out_features=1
+
+        # persistent mask on model
+        if not hasattr(self.model, "eql_mask"):
+            self.model.eql_mask = torch.ones_like(fc.weight.data, device=device)
+        # update persistent mask (once pruned, stays pruned)
+        self.model.eql_mask *= keep_mask
+
+        with torch.no_grad():
+            # Hard-zero pruned weights
+            fc.weight.data.mul_(self.model.eql_mask)
+
+            # zero any gradient leftovers
+            if fc.weight.grad is not None:
+                fc.weight.grad.data.mul_(self.model.eql_mask)
+
+        # Clear optimizer moving averages / state for fc.weight
+        self._clear_optimizer_state_for_param(fc.weight, self.model.eql_mask)
+
+        return self.model.eql_mask
+
+    def prune_by_gradient_saliency(self, thresh=0.01):
+        """
+        Your original saliency computation combined with permanent pruning + freeze.
+        thresh: fraction of mean saliency. (Keep features with saliency >= thresh * mean_saliency)
+        """
+        with torch.no_grad():
+            weights = self.model.reaction.eql_layer.fc.weight.data  # tensor
+            grads = self._last_grads  # should be same shape as weights
+
+            # Compute saliency
+            saliency = (grads * weights).abs()
+
+            # Normalize so threshold is relative to mean saliency
+            mean_sal = saliency.mean()
+
+            keep_mask = (saliency >= (thresh * mean_sal)).float()
+            
+            print(f'weights: {weights}')
+            print(f'grads: {grads}')
+            print(f'saliency: {saliency}')
+
+        # call helper to apply permanent pruning & freeze hill params
+        self.prune_indices_and_freeze(keep_mask)
+
     def predict(self, inputs):
         
         '''
