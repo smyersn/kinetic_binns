@@ -37,13 +37,12 @@ gls_weight=float(config['gls_weight'])
 pde_weight=float(config['pde_weight'])
 l05_weight = float(config['l05_weight'])
 param_bounds = float(config['param_bounds'])
-prune_thresh = float(config['prune_thresh'])
 
 dir_name = sys.argv[1]
 
 # Set training hyperparameters
 epochs = int(1e6)
-# epochs = 350
+# epochs = 100
 rel_save_thresh = 0.01
 
 # Get GPU
@@ -129,7 +128,6 @@ model = model_wrapper(
 train_loss_dict, val_loss_dict = model.fit(
     train_data=train_data,
     val_data=val_data,
-    prune_thresh=prune_thresh,
     batch_size=batch_size,
     epochs=epochs,
     early_stopping=2500,
