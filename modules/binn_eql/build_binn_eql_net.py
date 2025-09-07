@@ -179,12 +179,17 @@ class BINN(nn.Module):
         return self.surface_fitter(self.inputs)
     
     
-    def gls_loss(self, pred, true):
+    # def gls_loss(self, pred, true):
         
-        residual = (pred - true)**2
+    #     residual = (pred - true)**2
                 
-        return torch.mean(residual)
+    #     return torch.mean(residual)
     
+    def gls_loss(self, pred, true):
+        denom = true.abs() + 1e-6
+        residual = ((pred - true) / denom)**2
+        return torch.mean(residual)
+
     def pde_loss(self, inputs, outputs, epoch):
         # unpack outputs
         u = outputs.clone()
@@ -242,28 +247,12 @@ class BINN(nn.Module):
     def reg_loss(self, epoch):
         # Calculate coefficient loss
         coeffs = self.reaction.eql_layer.fc.weight
-        coeff_loss = torch.mean(self.param_weight * (coeffs - coeffs.clamp(self.coeff_min, self.coeff_max))**2)
-
-        # Calculate diffusion coeff loss
-        if not self.diff_coeffs:
-            D = self.diffusion_fitter()
-            D_loss = torch.mean(self.D_weight * (D - D.clamp(self.D_min, self.D_max))**2)
-        else:
-            D_loss = torch.tensor(0.0, device=coeffs.device)
 
         # Sparsity Regularization
         l05_norm = custom_norm(coeffs, 0.01)
-        sparsity_loss = self.l05_weight * l05_norm
+        l05_loss = self.l05_weight * l05_norm
         
-        # if epoch % 1000 == 0:
-        #     print(f'REG LOSS START')
-        #     print(f'coeffs: {coeffs}')
-        #     print(f'coeff loss: {coeff_loss}')
-        #     print(f'D: {D}')
-        #     print(f'D loss: {D_loss}')
-        #     print(f'sparsity loss: {sparsity_loss}\n')
-
-        return coeff_loss + D_loss + sparsity_loss
+        return l05_loss
 
     def loss(self, pred, true, epoch):
         # load cached inputs from forward pass
@@ -398,6 +387,44 @@ class BINN(nn.Module):
         return ns_inc, ns_dec, Ks_inc, Ks_dec
             
     def remove_insignificant_terms(self, uv, thresh):
+        # # Define epsilon to avoid division by zero
+        # eps=1e-12
+        
+        # # compute raw features (N x M)
+        # poly_feats = self.reaction.eql_layer.poly(uv)        # shape [N, M_poly]
+        # hill_feats = self.reaction.eql_layer.hill(uv)        # shape [N, M_hill]
+        # feats = torch.cat([poly_feats, hill_feats], dim=1)   # shape [N, M]
+
+        # # weights vector for the single-output fc (assume out_features==1)
+        # # use data (not requiring_grad); choose device automatically
+        # weights = self.reaction.eql_layer.fc.weight.detach().view(-1)  # shape [M]
+
+        # # per-feature RMS (scale) across the uv sample
+        # feat_rms = torch.sqrt((feats.detach() ** 2).mean(dim=0) + eps)  # shape [M]
+
+        # # absolute per-feature contribution (L2-style): |w_i| * feat_rms_i
+        # contrib = weights.abs() * feat_rms  # shape [M]
+
+        # # fractional contribution relative to total contribution
+        # total = contrib.sum() + eps
+        # frac = contrib / total  # shape [M], sums to ~1
+
+        # # build keep/prune mask: keep features whose fraction >= thresh_frac
+        # keep_mask = (frac >= thresh)   # boolean mask shape [M]
+        
+        # # print(f'weights: {weights}')
+        # # print(f'feat rms: {feat_rms}')
+        # print(f'contrib: {contrib}')
+        # print(f'frac: {frac}')
+        # print(f'keep mask: {keep_mask}')
+
+        # # zero-out pruned features (use no_grad)
+        # with torch.no_grad():
+        #     # if fc has shape [1, M], index accordingly
+        #     self.reaction.eql_layer.fc.weight[0, ~keep_mask] = 0.0
+
+        
+        
         # removes all terms from individual that have minor impact on surface
         poly_feats = self.reaction.eql_layer.poly(uv)
         hill_feats = self.reaction.eql_layer.hill(uv)
@@ -414,6 +441,7 @@ class BINN(nn.Module):
         
         # Determine which features are insignificant
         surface_range = torch.mean(torch.abs(surface))              # scalar
+        # surface_range = torch.max(surface) - torch.min(surface)   # scalar
         # print(f'surface range: {surface_range}')
         
         # Calculate coefficient of variation
@@ -428,35 +456,6 @@ class BINN(nn.Module):
             # self.reaction.eql_layer.fc.raw_weight[0][mask] = 0
             self.reaction.eql_layer.fc.weight[0][mask] = 0
             
-            
-            
-        # # removes all terms from individual that have minor impact on surface
-        # poly_feats = self.reaction.eql_layer.poly(uv)
-        # hill_feats = self.reaction.eql_layer.hill(uv)
-        # feats = torch.cat([poly_feats, hill_feats], dim=1)
-
-        # weights = self.reaction.eql_layer.fc.weight[0]
-        # weighted_feats = feats * weights 
-        
-        # surface = weighted_feats.sum(dim=1)        
-                        
-        # # Calculate RMSE if any feature is removed
-        # rmse = torch.sqrt((weighted_feats**2).mean(dim=0))          # [M]
-        
-        # # Determine which features are insignificant
-        # surface_range = torch.max(surface) - torch.min(surface)             # scalar
-
-        # # Calculate coefficient of variation
-        # coeffs = rmse / surface_range                               # [M]
-
-        # # build boolean mask of insignificant features
-        # mask = (coeffs < thresh)
-                                
-        # # zero them out insignificant features
-        # with torch.no_grad():
-        #     # self.reaction.eql_layer.fc.raw_weight[0][mask] = 0
-        #     self.reaction.eql_layer.fc.weight[0][mask] = 0
-
     def fix_cheating_hill_functions(self, uv, thresh):
         # Symbolic net sometimes "cheats" by approximating polynomial terms with
         # increasing Hill functions. This method corrects for this mistake.
@@ -554,13 +553,17 @@ class BINN(nn.Module):
                     else:
                         break       
                               
-    def prune(self, thresh):       
+    def prune(self, thresh=1):       
         # Get uv values from training data
         uv = self.train_data[:, -2:]
 
         # Prune
         self.remove_insignificant_terms(uv, thresh)
         self.fix_cheating_hill_functions(uv, thresh)
+        
+        # keep_mask = self.reaction.eql_layer.fc.weight != 0
+        
+        # return keep_mask
 
     def generate_equation(self):
         # Unpack coefficients

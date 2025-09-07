@@ -94,19 +94,15 @@ class model_wrapper():
             best_val_loss=None,
             lr_dec_epoch=None,
             lr_dec_prop=1.0,
-            rel_save_thresh=0.0):
+            rel_save_thresh=0.0,
+            prune_thresh=3):
                 
         # initialize book keeping
         start_time = time.time()
         last_improved = 0
         best_train_loss = 1e12 if best_train_loss is None else best_train_loss
         best_val_loss = 1e12 if best_val_loss is None else best_val_loss        
-        
-        # Create trivial mask for pruning
-        mask_shape = self.model.reaction.eql_layer.fc.weight.shape
-        mask = torch.ones(mask_shape, dtype=torch.float32, 
-                          device=train_data.device)
-                    
+                            
         # loop over epochs
         for epoch in range(initial_epoch, initial_epoch + epochs):
             #           
@@ -118,38 +114,17 @@ class model_wrapper():
             self.model.train()
             epoch_start_time = time.time()
             
-            # if epoch >= 5000:
-            #     for param in self.model.surface_fitter.parameters():
-            #         param.requires_grad = False
-            #         print(param)
-                                                
-            # if epoch > 0 and epoch % 25000 == 0:
-            # # if epoch > 0 and epoch % 100 == 0:
-                                
-            #     self.model.prune(thresh=3)
-                                                
-            #     fc_weight = self.model.reaction.eql_layer.fc.weight
+            # # Prune equation every 100 epochs
+            # if epoch % 100 == 0 and epoch > 0:
+            #     self.model.prune()
+            #     # self.freeze_pruned_params()
 
-            #     # Generate mask w/ zeros at positions of pruned parameters
-            #     with torch.no_grad(): # Ensure this operation doesn't track gradients
-            #         mask = (fc_weight.data != 0).float()
-
-            #     # Clear optimizer state for pruned parameters
-            #     for param_group in self.optimizer.param_groups:
-            #         for param in param_group['params']:
-            #             if param is fc_weight: # Only target the specific pruned layer
-            #                 if param in self.optimizer.state:
-            #                     state = self.optimizer.state[param]
-            #                     if 'exp_avg' in state:
-            #                         state['exp_avg'].mul_(mask)
-            #                     if 'exp_avg_sq' in state:
-            #                         state['exp_avg_sq'].mul_(mask)
-            
+            # Print equation every 1000 epochs                                                                        
             if epoch % 1000 == 0:  
                 fn = f'{self.dir_name}/equation.txt'
                 file = open(fn, 'a')
                 
-                file.write(f'Pruned Equation Epoch {epoch}\n')
+                file.write(f'Equation Epoch {epoch}\n')
                 for term in self.model.generate_equation():
                     file.write(f'{term}\n')
                 file.write(f'\n')
@@ -185,13 +160,18 @@ class model_wrapper():
                                                                             
                 # compute backward pass and update weights
                 train_loss.backward()
-                
-                grad = self.model.reaction.eql_layer.fc.weight.grad
-                if grad is not None:
-                    grad.mul_(mask)
-                                    
+                                                    
                 self.optimizer.step()
                 
+                # Clamp parameters between bounds
+                with torch.no_grad():
+                    bound = self.model.param_bounds
+                    self.model.reaction.eql_layer.fc.weight.data.clamp_(
+                        -bound, bound)
+
+                    if not self.model.diff_coeffs:
+                        self.diffusion_fitter().clamp_(0, bound)
+                        
                 # Update losses
                 train_losses += train_loss.item() * len(x_true)
                 train_gls_losses += train_gls_loss.item() * len(x_true)
@@ -214,8 +194,9 @@ class model_wrapper():
                 
                 # optionally save model and optimizer
                 if self.save_best_train:
-                    print(f'Pruned and saved at epoch {epoch}')
-                    self.model.prune(thresh=3)
+                    # print(f'Pruned and saved at epoch {epoch}')
+                    # self.model.prune(thresh=prune_thresh)
+                    # self.freeze_pruned_params()
                     self.save(self.save_name+'_best_train')
 
             #
@@ -238,8 +219,8 @@ class model_wrapper():
             # loop over validation batches
             for i in range(0, len(val_data), batch_size):
                 idx = no_perm[i:i+batch_size]
-                x_true = train_data[idx, :-self.species].data.clone()
-                y_true = train_data[idx, -self.species:].data.clone()
+                x_true = val_data[idx, :-self.species].data.clone()
+                y_true = val_data[idx, -self.species:].data.clone()
                            
                 self.optimizer.zero_grad()
                                                 
@@ -273,8 +254,9 @@ class model_wrapper():
                 
                 # optionally save model and optimizer
                 if self.save_best_val:
-                    print(f'Pruned and saved at epoch {epoch}')
-                    self.model.prune(thresh=3)
+                    # print(f'Pruned and saved at epoch {epoch}')
+                    # self.model.prune(thresh=prune_thresh)
+                    # self.freeze_pruned_params()
                     self.save(self.save_name+'_best_val')
                 
                 # update early stopper
@@ -306,7 +288,7 @@ class model_wrapper():
             # optional early stopping
             if early_stopping is not None:
                 # if epoch - last_improved >= early_stopping and epoch > last_pruned+2500:
-                if epoch - last_improved >= early_stopping and epoch > 10000:
+                if epoch - last_improved >= early_stopping and epoch > 30000:
                     break
                     
             # optional learning rate annealing
@@ -318,14 +300,14 @@ class model_wrapper():
         # final prune
         if self.save_best_train:
             self.load(self.save_name+'_best_train_model')
-            self.model.prune(thresh=3)
+            self.model.prune(thresh=prune_thresh)
             self.save(self.save_name+'_best_train')
 
         if self.save_best_val:
             self.load(self.save_name+'_best_val_model')
-            self.model.prune(thresh=3)
+            self.model.prune(thresh=prune_thresh)
             self.save(self.save_name+'_best_val')
-
+            
         # final print readout
         elapsed, remaining, ms = time_remaining(
             current_iter=epoch+1,
@@ -349,7 +331,25 @@ class model_wrapper():
         print(p, flush=True)
             
         return self.train_loss_dict, self.val_loss_dict
-                
+    
+    def freeze_pruned_params(self):
+        fc_weight = self.model.reaction.eql_layer.fc.weight
+
+        # Generate mask w/ zeros at positions of pruned parameters
+        with torch.no_grad(): # Ensure this operation doesn't track gradients
+            mask = (fc_weight.data != 0).float()
+
+        # Clear optimizer state for pruned parameters
+        for param_group in self.optimizer.param_groups:
+            for param in param_group['params']:
+                if param is fc_weight: # Only target the specific pruned layer
+                    if param in self.optimizer.state:
+                        state = self.optimizer.state[param]
+                        if 'exp_avg' in state:
+                            state['exp_avg'].mul_(mask)
+                        if 'exp_avg_sq' in state:
+                            state['exp_avg_sq'].mul_(mask)
+
     def predict(self, inputs):
         
         '''

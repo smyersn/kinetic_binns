@@ -37,13 +37,14 @@ gls_weight=float(config['gls_weight'])
 pde_weight=float(config['pde_weight'])
 l05_weight = float(config['l05_weight'])
 param_bounds = float(config['param_bounds'])
+rel_save_thresh = float(config['rel_save_thresh'])
+prune_thresh = float(config['prune_thresh'])
 
 dir_name = sys.argv[1]
 
 # Set training hyperparameters
 epochs = int(1e6)
-# epochs = 100
-rel_save_thresh = 0.01
+# rel_save_thresh = 0.01
 
 # Get GPU
 device = 'cuda'
@@ -130,8 +131,9 @@ train_loss_dict, val_loss_dict = model.fit(
     val_data=val_data,
     batch_size=batch_size,
     epochs=epochs,
-    early_stopping=2500,
-    rel_save_thresh=rel_save_thresh)
+    early_stopping=3000,
+    rel_save_thresh=rel_save_thresh,
+    prune_thresh=prune_thresh)
 
 generate_loss_curves(train_loss_dict, val_loss_dict, dir_name, 20, 'training_loss_curves')
 
