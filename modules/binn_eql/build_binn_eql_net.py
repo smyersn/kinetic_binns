@@ -36,19 +36,11 @@ class D_PARAMS(nn.Module):
         self.input_features = input_features
         self.param_bounds = param_bounds
 
-        # 1) Sample initial diffusivities in [0, D_max]
-        D0 = torch.rand(input_features) * param_bounds  # shape = (species,)
-
-        # 2) Invert softplus: raw = ln(exp(D0) - 1)
-        #    Use log1p for numerical stability: exp(D0) - 1 = expm1(D0)
-        raw0 = torch.log(torch.expm1(D0))
-
-        # 3) Register as a single learnable parameter
-        self.raw = nn.Parameter(raw0)
+        self.raw_D = nn.Parameter(torch.empty(input_features).uniform_(-4, 4))
         
     def forward(self):     
         # D = self.activation(self.params) * self.param_bounds
-        D = F.softplus(self.raw)
+        D = torch.sigmoid(self.raw_D) * self.param_bounds
         return D
 
 class uv_MLP(nn.Module):
@@ -114,7 +106,7 @@ class BINN(nn.Module):
     
     def __init__(self, dimensions, species, train_data, duplicates=1,
                  diff_coeffs=None, uv_layers=None, degree=2, gls_weight=1, 
-                 pde_weight=1, l05_weight=0.01, param_bounds=10):
+                 pde_weight=1, l05_weight=0.01, param_bounds=10, warm_up=0):
         
         super().__init__()
         self.dimensions = dimensions        
@@ -124,6 +116,7 @@ class BINN(nn.Module):
         self.diff_coeffs = diff_coeffs
         self.degree = degree
         self.param_bounds = param_bounds
+        self.warm_up = warm_up
         
         # diffusion fitter
         if not self.diff_coeffs:
@@ -177,14 +170,7 @@ class BINN(nn.Module):
         # cache input batch for pde loss
         self.inputs = inputs
         return self.surface_fitter(self.inputs)
-    
-    
-    # def gls_loss(self, pred, true):
         
-    #     residual = (pred - true)**2
-                
-    #     return torch.mean(residual)
-    
     def gls_loss(self, pred, true):
         denom = true.abs() + 1e-6
         residual = ((pred - true) / denom)**2
@@ -245,14 +231,10 @@ class BINN(nn.Module):
         return torch.mean(pde_loss)
     
     def reg_loss(self, epoch):
-        # Calculate coefficient loss
-        coeffs = self.reaction.eql_layer.fc.weight
-
         # Sparsity Regularization
-        l05_norm = custom_norm(coeffs, 0.01)
-        l05_loss = self.l05_weight * l05_norm
-        
-        return l05_loss
+        l05_norm = self.reaction.eql_layer.l0_gate.expected_l0()
+                       
+        return l05_norm
 
     def loss(self, pred, true, epoch):
         # load cached inputs from forward pass
@@ -273,36 +255,24 @@ class BINN(nn.Module):
         # compute PDE loss at sampled locations
         self.pde_loss_val = self.pde_weight*self.pde_loss(inputs_rand, outputs_rand, epoch)
         
-        # compute loss from regularization
-        self.reg_loss_val = self.reg_loss(epoch)
+        # Compute effective l05 weight
+        if self.warm_up == 0:
+            l0_weight_eff = self.l05_weight
+        else:     
+            if epoch < self.warm_up:
+                l0_weight_eff = 0
+            elif epoch < self.warm_up*2:
+                l0_weight_eff = ((epoch - self.warm_up) / self.warm_up) * self.l05_weight
+            else:
+                l0_weight_eff = self.l05_weight
         
-        # # load cached inputs from forward pass
-        # inputs = self.inputs
-
-        # if epoch < 5000:
-        #     self.gls_loss_val = self.gls_weight*self.gls_loss(pred, true)
-        #     self.pde_loss_val = torch.tensor(0).to(inputs.device)
-        #     self.reg_loss_val = torch.tensor(0).to(inputs.device)
-            
-        # else:
-        #     self.gls_loss_val = torch.tensor(0).to(inputs.device)
-            
-        #     # randomly sample from input domain for PDE loss
-        #     x = torch.empty(self.num_samples, self.dimensions, dtype=torch.float32, device=inputs.device).uniform_(0, 1)
-        #     x = x * (self.x_max - self.x_min) + self.x_min
-        #     t = torch.empty(self.num_samples, 1, dtype=torch.float32, device=inputs.device).uniform_(0, 1)
-        #     t = t * (self.t_max - self.t_min) + self.t_min
-        #     inputs_rand = torch.cat([x, t], dim=1).requires_grad_()
-            
-        #     # predict surface fitter at sampled locations
-        #     outputs_rand = self.surface_fitter(inputs_rand)
-            
-        #     # compute PDE loss at sampled locations
-        #     self.pde_loss_val = self.pde_weight*self.pde_loss(inputs_rand, outputs_rand, epoch)
-            
-        #     # compute loss from regularization
-        #     self.reg_loss_val = self.reg_loss(epoch)
-
+        # compute loss from regularization
+        l0_loss = self.reg_loss(epoch)
+        self.reg_loss_val = l0_weight_eff*l0_loss
+        
+        if epoch % 1000 == 0:
+            print(f'L0 norm, weight, loss: {l0_loss, l0_weight_eff, self.reg_loss_val}')
+        
         return (self.gls_loss_val + self.pde_loss_val + self.reg_loss_val), self.gls_loss_val, self.pde_loss_val, self.reg_loss_val
 
     def generate_terms(self):
@@ -338,9 +308,12 @@ class BINN(nn.Module):
         # Unpack coefficients for polynomial and Hill terms
         coeffs = self.reaction.eql_layer.fc.weight[0]
         
-        poly_coeffs = coeffs[:self.reaction.eql_layer.num_poly_features]
+        # Get gates and calculate effective coefficients
+        gates = self.reaction.eql_layer.l0_gate.get_binary_mask()
+        eff_coeffs = coeffs * gates
         
-        hill_coeffs = coeffs[self.reaction.eql_layer.num_poly_features:]
+        poly_coeffs = eff_coeffs[:self.reaction.eql_layer.num_poly_features]
+        hill_coeffs = eff_coeffs[self.reaction.eql_layer.num_poly_features:]
         
         # Generate terms
         poly_terms, hill_terms = self.generate_terms()

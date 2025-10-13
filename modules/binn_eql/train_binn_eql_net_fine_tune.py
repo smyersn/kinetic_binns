@@ -39,11 +39,13 @@ l05_weight = float(config['l05_weight'])
 param_bounds = float(config['param_bounds'])
 rel_save_thresh = float(config['rel_save_thresh'])
 prune_thresh = float(config['prune_thresh'])
+warm_up = float(config['warm_up'])
 
 dir_name = sys.argv[1]
 
 # Set training hyperparameters
-epochs = int(1e6)
+# epochs = int(1e6)
+epochs = 100_000
 # rel_save_thresh = 0.01
 
 # Get GPU
@@ -110,7 +112,8 @@ binn = BINN(
     gls_weight=gls_weight,
     pde_weight=pde_weight,
     l05_weight=l05_weight,
-    param_bounds=param_bounds)
+    param_bounds=param_bounds,
+    warm_up=warm_up)
 
 binn.to(device)
 
@@ -133,7 +136,8 @@ train_loss_dict, val_loss_dict = model.fit(
     epochs=epochs,
     early_stopping=3000,
     rel_save_thresh=rel_save_thresh,
-    prune_thresh=prune_thresh)
+    prune_thresh=prune_thresh,
+    warm_up=warm_up)
 
 generate_loss_curves(train_loss_dict, val_loss_dict, dir_name, 20, 'training_loss_curves')
 

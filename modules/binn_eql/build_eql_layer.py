@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from modules.binn_eql.bounded_linear_layer import BoundedLinear
+from modules.binn_eql.hard_concrete_gate import HardConcreteGate
        
 class HillFunction(nn.Module):
     def __init__(self, param_bounds, increasing=True):
@@ -135,16 +135,20 @@ class EQLLayer(nn.Module):
 
         self.total_features = self.num_poly_features + self.num_hill_features
                 
-        # self.fc = BoundedLinear(self.total_features, 1, param_bounds)
         self.fc = nn.Linear(self.total_features, 1, bias=False)
-        nn.init.uniform_(self.fc.weight, a=-param_bounds, b=param_bounds)
+        self.l0_gate = HardConcreteGate(self.total_features)
+        # nn.init.uniform_(self.fc.weight, a=-param_bounds, b=param_bounds)
+        nn.init.uniform_(self.fc.weight, a=-1, b=1)
 
-
-    def forward(self, x):
-        # if torch.isnan(x).any():
-        #     print('input nans')
-
+    def forward(self, x, training=True):
         poly_feats = self.poly(x)
         hill_feats = self.hill(x)
         features = torch.cat([poly_feats, hill_feats], dim=1)
-        return self.fc(features)       
+        
+        w = self.fc.weight  # shape (1, n_terms)
+        z = self.l0_gate()  # shape (1, n_terms)
+
+        gated_w = w * z  # element-wise gating
+        out = (features * gated_w).sum(dim=1, keepdim=True)
+        
+        return out

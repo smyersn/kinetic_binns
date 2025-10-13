@@ -95,7 +95,8 @@ class model_wrapper():
             lr_dec_epoch=None,
             lr_dec_prop=1.0,
             rel_save_thresh=0.0,
-            prune_thresh=3):
+            prune_thresh=3,
+            warm_up=0):
                 
         # initialize book keeping
         start_time = time.time()
@@ -143,14 +144,15 @@ class model_wrapper():
             # loop over training batches
             for i in range(0, len(train_data), batch_size):
                 idx = perm[i:i+batch_size]
-                x_true = train_data[idx, :-self.species].data.clone()
-                y_true = train_data[idx, -self.species:].data.clone()
-                
+                # x_true = train_data[idx, :-self.species].data.clone()
+                # y_true = train_data[idx, -self.species:].data.clone()
+                x_true = train_data[idx, :-self.species].detach().clone().requires_grad_(True)
+                y_true = train_data[idx, -self.species:].detach().clone().requires_grad_(True)
                 # zero out gradients
                 self.optimizer.zero_grad()
                                     
                 # require gradients
-                x_true.requires_grad = True
+                # x_true.requires_grad = True
                 
                 # run the model
                 y_pred = self.model(x_true)
@@ -219,16 +221,18 @@ class model_wrapper():
             # loop over validation batches
             for i in range(0, len(val_data), batch_size):
                 idx = no_perm[i:i+batch_size]
-                x_true = val_data[idx, :-self.species].data.clone()
-                y_true = val_data[idx, -self.species:].data.clone()
-                           
+                # x_true = val_data[idx, :-self.species].data.clone()
+                # y_true = val_data[idx, -self.species:].data.clone()
+                x_true = val_data[idx, :-self.species].detach().clone().requires_grad_(True)                         
+                y_true = val_data[idx, -self.species:].detach().clone().requires_grad_(True)     
+                  
                 self.optimizer.zero_grad()
                                                 
                 # require gradients
-                x_true.requires_grad = True
+                # x_true.requires_grad = True
                                 
                 # run the model
-                y_pred = self.model(x_true).data
+                y_pred = self.model(x_true)
                 
                 # comptue loss
                 val_loss, val_gls_loss, val_pde_loss, val_reg_loss = self.loss(y_pred, y_true, epoch)
@@ -247,27 +251,27 @@ class model_wrapper():
             # if validation error improved
             rel_diff = (best_val_loss - self.val_loss_dict['loss'][-1])
             rel_diff /= best_val_loss
-            if rel_diff > rel_save_thresh:
-                
-                # update best validation loss
-                best_val_loss = self.val_loss_dict['loss'][-1]
-                
-                # optionally save model and optimizer
-                if self.save_best_val:
-                    # print(f'Pruned and saved at epoch {epoch}')
-                    # self.model.prune(thresh=prune_thresh)
-                    # self.freeze_pruned_params()
-                    self.save(self.save_name+'_best_val')
-                
-                # update early stopper
+            
+            if epoch >= warm_up*2:
+                if rel_diff > rel_save_thresh:
+                    
+                    # update best validation loss
+                    best_val_loss = self.val_loss_dict['loss'][-1]
+                    
+                    # optionally save model and optimizer
+                    if self.save_best_val:
+                        # print(f'Pruned and saved at epoch {epoch}')
+                        # self.model.prune(thresh=prune_thresh)
+                        # self.freeze_pruned_params()
+                        self.save(self.save_name+'_best_val')
+                    
+                    # update early stopper
+                    last_improved = epoch
+            
+            else:
                 last_improved = epoch
                 
-                improved = ' *'
-                
-            else:
-                
-                improved = ''
-            
+                                
             # update user
             elapsed, remaining, ms = time_remaining(
                 current_iter=epoch+1,
@@ -287,8 +291,8 @@ class model_wrapper():
                 
             # optional early stopping
             if early_stopping is not None:
-                # if epoch - last_improved >= early_stopping and epoch > last_pruned+2500:
-                if epoch - last_improved >= early_stopping and epoch > 30000:
+                # if epoch - last_improved >= early_stopping and epoch > 50000:
+                if epoch - last_improved >= early_stopping:
                     break
                     
             # optional learning rate annealing
@@ -297,16 +301,16 @@ class model_wrapper():
                     for param_group in self.optimizer.param_groups:
                         param_group['lr'] *= lr_dec_prop
 
-        # final prune
-        if self.save_best_train:
-            self.load(self.save_name+'_best_train_model')
-            self.model.prune(thresh=prune_thresh)
-            self.save(self.save_name+'_best_train')
+        # # final prune
+        # if self.save_best_train:
+        #     self.load(self.save_name+'_best_train_model')
+        #     self.model.prune(thresh=prune_thresh)
+        #     self.save(self.save_name+'_best_train')
 
-        if self.save_best_val:
-            self.load(self.save_name+'_best_val_model')
-            self.model.prune(thresh=prune_thresh)
-            self.save(self.save_name+'_best_val')
+        # if self.save_best_val:
+        #     self.load(self.save_name+'_best_val_model')
+        #     self.model.prune(thresh=prune_thresh)
+        #     self.save(self.save_name+'_best_val')
             
         # final print readout
         elapsed, remaining, ms = time_remaining(
