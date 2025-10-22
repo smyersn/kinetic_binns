@@ -102,8 +102,11 @@ class model_wrapper():
         start_time = time.time()
         last_improved = 0
         best_train_loss = 1e12 if best_train_loss is None else best_train_loss
-        best_val_loss = 1e12 if best_val_loss is None else best_val_loss        
-                            
+        best_val_loss = 1e12 if best_val_loss is None else best_val_loss  
+        
+        # simple history container
+        self.param_history = {'raw_w': [], 'effective': [],'epoch': []}
+      
         # loop over epochs
         for epoch in range(initial_epoch, initial_epoch + epochs):
             #           
@@ -121,7 +124,8 @@ class model_wrapper():
             #     # self.freeze_pruned_params()
 
             # Print equation every 1000 epochs                                                                        
-            if epoch % 1000 == 0:  
+            if epoch % 1000 == 0:
+            # if epoch % 50 == 0:
                 fn = f'{self.dir_name}/equation.txt'
                 file = open(fn, 'a')
                 
@@ -131,7 +135,13 @@ class model_wrapper():
                 file.write(f'\n')
 
                 file.close()
-
+                
+                # Save history
+                param_snapshot = self.model.extract_params(full=False)
+                self.param_history['epoch'].append(epoch)
+                self.param_history['raw_w'].append(param_snapshot['raw_w'])
+                self.param_history['effective'].append(param_snapshot['effective'])
+                
             # Create lists for epoch training losses
             train_losses = 0
             train_gls_losses = 0
@@ -334,7 +344,7 @@ class model_wrapper():
         #sys.stdout.write(p)
         print(p, flush=True)
             
-        return self.train_loss_dict, self.val_loss_dict
+        return self.param_history, self.train_loss_dict, self.val_loss_dict
     
     def freeze_pruned_params(self):
         fc_weight = self.model.reaction.eql_layer.fc.weight

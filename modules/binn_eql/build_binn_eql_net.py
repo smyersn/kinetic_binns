@@ -1,3 +1,4 @@
+import numpy as np
 import torch, time
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,7 +10,6 @@ from modules.utils.numpy_torch_conversion import *
 from modules.activations.softplus_relu import softplus_relu
 from modules.symbolic_net.custom_norm import custom_norm
 from modules.binn_eql.build_eql_layer import EQLLayer
-
 
 class D_PARAMS(nn.Module):
     
@@ -128,6 +128,8 @@ class BINN(nn.Module):
             
             # loss weight
             self.D_weight = 1e10 / self.D_max
+        else:
+            self.diffusion_fitter = None
                 
         # surface fitter
         if uv_layers:
@@ -147,7 +149,17 @@ class BINN(nn.Module):
         self.x_max = float(torch.max(train_data[:, :self.dimensions]).item())
         self.t_min = float(torch.min(train_data[:, self.dimensions]).item())
         self.t_max = float(torch.max(train_data[:, self.dimensions]).item())
-            
+        
+        # mean scale (for GLS)
+        s_u_mean = float(train_data[:, -2].abs().mean().item())
+        s_v_mean = float(train_data[:, -1].abs().mean().item())
+        self.mean_scale = torch.tensor([s_u_mean, s_v_mean]).view(1, -1).to(train_data.device)
+
+        # 99th-percentile scale (for EQL inputs)
+        s_u_max = float(torch.quantile(train_data[:, -2].abs(), 0.99).item())
+        s_v_max = float(torch.quantile(train_data[:, -1].abs(), 0.99).item())
+        self.max_scale = torch.tensor([s_u_max, s_v_max]).view(1, -1).to(train_data.device)
+
         # loss weights
         # self.gls_weight = 1e0
         # self.pde_weight = 1e0
@@ -161,7 +173,7 @@ class BINN(nn.Module):
         self.gamma = 0.2
 
         # number of samples for pde loss
-        self.num_samples = 10000
+        self.num_samples = 1000
         
         # model name
         self.name = 'Dumlp_Dvmlp_Fmlp'
@@ -170,10 +182,12 @@ class BINN(nn.Module):
         # cache input batch for pde loss
         self.inputs = inputs
         return self.surface_fitter(self.inputs)
-        
+
+    # -----------------------
+    # Loss helpers
+    # -----------------------
     def gls_loss(self, pred, true):
-        denom = true.abs() + 1e-6
-        residual = ((pred - true) / denom)**2
+        residual = ((pred - true) / self.mean_scale)**2
         return torch.mean(residual)
 
     def pde_loss(self, inputs, outputs, epoch):
@@ -270,11 +284,14 @@ class BINN(nn.Module):
         l0_loss = self.reg_loss(epoch)
         self.reg_loss_val = l0_weight_eff*l0_loss
         
-        if epoch % 1000 == 0:
-            print(f'L0 norm, weight, loss: {l0_loss, l0_weight_eff, self.reg_loss_val}')
+        # if epoch % 1000 == 0:
+        #     print(f'L0 norm, weight, loss: {l0_loss, l0_weight_eff, self.reg_loss_val}')
         
         return (self.gls_loss_val + self.pde_loss_val + self.reg_loss_val), self.gls_loss_val, self.pde_loss_val, self.reg_loss_val
 
+    # -----------------------
+    # Feature generation and equation formatting
+    # -----------------------
     def generate_terms(self):
         poly_terms = []
         hill_terms = []
@@ -303,62 +320,187 @@ class BINN(nn.Module):
                     hill_terms.append((i, j))
                     
         return poly_terms, hill_terms
- 
-    def unpack_coeffs(self):       
-        # Unpack coefficients for polynomial and Hill terms
-        coeffs = self.reaction.eql_layer.fc.weight[0]
+    
+    def extract_params(self, full=True):
+        """
+        Return a dict of parameter arrays on CPU (numpy) that are safe to log/plot.
+        Keys:
+          - 'raw_w' : raw fc weights (numpy)
+          - 'gates' : deterministic gate values in [0,1]
+          - 'effective' : gated effective weights (w * gates)
+          - 'num_poly', 'num_hill'
+          - 'ns_inc','Ks_inc','ns_dec','Ks_dec' : arrays for hill params
+          - 'D' : diffusion coefficients array (or None)
+        """
+        eql = self.reaction.eql_layer
+        # raw linear weights (1 x M)
+        raw_w = eql.fc.weight.detach().cpu().numpy().reshape(-1)
+
+        # deterministic gate values (stretched-sigmoid proxy)
+        try:
+            gates_t = eql.l0_gate.get_gates()
+            gates = gates_t.detach().cpu().numpy().reshape(-1)
+        except Exception:
+            # fallback: compute from log_alpha
+            log_alpha = eql.l0_gate.log_alpha.detach().cpu().numpy().reshape(-1)
+            gamma = float(eql.l0_gate.gamma)
+            zeta = float(eql.l0_gate.zeta)
+            s = 1.0 / (1.0 + np.exp(-log_alpha))
+            s_stretched = s * (zeta - gamma) + gamma
+            gates = np.clip(s_stretched, 0.0, 1.0).reshape(-1)
+
+        effective = raw_w * gates
         
-        # Get gates and calculate effective coefficients
-        gates = self.reaction.eql_layer.l0_gate.get_binary_mask()
-        eff_coeffs = coeffs * gates
-        
-        poly_coeffs = eff_coeffs[:self.reaction.eql_layer.num_poly_features]
-        hill_coeffs = eff_coeffs[self.reaction.eql_layer.num_poly_features:]
-        
-        # Generate terms
+        if not full:
+            return {
+            'raw_w': raw_w,
+            'gates': gates,
+            'effective': effective}        
+
+        else:
+            num_poly = eql.num_poly_features
+            num_hill = eql.num_hill_features
+
+            # Hill params
+            ns_inc, ns_dec, Ks_inc, Ks_dec = [], [], [], []
+            for hill_module in eql.hill.hill_modules:
+                # raw increasing
+                for hf in hill_module.hill_inc_raw:
+                    ns_inc.append(float(torch.sigmoid(hf.raw_n).detach().cpu().item() * 5.0))
+                    Ks_inc.append(float(torch.sigmoid(hf.raw_K).detach().cpu().item() * self.param_bounds))
+                # cross inc
+                for key in getattr(hill_module, 'hill_inc_cross', {}):
+                    hf = hill_module.hill_inc_cross[key]
+                    ns_inc.append(float(torch.sigmoid(hf.raw_n).detach().cpu().item() * 5.0))
+                    Ks_inc.append(float(torch.sigmoid(hf.raw_K).detach().cpu().item() * self.param_bounds))
+
+                for hf in hill_module.hill_dec_raw:
+                    ns_dec.append(float(torch.sigmoid(hf.raw_n).detach().cpu().item() * 5.0))
+                    Ks_dec.append(float(torch.sigmoid(hf.raw_K).detach().cpu().item() * self.param_bounds))
+                for key in getattr(hill_module, 'hill_dec_cross', {}):
+                    hf = hill_module.hill_dec_cross[key]
+                    ns_dec.append(float(torch.sigmoid(hf.raw_n).detach().cpu().item() * 5.0))
+                    Ks_dec.append(float(torch.sigmoid(hf.raw_K).detach().cpu().item() * self.param_bounds))
+
+            # diffusion values (if present)
+            D_vals = None
+            if self.diffusion_fitter is not None:
+                try:
+                    D_vals = self.diffusion_fitter().detach().cpu().numpy()
+                except Exception:
+                    # try reading raw and applying sigmoid mapping
+                    try:
+                        raw = self.diffusion_fitter.raw.detach().cpu().numpy()
+                        s = 1.0 / (1.0 + np.exp(-raw))
+                        D_vals = s * float(self.param_bounds)
+                    except Exception:
+                        D_vals = None
+
+            return {
+                'raw_w': raw_w,
+                'gates': gates,
+                'effective': effective,
+                'num_poly': num_poly,
+                'num_hill': num_hill,
+                'ns_inc': np.array(ns_inc),
+                'Ks_inc': np.array(Ks_inc),
+                'ns_dec': np.array(ns_dec),
+                'Ks_dec': np.array(Ks_dec),
+                'D': D_vals}
+
+    def generate_equation(self, eps=1e-12):
+        """
+        Build readable equation strings using coefficients and hill params
+        taken from self.extract_params().
+
+        Assumptions / ordering:
+        - FC weights layout: [poly_coeffs (all duplicates)] + [hill_coeffs (for each duplicate: inc_block, dec_block)]
+        - extract_params() provides ns_inc, ns_dec, Ks_inc, Ks_dec flattened in the same duplicate-major ordering.
+        """
+        params = self.extract_params()
+        effective = np.asarray(params['effective'])   # shape (M,)
+
+        # counts
+        n_poly = int(self.reaction.eql_layer.num_poly_features)      # total poly features (includes duplicates)
+        n_hill_total = int(self.reaction.eql_layer.num_hill_features)  # total hill features (includes inc+dec across duplicates)
+
+        # hill_terms for a single duplicate (inc-type base terms)
+        _, hill_terms = self.generate_terms()
+        n_hill_single = len(hill_terms)
+        dup = int(self.duplicates)
+
+        # sanity check
+        expected_hill_total = 2 * n_hill_single * dup
+        if n_hill_total != expected_hill_total:
+            raise RuntimeError(f"Unexpected hill feature counts: eql_layer.num_hill_features={n_hill_total} "
+                            f"but expected 2 * {n_hill_single} * {dup} = {expected_hill_total}.")
+
+        # 1) polynomial coefficients (first n_poly entries)
+        poly_coeffs = effective[:n_poly]   # numpy
+
+        # 2) hill coefficients block and explicit reshape
+        hill_block = effective[n_poly : n_poly + n_hill_total]   # shape (n_hill_total,)
+        hb = hill_block.reshape(dup, 2 * n_hill_single)         # (dup, 2*n_hill_single)
+
+        # flatten inc and dec separately in duplicate-major order
+        hill_inc_all = hb[:, :n_hill_single].reshape(-1)   # length dup * n_hill_single
+        hill_dec_all = hb[:, n_hill_single:].reshape(-1)  # same length
+
+        # Hill params from extract_params() — convert to numpy and ensure they match length
+        ns_inc = np.asarray(params.get('ns_inc', []))
+        ns_dec = np.asarray(params.get('ns_dec', []))
+        Ks_inc = np.asarray(params.get('Ks_inc', []))
+        Ks_dec = np.asarray(params.get('Ks_dec', []))
+
+        if len(ns_inc) != len(hill_inc_all) or len(ns_dec) != len(hill_dec_all):
+            # helpful error to surface ordering/length mismatch early
+            raise RuntimeError(f"Hill param length mismatch: ns_inc {len(ns_inc)} vs coeffs {len(hill_inc_all)} ; "
+                            f"ns_dec {len(ns_dec)} vs coeffs {len(hill_dec_all)}. "
+                            "Check extract_params() ordering.")
+
+        # Build readable terms (embed n and K numerics) — keep species names consistent with your code
+        species = ['u', 'v']
+        terms = []
+
+        # Polynomials: poly_terms is for a single duplicate; repeats for duplicates in the FC ordering
         poly_terms, hill_terms = self.generate_terms()
-        n_hill = len(hill_terms)
 
-        # Extract increasing and decreasing Hill coefficients (alternating)
-        hill_coeffs_inc = torch.cat([hill_coeffs[i : i + n_hill] for i in range(0, len(hill_coeffs), 2 * n_hill)])
-        hill_coeffs_dec = torch.cat([hill_coeffs[i + n_hill : i + 2 * n_hill] for i in range(0, len(hill_coeffs), 2 * n_hill)])
+        for term, coeff in zip(poly_terms * dup, poly_coeffs):
+            if abs(coeff) > eps:
+                s = f'{float(coeff):.3f}'
+                for ind in term:
+                    s += f' * {species[ind]}'
+                terms.append(s)
+
+        # Increasing Hills: iterate hill_terms repeated per duplicate and corresponding numeric params
+        for (term, coeff, k, n) in zip(hill_terms * dup, hill_inc_all, Ks_inc, ns_inc):
+            if abs(coeff) > eps:
+                coeff_f = float(coeff)
+                k_f = float(k)
+                n_f = float(n)
+                if len(term) == 1:
+                    s = f'{coeff_f:.3f} * {species[term[0]]}^{n_f:.3f} / (1 + {k_f:.3f} * {species[term[0]]}^{n_f:.3f})'
+                else:
+                    s = f'{coeff_f:.3f} * {species[term[1]]} * {species[term[0]]}^{n_f:.3f} / (1 + {k_f:.3f} * {species[term[0]]}^{n_f:.3f})'
+                terms.append(s)
+
+        # Decreasing Hills: same, but using the dec arrays
+        for (term, coeff, k, n) in zip(hill_terms * dup, hill_dec_all, Ks_dec, ns_dec):
+            if abs(coeff) > eps:
+                coeff_f = float(coeff)
+                k_f = float(k)
+                n_f = float(n)
+                if len(term) == 1:
+                    s = f'{coeff_f:.3f} * (1 / {k_f:.3f} - {species[term[0]]}^{n_f:.3f} / (1 + {k_f:.3f} * {species[term[0]]}^{n_f:.3f}))'
+                else:
+                    s = f'{coeff_f:.3f} * {species[term[1]]} * (1 / {k_f:.3f} - {species[term[0]]}^{n_f:.3f} / (1 + {k_f:.3f} * {species[term[0]]}^{n_f:.3f}))'
+                terms.append(s)
+
+        return terms
         
-        return poly_coeffs, hill_coeffs_inc, hill_coeffs_dec
-
-    def unpack_hill_params(self):
-        ns_inc = []
-        ns_dec = []
-        Ks_inc = []
-        Ks_dec = []
-
-        # Access the hill feature module (works if you use DuplicateHillFeatures or just HillFeatures)
-        hill_features_list = self.reaction.eql_layer.hill.hill_modules
-
-        # Iterate over all HillFeatures modules
-        for hill_features in hill_features_list:
-            for hill_func in hill_features.hill_inc_raw:
-                ns_inc.append(torch.sigmoid(hill_func.raw_n).item() * 5)
-                Ks_inc.append(torch.sigmoid(hill_func.raw_K).item() * self.param_bounds)
-                
-            # Process increasing cross hill functions
-            for key in list(hill_features.hill_inc_cross.keys()):
-                hill_func = hill_features.hill_inc_cross[key]
-                ns_inc.append(torch.sigmoid(hill_func.raw_n).item() * 5)
-                Ks_inc.append(torch.sigmoid(hill_func.raw_K).item() * self.param_bounds)
-
-            # Process decreasing raw hill functions
-            for hill_func in hill_features.hill_dec_raw:
-                ns_dec.append(torch.sigmoid(hill_func.raw_n).item() * 5)
-                Ks_dec.append(torch.sigmoid(hill_func.raw_K).item() * self.param_bounds)
-                
-            # Process decreasing cross hill functions
-            for key in list(hill_features.hill_dec_cross.keys()):
-                hill_func = hill_features.hill_dec_cross[key]
-                ns_dec.append(torch.sigmoid(hill_func.raw_n).item() * 5)
-                Ks_dec.append(torch.sigmoid(hill_func.raw_K).item() * self.param_bounds)
-                
-        return ns_inc, ns_dec, Ks_inc, Ks_dec
-            
+    # -----------------------
+    # Utility: optional pruning helpers retained (no-change semantics)
+    # -----------------------
     def remove_insignificant_terms(self, uv, thresh):
         # # Define epsilon to avoid division by zero
         # eps=1e-12
@@ -537,43 +679,3 @@ class BINN(nn.Module):
         # keep_mask = self.reaction.eql_layer.fc.weight != 0
         
         # return keep_mask
-
-    def generate_equation(self):
-        # Unpack coefficients
-        poly_coeffs, hill_coeffs_inc, hill_coeffs_dec = self.unpack_coeffs()      
-        
-        # Unpack Hill params
-        ns_inc, ns_dec, Ks_inc, Ks_dec = self.unpack_hill_params()
-                
-        terms = []
-        species = ['u', 'v']
-        
-        # Generate terms
-        poly_terms, hill_terms = self.generate_terms()
-
-        for term, coeff in zip(poly_terms*self.duplicates, poly_coeffs):
-            if coeff != 0:
-                string = f'{coeff:.3f}'
-                for ind in term:
-                    string += f' * {species[ind]}'
-                terms.append(string)
-        
-        for term, coeff, k, n in zip(hill_terms*self.duplicates, hill_coeffs_inc, Ks_inc, ns_inc):
-            if coeff != 0:
-                string = f'{coeff:.3f}'
-                if len(term) == 1:
-                    string += f' * {species[term[0]]}^{n:.3f} / (1 + {k:.3f} * {species[term[0]]}^{n:.3f})'
-                else:     
-                    string += f' * {species[term[1]]} * {species[term[0]]}^{n:.3f} / (1 + {k:.3f} * {species[term[0]]}^{n:.3f})'
-                terms.append(string)
-            
-        for term, coeff, k, n in zip(hill_terms*self.duplicates, hill_coeffs_dec, Ks_dec, ns_dec):
-            if coeff != 0:
-                string = f'{coeff:.3f}'
-                if len(term) == 1:
-                    string += f' * (1 / {k:.3f} - {species[term[0]]}^{n:.3f} / (1 + {k:.3f} * {species[term[0]]}^{n:.3f}))'
-                else:     
-                    string += f' * {species[term[1]]} * (1 / {k:.3f} - {species[term[0]]}^{n:.3f} / (1 + {k:.3f} * {species[term[0]]}^{n:.3f}))'
-                terms.append(string)
-        
-        return terms

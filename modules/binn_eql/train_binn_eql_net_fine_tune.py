@@ -7,6 +7,7 @@ sys.path.append(repo_start)
 from modules.utils.imports import *
 from modules.binn_eql.model_wrapper_2d import model_wrapper
 from modules.binn_eql.build_binn_eql_net import BINN
+from modules.binn_eql.plot_param_history import plot_param_history
 from modules.loaders.format_data import format_data_general, format_data_torch
 from modules.loaders.visualize_training_data import animate_data
 from modules.utils.noise_and_interpolate import noise_and_interpolate
@@ -44,7 +45,7 @@ warm_up = float(config['warm_up'])
 dir_name = sys.argv[1]
 
 # Set training hyperparameters
-# epochs = int(1e6)
+# epochs = 200
 epochs = 100_000
 # rel_save_thresh = 0.01
 
@@ -129,7 +130,7 @@ model = model_wrapper(
     save_name=f'{dir_name}/binn')
 
 # train jointly
-train_loss_dict, val_loss_dict = model.fit(
+param_history, train_loss_dict, val_loss_dict = model.fit(
     train_data=train_data,
     val_data=val_data,
     batch_size=batch_size,
@@ -140,6 +141,8 @@ train_loss_dict, val_loss_dict = model.fit(
     warm_up=warm_up)
 
 generate_loss_curves(train_loss_dict, val_loss_dict, dir_name, 20, 'training_loss_curves')
+
+plot_param_history(binn, param_history, f"{dir_name}/param_history.png")
 
 # Load and prune final model
 model.load(f"{dir_name}/binn_best_val_model", device=device)
