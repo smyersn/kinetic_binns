@@ -45,7 +45,7 @@ warm_up = float(config['warm_up'])
 dir_name = sys.argv[1]
 
 # Set training hyperparameters
-# epochs = 200
+# epochs = 250
 epochs = 100_000
 # rel_save_thresh = 0.01
 
@@ -163,7 +163,10 @@ if not diff_coeffs:
 file.close()
 
 # Generate learned learned surface after initial training
-F_mlp_unformatted = model.model.reaction(torch.tensor(uv_nans).float().to(device))
+uv_nans_scaled = np.zeros_like(uv_nans)
+uv_nans_scaled[:, 0] = uv_nans[:, 0] / model.model.max_scale[0, 0].cpu().detach().numpy()
+uv_nans_scaled[:, 1] = uv_nans[:, 1] / model.model.max_scale[0, 1].cpu().detach().numpy()
+F_mlp_unformatted = model.model.reaction(torch.tensor(uv_nans_scaled).float().to(device))
 F_mlp = F_mlp_unformatted.cpu().detach().numpy().reshape(501, 501)
 
 # Visualize surfaces

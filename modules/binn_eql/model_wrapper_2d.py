@@ -105,7 +105,7 @@ class model_wrapper():
         best_val_loss = 1e12 if best_val_loss is None else best_val_loss  
         
         # simple history container
-        self.param_history = {'raw_w': [], 'effective': [],'epoch': []}
+        self.param_history = {'raw_w_unscaled': [], 'effective_unscaled': [],'epoch': []}
       
         # loop over epochs
         for epoch in range(initial_epoch, initial_epoch + epochs):
@@ -139,8 +139,8 @@ class model_wrapper():
                 # Save history
                 param_snapshot = self.model.extract_params(full=False)
                 self.param_history['epoch'].append(epoch)
-                self.param_history['raw_w'].append(param_snapshot['raw_w'])
-                self.param_history['effective'].append(param_snapshot['effective'])
+                self.param_history['raw_w_unscaled'].append(param_snapshot['raw_w_unscaled'])
+                self.param_history['effective_unscaled'].append(param_snapshot['effective_unscaled'])
                 
             # Create lists for epoch training losses
             train_losses = 0

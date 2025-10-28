@@ -18,16 +18,16 @@ def plot_param_history(binn_model,
     - legend order follows the colormap native order (for discrete colormaps like Set1).
     """
     # --- load arrays
-    if 'raw_w' in param_history:
-        raw_list = param_history['raw_w']
+    if 'raw_w_unscaled' in param_history:
+        raw_list = param_history['raw_w_unscaled']
     else:
-        raise KeyError("param_history must contain 'raw_w' or 'w'")
+        raise KeyError("param_history must contain 'raw_w_unscaled'")
 
-    if 'effective' not in param_history:
-        raise KeyError("param_history must contain 'effective'")
+    if 'effective_unscaled' not in param_history:
+        raise KeyError("param_history must contain 'effective_unscaled'")
 
     raw_arr = np.stack([np.asarray(a) for a in raw_list], axis=0)   # (E, M)
-    eff_arr = np.stack([np.asarray(a) for a in param_history['effective']], axis=0)
+    eff_arr = np.stack([np.asarray(a) for a in param_history['effective_unscaled']], axis=0)
     epoch_arr = np.array(param_history['epoch'])
     E, M = raw_arr.shape
     if eff_arr.shape != raw_arr.shape:
