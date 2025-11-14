@@ -100,7 +100,8 @@ class model_wrapper():
                 
         # initialize book keeping
         start_time = time.time()
-        last_improved = 0
+        monitor_start = int(warm_up * 2)    # start monitoring after twice warmup
+        last_improved = monitor_start
         best_train_loss = 1e12 if best_train_loss is None else best_train_loss
         best_val_loss = 1e12 if best_val_loss is None else best_val_loss  
         
@@ -262,7 +263,7 @@ class model_wrapper():
             rel_diff = (best_val_loss - self.val_loss_dict['loss'][-1])
             rel_diff /= best_val_loss
             
-            if epoch >= warm_up*2:
+            if epoch >= monitor_start:
                 if rel_diff > rel_save_thresh:
                     
                     # update best validation loss
@@ -276,11 +277,7 @@ class model_wrapper():
                         self.save(self.save_name+'_best_val')
                     
                     # update early stopper
-                    last_improved = epoch
-            
-            else:
-                last_improved = epoch
-                
+                    last_improved = epoch               
                                 
             # update user
             elapsed, remaining, ms = time_remaining(
