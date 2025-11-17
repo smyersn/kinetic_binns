@@ -8,7 +8,7 @@ def plot_param_history(binn_model,
                        param_history,
                        save_path = None,
                        max_terms=None,
-                       figsize=(14, 10),
+                       figsize=(14, 5),
                        alpha_dup=0.25,
                        alpha_sum=0.9,
                        cmap_name='Set1'):
@@ -23,15 +23,9 @@ def plot_param_history(binn_model,
     else:
         raise KeyError("param_history must contain 'raw_w_unscaled'")
 
-    if 'effective_unscaled' not in param_history:
-        raise KeyError("param_history must contain 'effective_unscaled'")
-
     raw_arr = np.stack([np.asarray(a) for a in raw_list], axis=0)   # (E, M)
-    eff_arr = np.stack([np.asarray(a) for a in param_history['effective_unscaled']], axis=0)
     epoch_arr = np.array(param_history['epoch'])
     E, M = raw_arr.shape
-    if eff_arr.shape != raw_arr.shape:
-        raise ValueError(f"raw and effective shapes mismatch: {raw_arr.shape} vs {eff_arr.shape}")
 
     # --- reconstruct base-term groups from model
     poly_terms, hill_terms = binn_model.generate_terms()   # lists for a single duplicate
@@ -96,9 +90,9 @@ def plot_param_history(binn_model,
         mags = {k: np.abs(arr[-1, groups[k]].sum()) for k in keys}
         return sorted(keys, key=lambda k: mags[k], reverse=True)[:K]
 
-    poly_plot_names = pick_top(groups_poly, eff_arr, max_terms)
-    hill_inc_plot_names = pick_top(groups_hill_inc, eff_arr, max_terms)
-    hill_dec_plot_names = pick_top(groups_hill_dec, eff_arr, max_terms)
+    poly_plot_names = pick_top(groups_poly, raw_arr, max_terms)
+    hill_inc_plot_names = pick_top(groups_hill_inc, raw_arr, max_terms)
+    hill_dec_plot_names = pick_top(groups_hill_dec, raw_arr, max_terms)
 
     # Combine order for colors & legend: first polys, then hill_inc, then hill_dec
     combined_names = list(poly_plot_names) + list(hill_inc_plot_names) + list(hill_dec_plot_names)
@@ -117,9 +111,8 @@ def plot_param_history(binn_model,
     color_map = {name: palette[i] for i, name in enumerate(combined_names)}
 
     # --- plotting
-    fig, axes = plt.subplots(2, 2, figsize=figsize, sharex=True)
-    ax_raw_poly, ax_raw_hill = axes[0,0], axes[0,1]
-    ax_eff_poly, ax_eff_hill = axes[1,0], axes[1,1]
+    fig, axes = plt.subplots(1, 2, figsize=figsize, sharex=True)
+    ax_raw_poly, ax_raw_hill = axes[0], axes[1]
 
     def plot_panel(ax, names_to_plot, groups_dict, data_arr, title):
         proxies = []
@@ -144,11 +137,6 @@ def plot_param_history(binn_model,
     # raw hills: show inc then dec separate in same axes (order of legend follows combined_names)
     plot_panel(ax_raw_hill, hill_inc_plot_names + hill_dec_plot_names,
                {**groups_hill_inc, **groups_hill_dec}, raw_arr, 'Raw hill rates (inc & dec)')
-    # effective polynomials
-    plot_panel(ax_eff_poly, poly_plot_names, groups_poly, eff_arr, 'Effective polynomial rates (gated)')
-    # effective hills
-    plot_panel(ax_eff_hill, hill_inc_plot_names + hill_dec_plot_names,
-               {**groups_hill_inc, **groups_hill_dec}, eff_arr, 'Effective hill rates (gated)')
 
     plt.tight_layout()
     

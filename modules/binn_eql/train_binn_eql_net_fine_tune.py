@@ -41,12 +41,13 @@ param_bounds = float(config['param_bounds'])
 rel_save_thresh = float(config['rel_save_thresh'])
 prune_thresh = float(config['prune_thresh'])
 warm_up = float(config['warm_up'])
+prune_freq = float(config['prune_freq'])
 
 dir_name = sys.argv[1]
 
 # Set training hyperparameters
-# epochs = 250
-epochs = 100_000
+# epochs = 150
+epochs = 250_000
 # rel_save_thresh = 0.01
 
 # Get GPU
@@ -138,7 +139,8 @@ param_history, train_loss_dict, val_loss_dict = model.fit(
     early_stopping=5000,
     rel_save_thresh=rel_save_thresh,
     prune_thresh=prune_thresh,
-    warm_up=warm_up)
+    warm_up=warm_up,
+    prune_freq=prune_freq)
 
 generate_loss_curves(train_loss_dict, val_loss_dict, dir_name, 20, 'training_loss_curves')
 

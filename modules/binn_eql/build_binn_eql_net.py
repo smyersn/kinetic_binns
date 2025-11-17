@@ -245,11 +245,15 @@ class BINN(nn.Module):
 
         return torch.mean(pde_loss)
     
-    def reg_loss(self, epoch):
-        # Sparsity Regularization
-        l05_norm = self.reaction.eql_layer.l0_gate.expected_l0()
-                       
-        return l05_norm
+    # def reg_loss(self, epoch):
+    #     # Calculate coefficient loss
+    #     coeffs = self.reaction.eql_layer.fc.weight
+
+    #     # Sparsity Regularization
+    #     l05_norm = custom_norm(coeffs, 0.01)
+    #     l05_loss = self.l05_weight * l05_norm
+        
+    #     return l05_loss
 
     def loss(self, pred, true, epoch):
         # load cached inputs from forward pass
@@ -281,14 +285,14 @@ class BINN(nn.Module):
             else:
                 l0_weight_eff = self.l05_weight
         
-        # compute loss from regularization
-        l0_loss = self.reg_loss(epoch)
-        self.reg_loss_val = l0_weight_eff*l0_loss
+        # # compute loss from regularization
+        # l0_loss = self.reg_loss(epoch)
+        # self.reg_loss_val = l0_weight_eff*l0_loss
         
         # if epoch % 1000 == 0:
         #     print(f'L0 norm, weight, loss: {l0_loss, l0_weight_eff, self.reg_loss_val}')
         
-        return (self.gls_loss_val + self.pde_loss_val + self.reg_loss_val), self.gls_loss_val, self.pde_loss_val, self.reg_loss_val
+        return (self.gls_loss_val + self.pde_loss_val), self.gls_loss_val, self.pde_loss_val
 
     # -----------------------
     # Feature generation and equation formatting
@@ -334,27 +338,7 @@ class BINN(nn.Module):
         eql = self.reaction.eql_layer
 
         # raw linear weights (1 x M) as tensor on device
-        raw_w_t = eql.fc.weight[0].detach()
-
-        # deterministic gate values (stretched-sigmoid proxy)
-        try:
-            gates_t = eql.l0_gate.get_gates().detach()  # tensor (M,)
-        except Exception:
-            # fallback: stretched-sigmoid proxy from log_alpha
-            log_alpha = eql.l0_gate.log_alpha.detach()
-            gamma = float(eql.l0_gate.gamma)
-            zeta = float(eql.l0_gate.zeta)
-            s = torch.sigmoid(log_alpha)
-            s_stretched = s * (zeta - gamma) + gamma
-            gates_t = s_stretched.clamp(0.0, 1.0)
-
-        # effective (gated) weights (tensor)
-        effective_t = (raw_w_t * gates_t).detach()
-
-        # Convert main arrays to numpy (single batched transfers)
-        raw_w = raw_w_t.cpu().numpy().reshape(-1)
-        gates = gates_t.cpu().numpy().reshape(-1)
-        effective = effective_t.cpu().numpy().reshape(-1)
+        raw_w = eql.fc.weight[0].detach().cpu().numpy().reshape(-1)
 
         # gather feature structure
         num_poly = int(eql.num_poly_features)
@@ -436,7 +420,7 @@ class BINN(nn.Module):
         s_u, s_v = self.max_scale[0, 0], self.max_scale[0, 1]
         
         # POLYNOMIALS: first num_poly entries correspond to poly_terms * duplicates ordering
-        poly_coeffs_scaled = effective[:num_poly] if num_poly > 0 else np.array([])
+        poly_coeffs_scaled = raw_w[:num_poly] if num_poly > 0 else np.array([])
         poly_coeffs_unscaled = []
         for term_tuple, coeff_scaled in zip(poly_terms * dup, poly_coeffs_scaled):
             # count powers of u (index 0) and v (index 1)
@@ -447,7 +431,7 @@ class BINN(nn.Module):
         poly_coeffs_unscaled = np.array(poly_coeffs_unscaled)
 
         # HILLS: extract hill block and split into inc/dec in duplicate-major order
-        hill_block = effective[num_poly : num_poly + num_hill] if num_hill > 0 else np.array([])
+        hill_block = raw_w[num_poly : num_poly + num_hill] if num_hill > 0 else np.array([])
         if hill_block.size:
             # shape (dup, 2 * n_hill_single)
             try:
@@ -529,22 +513,17 @@ class BINN(nn.Module):
             raw_w_unscaled_list.extend(hill_dec_unscaled.tolist())
 
         raw_w_unscaled = np.array(raw_w_unscaled_list) if len(raw_w_unscaled_list) else np.array([])
-        effective_unscaled = (raw_w_unscaled * gates)
         
         # Non-full (quick) return: minimal keys requested
         if not full:
             return {
                 'raw_w_unscaled': raw_w_unscaled,
-                'effective_unscaled': effective_unscaled
             }
 
         # Full return (everything)
         return {
             'raw_w': raw_w,
             'raw_w_unscaled': raw_w_unscaled,
-            'gates': gates,
-            'effective': effective,
-            'effective_unscaled': effective_unscaled,
             'num_poly': num_poly,
             'num_hill': num_hill,
             'ns_inc': ns_inc,
@@ -610,136 +589,16 @@ class BINN(nn.Module):
             terms.append(s)
 
         return terms
-
-    def eval_equation_from_params(self, uv_np, dec=10):
-        """
-        Evaluate analytic equation described by params at points uv_np (N,2).
-        domain: 'unscaled' -> evaluate in original u,v using _unscaled arrays (the default pretty equation)
-                'scaled'   -> evaluate in scaled domain (u',v') using *_scaled arrays (so matches model input).
-        """
-        params = self.extract_params()
-        s_u, s_v = self.max_scale[0, 0], self.max_scale[0, 1]
-        
-        u = np.asarray(uv_np)[:,0].astype(float)
-        v = np.asarray(uv_np)[:,1].astype(float)
-        N = len(u)
-        z = np.zeros(N, dtype=float)
-
-        poly_terms = params['poly_terms']
-        hill_terms = params['hill_terms']
-        dup = int(params.get('duplicates', 1))
-
-        poly_coeffs = np.round(np.asarray(params['poly_coeffs_unscaled']), dec)
-        inc_b = np.round(np.asarray(params['hill_inc_unscaled']), dec)
-        dec_b = np.round(np.asarray(params['hill_dec_unscaled']), dec)
-        Ks_inc = np.round(np.asarray(params['Ks_inc_unscaled']), dec)
-        Ks_dec = np.round(np.asarray(params['Ks_dec_unscaled']), dec)
-        ns_inc = np.round(np.asarray(params['ns_inc']), dec)
-        ns_dec = np.round(np.asarray(params['ns_dec']), dec)
-
-        # polynomials
-        for term, coeff in zip(poly_terms * dup, poly_coeffs):
-            if abs(coeff) < 1e-12:
-                continue
-            feat = np.ones(N)
-            for ind in term:
-                feat = feat * (u if ind == 0 else v)
-            z += float(coeff) * feat
-
-        # inc hills
-        for term, coeff, K, n in zip(hill_terms * dup, inc_b, Ks_inc, ns_inc):
-            if abs(coeff) < 1e-12:
-                continue
-            if len(term) == 1:
-                reg = u if term[0] == 0 else v
-                term_val = (reg ** n) / (1.0 + K * (reg ** n))
-            else:
-                reg = u if term[0] == 0 else v
-                mult = u if term[1] == 0 else v
-                term_val = mult * ((reg ** n) / (1.0 + K * (reg ** n)))
-            z += float(coeff) * term_val
-            
-        # dec hills
-        for term, coeff, K, n in zip(hill_terms * dup, dec_b, Ks_dec, ns_dec):
-            if abs(coeff) < 1e-12:
-                continue
-            if len(term) == 1:
-                reg = u if term[0] == 0 else v
-                term_val = (1.0 / K) - (reg ** n) / (1.0 + K * (reg ** n))
-            else:
-                reg = u if term[0] == 0 else v
-                mult = u if term[1] == 0 else v
-                term_val = mult * ((1.0 / K) - (reg ** n) / (1.0 + K * (reg ** n)))
-            z += float(coeff) * term_val
-        return z
       
     # -----------------------
     # Utility: optional pruning helpers retained (no-change semantics)
     # -----------------------
-    def remove_insignificant_terms(self, uv, thresh):
-        # # Define epsilon to avoid division by zero
-        # eps=1e-12
-        
-        # # compute raw features (N x M)
-        # poly_feats = self.reaction.eql_layer.poly(uv)        # shape [N, M_poly]
-        # hill_feats = self.reaction.eql_layer.hill(uv)        # shape [N, M_hill]
-        # feats = torch.cat([poly_feats, hill_feats], dim=1)   # shape [N, M]
-
-        # # weights vector for the single-output fc (assume out_features==1)
-        # # use data (not requiring_grad); choose device automatically
-        # weights = self.reaction.eql_layer.fc.weight.detach().view(-1)  # shape [M]
-
-        # # per-feature RMS (scale) across the uv sample
-        # feat_rms = torch.sqrt((feats.detach() ** 2).mean(dim=0) + eps)  # shape [M]
-
-        # # absolute per-feature contribution (L2-style): |w_i| * feat_rms_i
-        # contrib = weights.abs() * feat_rms  # shape [M]
-
-        # # fractional contribution relative to total contribution
-        # total = contrib.sum() + eps
-        # frac = contrib / total  # shape [M], sums to ~1
-
-        # # build keep/prune mask: keep features whose fraction >= thresh_frac
-        # keep_mask = (frac >= thresh)   # boolean mask shape [M]
-        
-        # # print(f'weights: {weights}')
-        # # print(f'feat rms: {feat_rms}')
-        # print(f'contrib: {contrib}')
-        # print(f'frac: {frac}')
-        # print(f'keep mask: {keep_mask}')
-
-        # # zero-out pruned features (use no_grad)
-        # with torch.no_grad():
-        #     # if fc has shape [1, M], index accordingly
-        #     self.reaction.eql_layer.fc.weight[0, ~keep_mask] = 0.0
-
-        
-        
-        # removes all terms from individual that have minor impact on surface
-        poly_feats = self.reaction.eql_layer.poly(uv)
-        hill_feats = self.reaction.eql_layer.hill(uv)
-        feats = torch.cat([poly_feats, hill_feats], dim=1)
-
-        weights = self.reaction.eql_layer.fc.weight[0]
-        weighted_feats = feats * weights  
-        
-        surface = weighted_feats.sum(dim=1)  
-                
-        # Calculate RMSE if any feature is removed
-        rmse = torch.sqrt((weighted_feats**2).mean(dim=0))          # [M]
-        # print(f'rmse: {rmse}')
-        
-        # Determine which features are insignificant
-        surface_range = torch.mean(torch.abs(surface))              # scalar
-        # surface_range = torch.max(surface) - torch.min(surface)   # scalar
-        # print(f'surface range: {surface_range}')
-        
-        # Calculate coefficient of variation
-        coeffs = rmse / surface_range                               # [M]
-        # print(f'coeffs: {coeffs}')
-        
+    def remove_insignificant_terms(self, thresh):  
+        # Get coefficients      
+        coeffs = self.extract_params(full=False)['raw_w_unscaled']
+               
         # build boolean mask of insignificant features
-        mask = (coeffs < thresh)
+        mask = (np.abs(coeffs) < thresh)
                                 
         # zero them out insignificant features
         with torch.no_grad():
@@ -843,13 +702,10 @@ class BINN(nn.Module):
                     else:
                         break       
                               
-    def prune(self, thresh=1):       
-        # Get uv values from training data
-        uv = self.train_data[:, -2:]
-
+    def prune(self, thresh):       
         # Prune
-        self.remove_insignificant_terms(uv, thresh)
-        self.fix_cheating_hill_functions(uv, thresh)
+        self.remove_insignificant_terms(thresh)
+        # self.fix_cheating_hill_functions(uv, thresh)
         
         # keep_mask = self.reaction.eql_layer.fc.weight != 0
         
