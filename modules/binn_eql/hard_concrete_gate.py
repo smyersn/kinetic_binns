@@ -150,17 +150,15 @@ class HardConcreteGate(nn.Module):
     
     def expected_l0(self):
         """
-        Analytic expected L0 (probability that gate is non-zero) used in the paper:
-          P(z > 0) = sigmoid( log_alpha - beta * log(-gamma / zeta) )
-        Returns a vector of same shape as log_alpha with values in (0,1).
-        This is the expected contribution to L0; you can multiply by lambda and sum.
+        Returns a vector of probabilities P(z > 0) for each gate.
         """
-        # ensure gamma < 0 and zeta > 0, and -gamma/zeta > 0
-        # compute sigmoid(log_alpha - beta * log(-gamma/zeta))
-        # note: using float casts to avoid integer division surprises
         factor = - (self.gamma) / (self.zeta)
+        
+        # Defensive check for broken config
         if factor <= 0:
-            # defensively return probabilities close to 1 if config broken
-            return torch.sigmoid(self.log_alpha * 0.0 + 1e6 * torch.ones_like(self.log_alpha))
+            return torch.sigmoid(self.log_alpha * 0.0 + 1e6)
+            
         term = self.log_alpha - self.beta * torch.log(torch.tensor(factor, device=self.log_alpha.device, dtype=self.log_alpha.dtype))
-        return torch.sigmoid(term).sum()
+        
+        # CHANGE: Return the vector, do NOT sum here.
+        return torch.sigmoid(term)

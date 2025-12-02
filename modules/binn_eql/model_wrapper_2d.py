@@ -71,8 +71,8 @@ class model_wrapper():
         self.save_best_val = save_best_val
         self.save_opt = save_opt
         self.save_reg = save_reg
-        self.train_loss_dict = {'loss': [], 'gls': [], 'pde': []}
-        self.val_loss_dict = {'loss': [], 'gls': [], 'pde': []}
+        self.train_loss_dict = {'loss': [], 'gls': [], 'pde': [], 'reg': []}
+        self.val_loss_dict = {'loss': [], 'gls': [], 'pde': [], 'reg': []}
         self.train = False
         self.val = False
         
@@ -96,20 +96,17 @@ class model_wrapper():
             lr_dec_prop=1.0,
             rel_save_thresh=0.0,
             prune_thresh=3,
-            warm_up=0,
-            prune_freq=10000):
+            warm_up=0):
                 
         # initialize book keeping
         start_time = time.time()
-        last_improved = 0
+        monitor_start = int(warm_up * 2)    # start monitoring after twice warmup
+        last_improved = monitor_start
         best_train_loss = 1e12 if best_train_loss is None else best_train_loss
         best_val_loss = 1e12 if best_val_loss is None else best_val_loss  
         
         # simple history container
-        self.param_history = {'raw_w_unscaled': [], 'epoch': []}
-        
-        # set initial threshold
-        thresh = 0.01
+        self.param_history = {'raw_w_unscaled': [], 'effective_unscaled': [],'epoch': []}
       
         # loop over epochs
         for epoch in range(initial_epoch, initial_epoch + epochs):
@@ -121,15 +118,15 @@ class model_wrapper():
                     
             self.model.train()
             epoch_start_time = time.time()
-                        
-            if epoch >= warm_up and epoch % prune_freq == 0:
-                self.model.prune(thresh=thresh)
-                self.freeze_pruned_params()
-                if thresh <= 0.1:
-                    thresh += 0.01
+            
+            # # Prune equation every 100 epochs
+            # if epoch % 100 == 0 and epoch > 0:
+            #     self.model.prune()
+            #     # self.freeze_pruned_params()
 
             # Print equation every 1000 epochs                                                                        
             if epoch % 1000 == 0:
+            # if epoch % 50 == 0:
                 fn = f'{self.dir_name}/equation.txt'
                 file = open(fn, 'a')
                 
@@ -144,11 +141,13 @@ class model_wrapper():
                 param_snapshot = self.model.extract_params(full=False)
                 self.param_history['epoch'].append(epoch)
                 self.param_history['raw_w_unscaled'].append(param_snapshot['raw_w_unscaled'])
+                self.param_history['effective_unscaled'].append(param_snapshot['effective_unscaled'])
                 
             # Create lists for epoch training losses
             train_losses = 0
             train_gls_losses = 0
             train_pde_losses = 0
+            train_reg_losses = 0
 
             # Shuffle training data
             perm = torch.randperm(train_data.size(0))
@@ -170,7 +169,7 @@ class model_wrapper():
                 y_pred = self.model(x_true)
                                     
                 # compute loss and optional regularization
-                train_loss, train_gls_loss, train_pde_loss = self.loss(y_pred, y_true, epoch)
+                train_loss, train_gls_loss, train_pde_loss, train_reg_loss = self.loss(y_pred, y_true, epoch)
                                                                             
                 # compute backward pass and update weights
                 train_loss.backward()
@@ -190,11 +189,13 @@ class model_wrapper():
                 train_losses += train_loss.item() * len(x_true)
                 train_gls_losses += train_gls_loss.item() * len(x_true)
                 train_pde_losses += train_pde_loss.item() * len(x_true)
+                train_reg_losses += train_reg_loss.item() * len(x_true)
 
             # update book keeping for this epoch
             self.train_loss_dict['loss'].append(np.sum(train_losses) / len(train_data))
             self.train_loss_dict['gls'].append(np.sum(train_gls_losses) / len(train_data))
             self.train_loss_dict['pde'].append(np.sum(train_pde_losses) / len(train_data))
+            self.train_loss_dict['reg'].append(np.sum(train_reg_losses) / len(train_data))
             
             # if train error improved
             rel_diff = (best_train_loss - self.train_loss_dict['loss'][-1])
@@ -223,6 +224,7 @@ class model_wrapper():
             val_losses = 0
             val_gls_losses = 0
             val_pde_losses = 0
+            val_reg_losses = 0
             
             # Don't shuffle val data
             no_perm  = torch.arange(val_data.size(0))
@@ -244,22 +246,24 @@ class model_wrapper():
                 y_pred = self.model(x_true)
                 
                 # comptue loss
-                val_loss, val_gls_loss, val_pde_loss = self.loss(y_pred, y_true, epoch)
+                val_loss, val_gls_loss, val_pde_loss, val_reg_loss = self.loss(y_pred, y_true, epoch)
                 
                 val_losses += val_loss.item() * len(x_true)
                 val_gls_losses += val_gls_loss.item() * len(x_true)
                 val_pde_losses += val_pde_loss.item() * len(x_true)
+                val_reg_losses += val_reg_loss.item() * len(x_true)
 
             # update book keeping for this epoch
             self.val_loss_dict['loss'].append(np.sum(val_losses) / len(val_data))
             self.val_loss_dict['gls'].append(np.sum(val_gls_losses) / len(val_data))
             self.val_loss_dict['pde'].append(np.sum(val_pde_losses) / len(val_data))
+            self.val_loss_dict['reg'].append(np.sum(val_reg_losses) / len(val_data))
 
             # if validation error improved
             rel_diff = (best_val_loss - self.val_loss_dict['loss'][-1])
             rel_diff /= best_val_loss
             
-            if epoch >= warm_up*2:
+            if epoch >= monitor_start:
                 if rel_diff > rel_save_thresh:
                     
                     # update best validation loss
@@ -273,11 +277,7 @@ class model_wrapper():
                         self.save(self.save_name+'_best_val')
                     
                     # update early stopper
-                    last_improved = epoch
-            
-            else:
-                last_improved = epoch
-                
+                    last_improved = epoch               
                                 
             # update user
             elapsed, remaining, ms = time_remaining(
@@ -307,18 +307,9 @@ class model_wrapper():
                 if np.mod(epoch, lr_dec_epoch) == 0 and epoch != 0:
                     for param_group in self.optimizer.param_groups:
                         param_group['lr'] *= lr_dec_prop
+                        
+        # self.save(self.save_name+'_best_val')
 
-        # # final prune
-        if self.save_best_train:
-            self.load(self.save_name+'_best_train_model')
-            self.model.prune(thresh=thresh)
-            self.save(self.save_name+'_best_train')
-
-        if self.save_best_val:
-            self.load(self.save_name+'_best_val_model')
-            self.model.prune(thresh=thresh)
-            self.save(self.save_name+'_best_val')
-            
         # final print readout
         elapsed, remaining, ms = time_remaining(
             current_iter=epoch+1,

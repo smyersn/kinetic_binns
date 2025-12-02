@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from modules.binn_eql.hard_concrete_gate import HardConcreteGate
        
 class HillFunction(nn.Module):
     def __init__(self, param_bounds, increasing=True):
@@ -12,14 +13,16 @@ class HillFunction(nn.Module):
         # self.raw_n = nn.Parameter(torch.randn(1))
         # self.raw_K = nn.Parameter(torch.randn(1))
         self.raw_n = nn.Parameter(torch.empty(1).uniform_(-4, 4))
-        self.raw_K = nn.Parameter(torch.empty(1).uniform_(-4, 4))
+        self.raw_logK = nn.Parameter(
+            torch.empty(1).uniform_(torch.log(torch.tensor(1e-3)), 
+                                    torch.log(torch.tensor(1))))
 
         self.increasing = increasing
 
     def forward(self, x):
         # Use sigmoid to ensure n and K are positive and scale to maxes
-        n = torch.sigmoid(self.raw_n) * 5
-        K = torch.sigmoid(self.raw_K) * self.param_bounds
+        n = torch.sigmoid(self.raw_n) * 3 + 1
+        K = torch.exp(self.raw_logK)
         x_n = x.pow(n)
         
         if self.increasing:
@@ -135,11 +138,19 @@ class EQLLayer(nn.Module):
         self.total_features = self.num_poly_features + self.num_hill_features
                 
         self.fc = nn.Linear(self.total_features, 1, bias=False)
+        self.l0_gate = HardConcreteGate(self.total_features)
         # nn.init.uniform_(self.fc.weight, a=-param_bounds, b=param_bounds)
         nn.init.uniform_(self.fc.weight, a=-1, b=1)
 
-    def forward(self, x):
+    def forward(self, x, training=True):
         poly_feats = self.poly(x)
         hill_feats = self.hill(x)
         features = torch.cat([poly_feats, hill_feats], dim=1)
-        return self.fc(features)       
+        
+        w = self.fc.weight  # shape (1, n_terms)
+        z = self.l0_gate()  # shape (1, n_terms)
+
+        gated_w = w * z  # element-wise gating
+        out = (features * gated_w).sum(dim=1, keepdim=True)
+        
+        return out

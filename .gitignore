@@ -1,3 +1,6 @@
 /development/
 /data/__pycache__/
 *.pyc
+*.pt
+*.npz
+*.gif

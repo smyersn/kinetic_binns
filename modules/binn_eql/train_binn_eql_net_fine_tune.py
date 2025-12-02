@@ -8,13 +8,14 @@ from modules.utils.imports import *
 from modules.binn_eql.model_wrapper_2d import model_wrapper
 from modules.binn_eql.build_binn_eql_net import BINN
 from modules.binn_eql.plot_param_history import plot_param_history
-from modules.loaders.format_data import format_data_general, format_data_torch
-from modules.loaders.visualize_training_data import animate_data
+from modules.loaders.format_data import format_data_torch
 from modules.utils.noise_and_interpolate import noise_and_interpolate
 from modules.utils.training_test_split import training_test_split
 from modules.analysis.generate_loss_curves import generate_loss_curves
 from modules.binn_eql.visualize_surface import visualize_surface
-from modules.binn_eql.simulate_surface import simulate_surface, animate_sim
+from modules.loaders.sims_and_animations import (simulate_uvmlp, simulate_feql,
+                                                 format_training_data_for_animation,
+                                                 animate_uarray)
 from modules.generate_data.simulate_system import wave_pinning
 
 # load params from configuration file
@@ -41,13 +42,12 @@ param_bounds = float(config['param_bounds'])
 rel_save_thresh = float(config['rel_save_thresh'])
 prune_thresh = float(config['prune_thresh'])
 warm_up = float(config['warm_up'])
-prune_freq = float(config['prune_freq'])
 
 dir_name = sys.argv[1]
 
 # Set training hyperparameters
-# epochs = 150
-epochs = 250_000
+# epochs = 100
+epochs = 100_000
 # rel_save_thresh = 0.01
 
 # Get GPU
@@ -57,6 +57,7 @@ device = 'cuda'
 data = torch.load(training_data_path)
 u_array, x_array, t_array = data['u_array'], data['x_array'], data['t_array']
 training_data = format_data_torch(u_array, x_array, t_array)
+training_data = training_data[training_data[:, dimensions] <= 60]
 
 # Add noise to training data if specified in config file
 if epsilon != 0 or points != 0:
@@ -64,8 +65,8 @@ if epsilon != 0 or points != 0:
                                           dimensions, species, 
                                           multiplicative_noise=False)
 
-animate_data(training_data, dimensions, species, name=f'{dir_name}/training_data')
-
+training_u_array, training_times = format_training_data_for_animation(training_data)
+animate_uarray(training_u_array, training_times, f'{dir_name}/training_data_sim')
 
 
 ########
@@ -136,11 +137,10 @@ param_history, train_loss_dict, val_loss_dict = model.fit(
     val_data=val_data,
     batch_size=batch_size,
     epochs=epochs,
-    early_stopping=3000,
+    early_stopping=5000,
     rel_save_thresh=rel_save_thresh,
     prune_thresh=prune_thresh,
-    warm_up=warm_up,
-    prune_freq=prune_freq)
+    warm_up=warm_up)
 
 generate_loss_curves(train_loss_dict, val_loss_dict, dir_name, 20, 'training_loss_curves')
 
@@ -175,6 +175,10 @@ F_mlp = F_mlp_unformatted.cpu().detach().numpy().reshape(501, 501)
 visualize_surface(dir_name, u_triangle_mesh, v_triangle_mesh,
                 F_true, F_mlp, 'f_mlp_surfaces')
 
+# Simulate uvmlp
+uvmlp_u_array, uvmlp_times = simulate_uvmlp(training_data, model)
+animate_uarray(uvmlp_u_array, uvmlp_times, f'{dir_name}/uvmlp_sim')
+
 # Simulate surface
-u_array, t_array = simulate_surface(training_data, model)
-animate_sim(u_array, t_array, f'{dir_name}/f_mlp_animation_training_data_ic')
+feql_u_array, feql_times = simulate_feql(training_data, model)
+animate_uarray(feql_u_array, feql_times, f'{dir_name}/feql_sim')
