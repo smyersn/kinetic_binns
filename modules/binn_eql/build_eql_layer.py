@@ -65,8 +65,10 @@ class HillFeatures(nn.Module):
         self.num_proteins = species
         
         # Raw Hill functions: one per protein.
-        self.hill_inc_raw = nn.ModuleList([HillFunction(param_bounds, increasing=True) for _ in range(species)])
-        self.hill_dec_raw = nn.ModuleList([HillFunction(param_bounds, increasing=False) for _ in range(species)])
+        self.hill_inc_raw = nn.ModuleList([HillFunction(param_bounds, increasing=True)
+                                           for _ in range(species)])
+        self.hill_dec_raw = nn.ModuleList([HillFunction(param_bounds, increasing=False)
+                                           for _ in range(species)])
         
         # Cross-term Hill functions: one for each pair (i,j) where i != j.
         self.hill_inc_cross = nn.ModuleDict()
@@ -74,8 +76,10 @@ class HillFeatures(nn.Module):
         for i in range(species):
             for j in range(species):
                 if i != j:
-                    self.hill_inc_cross[f"{i}_{j}"] = HillFunction(param_bounds, increasing=True)
-                    self.hill_dec_cross[f"{i}_{j}"] = HillFunction(param_bounds, increasing=False)
+                    self.hill_inc_cross[f"{i}_{j}"] = HillFunction(param_bounds, 
+                                                                   increasing=True)
+                    self.hill_dec_cross[f"{i}_{j}"] = HillFunction(param_bounds, 
+                                                                   increasing=False)
     
     def forward(self, x):
         # x has shape [batch, num_proteins]
@@ -109,7 +113,8 @@ class HillFeatures(nn.Module):
 class DuplicateHillFeatures(nn.Module):
     def __init__(self, species, param_bounds, duplicates):
         super(DuplicateHillFeatures, self).__init__()
-        self.hill_modules = nn.ModuleList([HillFeatures(species, param_bounds) for _ in range(duplicates)])
+        self.hill_modules = nn.ModuleList([HillFeatures(species, param_bounds)
+                                           for _ in range(duplicates)])
 
     def forward(self, x):
         # Compute features from each independently initialized HillFeatures module

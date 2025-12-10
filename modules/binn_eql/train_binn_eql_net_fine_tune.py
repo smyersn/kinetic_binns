@@ -15,7 +15,7 @@ from modules.analysis.generate_loss_curves import generate_loss_curves
 from modules.binn_eql.visualize_surface import visualize_surface
 from modules.loaders.sims_and_animations import (simulate_uvmlp, simulate_feql,
                                                  format_training_data_for_animation,
-                                                 animate_uarray)
+                                                 animate_uarray, animate_residuals)
 from modules.generate_data.simulate_system import wave_pinning
 
 # load params from configuration file
@@ -35,18 +35,15 @@ diff_coeffs = [float(x) for x in config['diff_coeffs'].strip("()").split()]
 # Symbolic Net params
 duplicates = int(config['duplicates'])
 degree = int(config['degree'])
-gls_weight=float(config['gls_weight'])
 pde_weight=float(config['pde_weight'])
-l05_weight = float(config['l05_weight'])
-param_bounds = float(config['param_bounds'])
-rel_save_thresh = float(config['rel_save_thresh'])
-prune_thresh = float(config['prune_thresh'])
+l0_weight = float(config['l0_weight'])
 warm_up = float(config['warm_up'])
+param_bounds = float(config['param_bounds'])
 
 dir_name = sys.argv[1]
 
 # Set training hyperparameters
-# epochs = 100
+# epochs = 10
 epochs = 100_000
 # rel_save_thresh = 0.01
 
@@ -112,11 +109,7 @@ binn = BINN(
     duplicates=duplicates,
     diff_coeffs=diff_coeffs,
     degree=degree,
-    gls_weight=gls_weight,
-    pde_weight=pde_weight,
-    l05_weight=l05_weight,
-    param_bounds=param_bounds,
-    warm_up=warm_up)
+    param_bounds=param_bounds)
 
 binn.to(device)
 
@@ -135,12 +128,12 @@ model = model_wrapper(
 param_history, train_loss_dict, val_loss_dict = model.fit(
     train_data=train_data,
     val_data=val_data,
+    pde_weight=pde_weight,
+    l0_weight=l0_weight,
+    warm_up=warm_up,
     batch_size=batch_size,
     epochs=epochs,
-    early_stopping=5000,
-    rel_save_thresh=rel_save_thresh,
-    prune_thresh=prune_thresh,
-    warm_up=warm_up)
+    early_stopping=5000)
 
 generate_loss_curves(train_loss_dict, val_loss_dict, dir_name, 20, 'training_loss_curves')
 
@@ -165,11 +158,22 @@ if not diff_coeffs:
 file.close()
 
 # Generate learned learned surface after initial training
+# Prepare Scaled Inputs (Physical -> Dimensionless)
 uv_nans_scaled = np.zeros_like(uv_nans)
-uv_nans_scaled[:, 0] = uv_nans[:, 0] / model.model.max_scale[0, 0].cpu().detach().numpy()
-uv_nans_scaled[:, 1] = uv_nans[:, 1] / model.model.max_scale[0, 1].cpu().detach().numpy()
-F_mlp_unformatted = model.model.reaction(torch.tensor(uv_nans_scaled).float().to(device))
-F_mlp = F_mlp_unformatted.cpu().detach().numpy().reshape(501, 501)
+s_u = model.model.max_scale[0, 0].cpu().detach().numpy()
+s_v = model.model.max_scale[0, 1].cpu().detach().numpy()
+uv_nans_scaled[:, 0] = uv_nans[:, 0] / s_u
+uv_nans_scaled[:, 1] = uv_nans[:, 1] / s_v
+
+# Predict (Dimensionless Output) then unscale
+input_tensor = torch.tensor(uv_nans_scaled).float().to(device)
+with torch.no_grad():
+    F_mlp_hat = model.model.reaction(input_tensor)
+F_mlp_hat_cpu = F_mlp_hat.cpu().detach().numpy()
+F_mlp_phys = F_mlp_hat_cpu * s_u
+
+# Scale and reshape for plotting
+F_mlp = F_mlp_phys.reshape(501, 501)
 
 # Visualize surfaces
 visualize_surface(dir_name, u_triangle_mesh, v_triangle_mesh,
@@ -178,7 +182,11 @@ visualize_surface(dir_name, u_triangle_mesh, v_triangle_mesh,
 # Simulate uvmlp
 uvmlp_u_array, uvmlp_times = simulate_uvmlp(training_data, model)
 animate_uarray(uvmlp_u_array, uvmlp_times, f'{dir_name}/uvmlp_sim')
+animate_residuals(uvmlp_u_array, training_u_array, uvmlp_times, 
+                  name=f'{dir_name}/uvmlp_residuals')
 
-# Simulate surface
+# Simulate feql
 feql_u_array, feql_times = simulate_feql(training_data, model)
 animate_uarray(feql_u_array, feql_times, f'{dir_name}/feql_sim')
+animate_residuals(feql_u_array, training_u_array, feql_times, 
+                  name=f'{dir_name}/feql_residuals')

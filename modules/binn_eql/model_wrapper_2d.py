@@ -86,6 +86,9 @@ class model_wrapper():
     def fit(self,
             train_data,
             val_data,
+            pde_weight,
+            l0_weight,
+            warm_up,
             batch_size=None,
             epochs=1,
             initial_epoch=0,
@@ -94,39 +97,78 @@ class model_wrapper():
             best_val_loss=None,
             lr_dec_epoch=None,
             lr_dec_prop=1.0,
-            rel_save_thresh=0.0,
-            prune_thresh=3,
-            warm_up=0):
+            rel_save_thresh=0.0):
                 
         # initialize book keeping
         start_time = time.time()
-        monitor_start = int(warm_up * 2)    # start monitoring after twice warmup
-        last_improved = monitor_start
         best_train_loss = 1e12 if best_train_loss is None else best_train_loss
         best_val_loss = 1e12 if best_val_loss is None else best_val_loss  
         
         # simple history container
         self.param_history = {'raw_w_unscaled': [], 'effective_unscaled': [],'epoch': []}
+        
+        phase_1_end = int(warm_up)
+        phase_2_end = int(warm_up * 1.5)
+        phase_3_end = int(warm_up * 2)
+        min_epochs_before_stop = int(warm_up * 3)
+        last_improved = min_epochs_before_stop
       
         # loop over epochs
         for epoch in range(initial_epoch, initial_epoch + epochs):
-            #           
-            # training step            
-            #
+            # -----------------------------
+            # 1. Determine Phase
+            # -----------------------------
+            if epoch < phase_1_end:
+                phase = 1
+            elif epoch < phase_2_end:
+                phase = 2
+            elif epoch < phase_3_end:
+                phase = 3
+            else:
+                phase = 4
+                
+            # Apply Freezing (Idempotent, safe to call every epoch)
+            self.set_training_phase(phase)
+            
+            # -----------------------------
+            # 2. Determine Weights
+            # -----------------------------
+            
+            # Phase 1: Data Only
+            if phase == 1:
+                pde_weight_eff = 0.0
+                l0_weight_eff = 0.0
+                
+            # Phase 2: Physics On, No Reg
+            elif phase == 2:
+                pde_weight_eff = pde_weight
+                l0_weight_eff = 0.0
+                
+            # Phase 3: Physics On, Ramp Reg
+            elif phase == 3:
+                pde_weight_eff = pde_weight
+                
+                # Calculate progress through Phase 3 (0.0 to 1.0)
+                phase_duration = phase_3_end - phase_2_end
+                progress = (epoch - phase_2_end) / phase_duration
+                l0_weight_eff = progress * l0_weight
+                
+            # Phase 4: Max Reg
+            elif phase == 4:
+                pde_weight_eff = pde_weight
+                l0_weight_eff = l0_weight
+
+            # -----------------------------
+            # 3. Train Step
+            # -----------------------------
             self.train = True
             self.val = False
                     
             self.model.train()
             epoch_start_time = time.time()
             
-            # # Prune equation every 100 epochs
-            # if epoch % 100 == 0 and epoch > 0:
-            #     self.model.prune()
-            #     # self.freeze_pruned_params()
-
             # Print equation every 1000 epochs                                                                        
             if epoch % 1000 == 0:
-            # if epoch % 50 == 0:
                 fn = f'{self.dir_name}/equation.txt'
                 file = open(fn, 'a')
                 
@@ -169,22 +211,17 @@ class model_wrapper():
                 y_pred = self.model(x_true)
                                     
                 # compute loss and optional regularization
-                train_loss, train_gls_loss, train_pde_loss, train_reg_loss = self.loss(y_pred, y_true, epoch)
+                train_loss, train_gls_loss, train_pde_loss, train_reg_loss = self.loss(y_pred, 
+                                                                                       y_true, 
+                                                                                       epoch,
+                                                                                       pde_weight_eff,
+                                                                                       l0_weight_eff)
                                                                             
                 # compute backward pass and update weights
                 train_loss.backward()
-                                                    
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)                       
                 self.optimizer.step()
-                
-                # Clamp parameters between bounds
-                with torch.no_grad():
-                    bound = self.model.param_bounds
-                    self.model.reaction.eql_layer.fc.weight.data.clamp_(
-                        -bound, bound)
-
-                    if not self.model.diff_coeffs:
-                        self.diffusion_fitter().clamp_(0, bound)
-                        
+                                        
                 # Update losses
                 train_losses += train_loss.item() * len(x_true)
                 train_gls_losses += train_gls_loss.item() * len(x_true)
@@ -212,9 +249,9 @@ class model_wrapper():
                     # self.freeze_pruned_params()
                     self.save(self.save_name+'_best_train')
 
-            #
-            # validation step
-            #                
+            # -----------------------------
+            # 3. Validation Step
+            # -----------------------------
             self.train = False
             self.val = True
             
@@ -246,7 +283,11 @@ class model_wrapper():
                 y_pred = self.model(x_true)
                 
                 # comptue loss
-                val_loss, val_gls_loss, val_pde_loss, val_reg_loss = self.loss(y_pred, y_true, epoch)
+                val_loss, val_gls_loss, val_pde_loss, val_reg_loss = self.loss(y_pred,
+                                                                               y_true,
+                                                                               epoch,
+                                                                               pde_weight_eff,
+                                                                               l0_weight_eff)
                 
                 val_losses += val_loss.item() * len(x_true)
                 val_gls_losses += val_gls_loss.item() * len(x_true)
@@ -263,7 +304,7 @@ class model_wrapper():
             rel_diff = (best_val_loss - self.val_loss_dict['loss'][-1])
             rel_diff /= best_val_loss
             
-            if epoch >= monitor_start:
+            if epoch >= min_epochs_before_stop:
                 if rel_diff > rel_save_thresh:
                     
                     # update best validation loss
@@ -298,10 +339,12 @@ class model_wrapper():
                 
             # optional early stopping
             if early_stopping is not None:
-                # if epoch - last_improved >= early_stopping and epoch > 50000:
-                if epoch - last_improved >= early_stopping:
-                    break
-                    
+                # Logic: Only check stopping if we have passed the minimum epoch threshold
+                if epoch > min_epochs_before_stop:
+                    if epoch - last_improved >= early_stopping:
+                        print(f"Early stopping triggered at epoch {epoch}")
+                        break
+                            
             # optional learning rate annealing
             if lr_dec_epoch is not None:
                 if np.mod(epoch, lr_dec_epoch) == 0 and epoch != 0:
@@ -351,6 +394,38 @@ class model_wrapper():
                             state['exp_avg'].mul_(mask)
                         if 'exp_avg_sq' in state:
                             state['exp_avg_sq'].mul_(mask)
+                                     
+    def set_training_phase(self, phase):
+        # Phase 1: Surface Fitting Only
+        if phase == 1:
+            # Unfreeze Surface
+            for p in self.model.surface_fitter.parameters(): p.requires_grad = True
+            
+            # Freeze Physics (Reaction + Diffusion)
+            for p in self.model.reaction.parameters(): p.requires_grad = False
+            if self.model.diffusion_fitter:
+                for p in self.model.diffusion_fitter.parameters(): p.requires_grad = False
+                
+        # Phase 2 & 3: Equation Discovery & Pruning (Surface Frozen)
+        # We keep the surface frozen so the equation learns against a "stable target"
+        elif phase == 2 or phase == 3:
+            # Freeze Surface (CRITICAL)
+            for p in self.model.surface_fitter.parameters(): p.requires_grad = False
+            
+            # Unfreeze Physics
+            for p in self.model.reaction.parameters(): p.requires_grad = True
+            if self.model.diffusion_fitter:
+                for p in self.model.diffusion_fitter.parameters(): p.requires_grad = True
+                
+        # Phase 4: Joint Fine-Tuning
+        # The equation is mostly found. Now we let the surface adjust slightly
+        # to the physics, and the physics adjust slightly to the surface.
+        elif phase == 4:
+            # Unfreeze Everything
+            for p in self.model.surface_fitter.parameters(): p.requires_grad = True
+            for p in self.model.reaction.parameters(): p.requires_grad = True
+            if self.model.diffusion_fitter:
+                for p in self.model.diffusion_fitter.parameters(): p.requires_grad = True
 
     def predict(self, inputs):
         

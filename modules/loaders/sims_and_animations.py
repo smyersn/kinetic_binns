@@ -30,8 +30,18 @@ def simulate_uvmlp(training_data, model):
         input_tensor = torch.cat([spatial_coords, t_column], dim=1).to(device)
 
         # Calculate surface
-        with torch.no_grad():
-            uv = model.model(input_tensor).view(len(points), len(points), 2)
+        with torch.no_grad():           
+            # 1. NORMALIZE INPUTS (Using BINN helper)
+            input_norm = model.model.scale_inputs(input_tensor)
+            
+            # 2. PREDICT (Returns Dimensionless [0, 1])
+            uv_hat = model.model.surface_fitter(input_norm)
+            
+            # 3. UNSCALE OUTPUT (To Physical)
+            uv_phys = uv_hat * model.model.max_scale
+            
+            # Reshape for storage
+            uv = uv_phys.view(len(points), len(points), 2)
             
         u_array[n] = uv
 
@@ -141,9 +151,7 @@ def simulate_feql(training_data, model):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     xt = training_data[:, :dimensions+1]
-    times = torch.unique(xt[:, dimensions])
-    
-    # Fix: Ensure points is an int for reshaping
+    times = torch.unique(xt[:, dimensions])   
     points_raw = torch.unique(xt[:, 0])
     points_len = len(points_raw)
     
@@ -166,6 +174,9 @@ def simulate_feql(training_data, model):
     dt = 0.0001
     nits = int(T / dt)
     
+    # Get Scales from Model (Buffers)
+    u_scale = model.model.max_scale # Shape [1, 2]
+    
     # Get diffusion coefficients
     if model.model.diff_coeffs:
         du, dv = model.model.diff_coeffs
@@ -177,7 +188,6 @@ def simulate_feql(training_data, model):
     D_tensor = torch.tensor([du, dv], device=device).view(1, 2, 1, 1)
 
     # --- Laplacian kernel (Grouped Conv2d) ---
-    # OPTIMIZATION 2: Grouped Convolution (2 separate channels, same kernel)
     laplace_kernel = torch.tensor([[0, 1, 0],
                                    [1, -4, 1],
                                    [0, 1, 0]], dtype=torch.float32, device=device)
@@ -209,29 +219,37 @@ def simulate_feql(training_data, model):
     # This fuses the physics operations into fewer kernels
     @torch.compile 
     def physics_step(current_state):
-        # 1. Diffusion
+        # 1. Diffusion (Physical Units)
+        # current_state is Physical. laplace kernel is unitless. dx is Physical.
+        # So lap_uv is Physical concentration / length^2.
         lap_uv = conv(current_state) / (dx**2)
         
         # 2. Reaction 
         state_permuted = current_state.permute(0, 2, 3, 1).contiguous()
-        uv_flat = state_permuted.view(-1, 2)
+        uv_flat_phys = state_permuted.view(-1, 2) # Physical Units
         
-        # Run Reaction Network
-        r_flat = reaction(uv_flat) 
+        # --- SCALING FIX START ---
+        # A. Normalize Input: Physical -> [0, 1]
+        uv_flat_norm = uv_flat_phys / u_scale
         
-        # Reshape R back to grid: (1, 1, H, W)
-        r_grid = r_flat.view(1, 1, nx, ny) 
+        # B. Run Network: [0, 1] -> Dimensionless Rate
+        r_flat_hat = reaction(uv_flat_norm) 
         
-        # 3. Construct Reaction Update: [ +R, -R ]
-        # This adds R to u (channel 0) and subtracts R from v (channel 1)
+        # C. Scale Output: Dimensionless Rate -> Physical Rate
+        # Recall: F_phys = F_hat * s_u_max
+        r_flat_phys = r_flat_hat * u_scale[0, 0] 
+        # --- SCALING FIX END ---
+        
+        # Reshape R back to grid
+        r_grid = r_flat_phys.view(1, 1, nx, ny) 
+        
+        # 3. Construct Reaction Update
         reaction_term = torch.cat([r_grid, -r_grid], dim=1) 
         
-        # Euler Step
+        # Euler Step (All Physical)
         new_state = current_state + dt * (D_tensor * lap_uv + reaction_term)
-        # print(f'current state: {current_state.shape}, uv_flat: {uv_flat.shape}, r_flat: {r_flat.shape}, r_grid: {r_grid.shape}, reaction_term: {reaction_term.shape}, new_state: {new_state.shape}')
-        # print(reaction_term[0, :, 0, 0])
-        return new_state      
-    
+        return new_state
+        
     # --- Progress Tracking Variables ---
     print_interval = nits // 10  # 10%
     last_time = time.time()
@@ -337,4 +355,72 @@ def animate_uarray(u_array, times, name=None, titles=("u", "v")):
         writergif = animation.PillowWriter(fps=10)
         anim.save(f'{name}.gif', writer=writergif)
 
+    return anim
+
+def animate_residuals(pred_array, true_array, times, name=None, 
+                      titles=("Pred u - True u", "Pred v - True v")):
+    """
+    Plots the difference (Pred - True) side-by-side for u and v.
+    Assumes inputs are (Time, Height, Width, 2).
+    Red: Model > Truth (Overestimation).
+    Blue: Model < Truth (Underestimation).
+    """
+    # 1. Shape Handling: Ensure (Time, Height, Width, Channel)
+    # Check if inputs are PyTorch Tensors (CPU or GPU) and convert
+    if hasattr(pred_array, 'detach'): 
+        pred_array = pred_array.detach().cpu().numpy()
+    
+    if hasattr(true_array, 'detach'): 
+        true_array = true_array.detach().cpu().numpy()
+
+    if pred_array.ndim == 4 and pred_array.shape[1] == 2: 
+        pred_array = np.transpose(pred_array, (0, 2, 3, 1))
+        
+    if true_array.ndim == 4 and true_array.shape[1] == 2:
+        true_array = np.transpose(true_array, (0, 2, 3, 1))
+        
+    # 2. Compute Residuals (Predicted - Ground Truth)
+    residuals = pred_array - true_array
+    
+    # 3. Determine Scale (Symmetric for diverging colormap)
+    # We define the range as [-max_error, +max_error] so 0 is always white/centered
+    # Use slicing [..., 0] for u channel and [..., 1] for v channel
+    max_err_u = np.max(np.abs(residuals[..., 0]))
+    max_err_v = np.max(np.abs(residuals[..., 1]))
+    
+    # Avoid div by zero if perfect match
+    max_err_u = max(max_err_u, 1e-6)
+    max_err_v = max(max_err_v, 1e-6)
+
+    # 4. Setup Figure
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    
+    # Plot 1: Residual U (Channel 0)
+    im1 = axes[0].imshow(residuals[0, :, :, 0], cmap='seismic', vmin=-max_err_u, vmax=max_err_u)
+    axes[0].set_title(f"{titles[0]}\n(Range: +/- {max_err_u:.3f})")
+    fig.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
+
+    # Plot 2: Residual V (Channel 1)
+    im2 = axes[1].imshow(residuals[0, :, :, 1], cmap='seismic', vmin=-max_err_v, vmax=max_err_v)
+    axes[1].set_title(f"{titles[1]}\n(Range: +/- {max_err_v:.3f})")
+    fig.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04)
+
+    # Shared Main Title
+    main_title = fig.suptitle(f'T = {times[0]:.2f}', fontsize=16)
+
+    # 5. Define Update Function
+    def animate(frame):
+        im1.set_array(residuals[frame, :, :, 0])
+        im2.set_array(residuals[frame, :, :, 1])
+        main_title.set_text(f'Residuals at T = {times[frame]:.2f}')
+        return im1, im2, main_title
+
+    # 6. Create Animation
+    anim = animation.FuncAnimation(fig, animate, frames=len(times), interval=200)
+    
+    # Save if name provided
+    if name:
+        writergif = animation.PillowWriter(fps=10)
+        anim.save(f'{name}.gif', writer=writergif)
+        
     return anim
