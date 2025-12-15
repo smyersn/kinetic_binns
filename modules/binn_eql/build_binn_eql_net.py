@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
+import torch.nn.utils as utils
 
 from modules.binn.build_mlp import build_mlp
 from modules.utils.gradient import gradient
@@ -26,14 +26,28 @@ class uv_MLP(nn.Module):
     # def __init__(self, input_features, layers=[512, 512, 512, 512, 2], fourier_scale=10):
         super().__init__()
                
-        # MLP
+        # # MLP
+        # self.mlp = build_mlp(
+        #     input_features=input_features, 
+        #     layers=layers,
+        #     activation=nn.Tanh(),
+        #     linear_output=False,
+        #     output_activation=nn.Softplus()) # Softplus ensures u,v > 0
+
+        # 1. Pass GELU directly (build_mlp accepts an activation arg)
         self.mlp = build_mlp(
             input_features=input_features, 
             layers=layers,
-            activation=nn.Tanh(),
+            activation=nn.GELU(),          # <--- Change 1: GELU
             linear_output=False,
-            output_activation=nn.Softplus()) # Softplus ensures u,v > 0
+            output_activation=nn.Softplus())
 
+        # 2. Apply Weight Norm "Post-Hoc"
+        # We iterate through the network we just built and wrap every Linear layer
+        for module in self.mlp.MLP:
+            if isinstance(module, nn.Linear):
+                utils.weight_norm(module)  # <--- Change 2: Weight Norm
+                
     def forward(self, inputs):
         # inputs are [-1, 1]
         return self.mlp(inputs) # Outputs [0, 1] roughly (scaled space)
@@ -83,10 +97,8 @@ class BINN(nn.Module):
                 
         # Concentration Scales (Physical -> Dimensionless)
         ## We use 99th percentile to be robust against outliers
-        # s_u_max = torch.quantile(train_data[:, -2].abs(), 0.99)
-        # s_v_max = torch.quantile(train_data[:, -1].abs(), 0.99)
-        s_u_max = torch.max(train_data[:, -2].abs())
-        s_v_max = torch.max(train_data[:, -1].abs())
+        s_u_max = torch.quantile(train_data[:, -2].abs(), 0.99)
+        s_v_max = torch.quantile(train_data[:, -1].abs(), 0.99)
         # Shape [1, species]
         self.register_buffer('max_scale', torch.tensor([s_u_max, s_v_max]).view(1, -1))
         
@@ -118,137 +130,66 @@ class BINN(nn.Module):
         self.num_samples = 10000
         self.name = 'Dumlp_Dvmlp_Fmlp'
 
-    # -----------------------
-    # Normalization Helpers
-    # -----------------------
-    def scale_inputs(self, inputs):
+    def normalize(self, inputs):
         """ Maps Physical [lb, ub] -> Dimensionless [-1, 1] """
         return 2.0 * (inputs - self.lb) / (self.ub - self.lb) - 1.0
 
     def forward(self, inputs):
         """ Returns PREDICTED u (Scaled [0,1]) from Physical Inputs """       
         # 1. Normalize Inputs
-        inputs_hat = self.scale_inputs(inputs)
+        inputs_hat = self.normalize(inputs)
         
         # 2. Predict Surface (Dimensionless)
         return self.surface_fitter(inputs_hat)
 
-    def get_physical_derivatives(self, inputs_hat, u_hat):
-        """ 
-        Calculates du/dt and d2u/dx2 in PHYSICAL units 
-        using the Chain Rule on the scaled variables.
-        """
-        # 1. Compute gradients in SCALED space (d_u_hat / d_x_hat)
-        grads = torch.autograd.grad(
-            u_hat, inputs_hat, 
-            grad_outputs=torch.ones_like(u_hat), 
-            create_graph=True
-        )[0]
-        
-        dudx_hat = grads[:, :-1] # Spatial dims
-        dudt_hat = grads[:, -1:] # Time dim
-        
-        # 2. Compute Second Derivative (d2_u_hat / d_x_hat2)
-        # We assume 1D or 2D space. 
-        d2udx2_hat_list = []
-        for i in range(self.dimensions):
-             g2 = torch.autograd.grad(
-                dudx_hat[:, i], inputs_hat,
-                grad_outputs=torch.ones_like(dudx_hat[:, i]),
-                create_graph=True
-             )[0][:, i]
-             d2udx2_hat_list.append(g2)
-        d2udx2_hat = torch.stack(d2udx2_hat_list, dim=1)
-
-        # 3. Chain Rule Factors
-        dt_factor = (2.0 / self.t_range)
-        dx_factor = (2.0 / self.x_range)
-        
-        # 4. Convert to Physical Units
-        # u_t_phys = (d_uhat/d_that) * (max_scale) * (d_that/dt)
-        u_t_phys = dudt_hat * self.max_scale * dt_factor
-        
-        # u_xx_phys = (d2_uhat/d_xhat2) * (max_scale) * (d_xhat/dx)^2
-        u_xx_phys = d2udx2_hat.unsqueeze(2) * self.max_scale.unsqueeze(1) * (dx_factor ** 2)
-        
-        # Return shapes: u_t [N, Species], u_xx [N, Dims, Species]
-        # Reshape u_xx for compatibility with laplacian sum later
-        u_xx_phys = u_xx_phys.permute(0, 2, 1) # [N, Species, Dims]
-        
-        return u_t_phys, u_xx_phys
-
     # -----------------------
     # Loss Functions
     # -----------------------
-    # def gls_loss(self, pred, true):
-    #     # pred is Dimensionless [0, 1], true is physical       
-    #     # Convert pred to physical for loss calculation (or scale true down)
-    #     # Scaling true down is numerically more stable for GLS denominator
-    #     true_scaled = true / self.mean_scale
-    #     pred_phys = pred * self.max_scale
-    #     pred_scaled = pred_phys / self.mean_scale
-        
-    #     residual = (pred_scaled - true_scaled)**2
-    #     return torch.mean(residual)
-
     def gls_loss(self, pred, true):
-            # 1. Scale True Data (Physical -> Dimensionless)
-            true_norm = true / self.max_scale
-            
-            # 2. Calculate Squared Residuals
-            # pred is already [0,1], true_norm is [0,1]
-            residuals = (pred - true_norm)**2
-            
-            # 3. Hard Example Mining (Top 10%)
-            # We flatten the batch and spatial dims to find the worst individual points
-            res_flat = residuals.view(-1)
-            
-            # Calculate number of hard examples (e.g., 10% of total pixels)
-            num_hard = int(0.10 * res_flat.numel())
-            
-            # Select the top k largest errors
-            # This automatically finds the wave front edges and peak errors
-            top_k_loss, _ = torch.topk(res_flat, num_hard)
-            
-            # 4. Standard MSE (for stability) + Hard Loss (for sharpness)
-            # We combine them so the network doesn't completely ignore the easy parts
-            total_loss = torch.mean(residuals) + 4.0 * torch.mean(top_k_loss)
-            
-            return total_loss
+        residual = ((pred - true) / self.mean_scale)**2
+        return torch.mean(residual)
     
-    def pde_loss(self, inputs, epoch):
-        # 1. Prepare Scaled Inputs (Requires Grad for PDE)
-        inputs_hat = self.scale_inputs(inputs).requires_grad_(True)
-        
-        # 2. Re-Run Forward Pass (Tracked Graph)
-        u_hat_tracked = self.surface_fitter(inputs_hat)
-        
-        # 3. Calculate Physical Derivatives
-        # u_t: [N, Species], u_xx: [N, Species, Dims]
-        u_t_phys, u_xx_phys = self.get_physical_derivatives(inputs_hat, u_hat_tracked)
-        
-        # 4. Calculate Reaction (Scaled -> Scaled)
-        F_hat = self.reaction(u_hat_tracked)
-        
-        # 5. Scale Reaction to Physical Units (Output Scaling to u_max)
-        F_phys = F_hat * self.max_scale[0, 0]
+    def pde_loss(self, inputs, outputs, epoch):
+        # unpack outputs
+        u = outputs.clone()
+        u_scaled = u / self.max_scale
 
-        # 6. Laplacian (Physical)
-        lap_u_phys = torch.sum(u_xx_phys, dim=2) # Sum over dims -> [N, Species]
+        # create arrays to store partial derivatives
+        points = len(inputs)
+        uxx_array = torch.zeros((self.species, points, self.dimensions)).to(inputs.device)
+        ut_array = torch.zeros((points, self.species)).to(inputs.device)
 
-        # 7. Diffusion (Physical)
+        # partial derivative computations
+        for i in range(self.species):
+            d1 = gradient(u[:, i], inputs, order=1)
+            ut = d1[:, -1]
+            ut_array[:, i] = ut
+
+            for j in range(self.dimensions):
+                d2 = gradient(d1[:, j], inputs, order=1)
+                uxx = d2[:, j]
+                uxx_array[i, :, j] = uxx
+                                        
+        # reaction
+        F = self.reaction(u_scaled)
+        
+        # diffusion
         if self.diff_coeffs:
-             D = torch.tensor(self.diff_coeffs).to(inputs.device)
+            Du, Dv = torch.tensor(self.diff_coeffs[0]), torch.tensor(self.diff_coeffs[1])
+            
         else:
-             D = self.diffusion_fitter() 
-        
-        # 8. Residual (u and v specific)
-        # u_t - (D*lap + F)        
-        # Equation: u_t = Du * lap_u + F
-        res_u = u_t_phys[:, 0:1] - (D[0] * lap_u_phys[:, 0:1] + F_phys)
-        
-        # Equation: v_t = Dv * lap_v - F
-        res_v = u_t_phys[:, 1:2] - (D[1] * lap_u_phys[:, 1:2] - F_phys)
+            D = self.diffusion_fitter()
+            Du, Dv = D[0], D[1]
+                    
+        lap_u = Du * torch.sum(uxx_array[0, :, :], dim=1, keepdim=True)
+        lap_v = Dv * torch.sum(uxx_array[1, :, :], dim=1, keepdim=True)
+                    
+        # Reaction-diffusion equation       
+        LHS_u = ut_array[:, 0][:,None]
+        RHS_u = lap_u + F
+        LHS_v = ut_array[:, 1][:,None]
+        RHS_v = lap_v - F
+        pde_loss = (LHS_u - RHS_u)**2 + (LHS_v - RHS_v)**2
         
         # if epoch % 1000 == 0:
         #     print(f'PDE LOSS START:')
@@ -261,7 +202,7 @@ class BINN(nn.Module):
         #     print(f'loss: {pde_loss[:20]}')
         #     print(f'pde loss: {torch.mean(pde_loss)}\n')
 
-        return torch.mean(res_u**2 + res_v**2)
+        return torch.mean(pde_loss)
                     
     def reg_loss(self, epoch):
         # # 1. Get probabilities
@@ -308,10 +249,13 @@ class BINN(nn.Module):
         # PDE Sampling
         x = torch.empty(self.num_samples, self.dimensions, device=pred.device).uniform_(self.lb[0,0], self.ub[0,0])
         t = torch.empty(self.num_samples, 1, device=pred.device).uniform_(self.lb[0,-1], self.ub[0,-1])
-        inputs_rand = torch.cat([x, t], dim=1)
+        inputs_rand = torch.cat([x, t], dim=1).requires_grad_()
+        inputs_rand_norm = self.normalize(inputs_rand)
+        outputs_rand = self.surface_fitter(inputs_rand_norm)
         
         # PDE Loss
-        self.pde_loss_val = pde_weight * self.pde_loss(inputs_rand, epoch)
+        self.pde_loss_val = pde_weight * self.pde_loss(inputs_rand, outputs_rand,
+                                                       epoch)
               
         # Reg Loss            
         l0_loss = self.reg_loss(epoch)
@@ -357,13 +301,14 @@ class BINN(nn.Module):
     def extract_params(self, full=True):
         """
         Return a dict of parameter arrays on CPU (numpy) that are safe to log/plot.
-        Handles the conversion from Dimensionless Network Weights -> Physical Constants.
+
+        If full is False returns only:
+            {'raw_w_unscaled', 'gates', 'effective'}
+
+        If full is True returns many more keys (see docstring in code).
         """
         eql = self.reaction.eql_layer
 
-        # ---------------------------------------------------------
-        # 1. GET RAW NETWORK WEIGHTS (SCALED SPACE)
-        # ---------------------------------------------------------
         # raw linear weights (1 x M) as tensor on device
         raw_w_t = eql.fc.weight[0].detach()
 
@@ -387,9 +332,7 @@ class BINN(nn.Module):
         gates = gates_t.cpu().numpy().reshape(-1)
         effective = effective_t.cpu().numpy().reshape(-1)
 
-        # ---------------------------------------------------------
-        # 2. GATHER HILL PARAMETERS (n, K)
-        # ---------------------------------------------------------
+        # gather feature structure
         num_poly = int(eql.num_poly_features)
         num_hill = int(eql.num_hill_features)
         poly_terms, hill_terms = self.generate_terms()  # lists for single duplicate
@@ -403,7 +346,6 @@ class BINN(nn.Module):
         raw_Ks_dec_list = []
 
         for hill_module in eql.hill.hill_modules:
-            # Increasing Terms
             for hf in hill_module.hill_inc_raw:
                 raw_ns_inc_list.append(hf.raw_n.view(-1))
                 raw_Ks_inc_list.append(hf.raw_logK.view(-1))
@@ -412,7 +354,6 @@ class BINN(nn.Module):
                 raw_ns_inc_list.append(hf.raw_n.view(-1))
                 raw_Ks_inc_list.append(hf.raw_logK.view(-1))
 
-            # Decreasing Terms
             for hf in hill_module.hill_dec_raw:
                 raw_ns_dec_list.append(hf.raw_n.view(-1))
                 raw_Ks_dec_list.append(hf.raw_logK.view(-1))
@@ -421,7 +362,7 @@ class BINN(nn.Module):
                 raw_ns_dec_list.append(hf.raw_n.view(-1))
                 raw_Ks_dec_list.append(hf.raw_logK.view(-1))
 
-        # Helper to stack
+        # stack (if empty, create empty numpy arrays)
         def _stack_to_numpy(lst):
             if len(lst) == 0:
                 return np.array([])
@@ -433,56 +374,66 @@ class BINN(nn.Module):
         raw_ns_dec = _stack_to_numpy(raw_ns_dec_list)
         raw_Ks_dec = _stack_to_numpy(raw_Ks_dec_list)
 
-        # Map raw parameters to numbers (Sigmoid/Exp as defined in HillFunction)
-        # Note: Must match the math in your HillFunction class exactly!
-        ns_inc = (1 / (1 + np.exp(-raw_ns_inc))) * 3 + 1
-        ns_dec = (1 / (1 + np.exp(-raw_ns_dec))) * 3 + 1
-        Ks_inc = np.exp(raw_Ks_inc)
-        Ks_dec = np.exp(raw_Ks_dec)
+        # map raw to interpretable numeric params (numpy)
+        if raw_ns_inc.size:
+            # ns_inc = (1.0 / (1.0 + np.exp(-raw_ns_inc))) * 5.0
+            ns_inc = (1 / (1 + np.exp(-raw_ns_inc))) * 3 + 1
+        else:
+            ns_inc = np.array([])
+        if raw_ns_dec.size:
+            # ns_dec = (1.0 / (1.0 + np.exp(-raw_ns_dec))) * 5.0
+            ns_dec = (1 / (1 + np.exp(-raw_ns_dec))) * 3 + 1
+        else:
+            ns_dec = np.array([])
 
-        # Diffusion (if present)
+        if raw_Ks_inc.size:
+            # Ks_inc = (1.0 / (1.0 + np.exp(-raw_Ks_inc))) * float(self.param_bounds)
+            Ks_inc = np.exp(raw_Ks_inc)
+        else:
+            Ks_inc = np.array([])
+        if raw_Ks_dec.size:
+            # Ks_dec = (1.0 / (1.0 + np.exp(-raw_Ks_dec))) * float(self.param_bounds)
+            Ks_dec = np.exp(raw_Ks_dec)
+        else:
+            Ks_dec = np.array([])
+
+        # diffusion (if present) - try to get in one shot
         D_vals = None
         if hasattr(self, 'diffusion_fitter') and self.diffusion_fitter is not None:
             try:
                 with torch.no_grad():
                     D_vals = self.diffusion_fitter().detach().cpu().numpy()
             except Exception:
-                D_vals = None
+                try:
+                    rawD = self.diffusion_fitter.raw.detach().cpu().numpy()
+                    s = 1.0 / (1.0 + np.exp(-rawD))
+                    D_vals = s * float(self.param_bounds)
+                except Exception:
+                    D_vals = None
 
-        # ---------------------------------------------------------
-        # 3. UNSCALING LOGIC (DIMENSIONLESS -> PHYSICAL)
-        # ---------------------------------------------------------
-        # 1. Get Input Scales
-        s_u, s_v = self.max_scale[0, 0].item(), self.max_scale[0, 1].item()
+        # ------- Build unscaled coefficients (original units) -------
+        # We assume EQL was trained on scaled inputs using self.u_scale_pct / self.v_scale_pct.
+        s_u, s_v = self.max_scale[0, 0], self.max_scale[0, 1]
         
-        # 2. Get Output Scale
-        # Assuming single output F for species u. 
-        # If your EQL outputs a vector [F_u, F_v], you need to select s_u or s_v accordingly.
-        # Here we assume standard reaction-diffusion where F is the rate for u.
-        s_out = s_u 
-
-        # --- A. POLYNOMIALS ---
+        # POLYNOMIALS: first num_poly entries correspond to poly_terms * duplicates ordering
         poly_coeffs_scaled = effective[:num_poly] if num_poly > 0 else np.array([])
         poly_coeffs_unscaled = []
         for term_tuple, coeff_scaled in zip(poly_terms * dup, poly_coeffs_scaled):
-            # Count powers
+            # count powers of u (index 0) and v (index 1)
             p = sum(1 for ind in term_tuple if ind == 0)
             q = sum(1 for ind in term_tuple if ind == 1)
-            
-            # Math: W_phys = W_net * S_out / (S_u^p * S_v^q)
-            input_scale = (s_u ** p) * (s_v ** q)
-            a_orig = (coeff_scaled * s_out) / (input_scale + 1e-9)
-            
-            poly_coeffs_unscaled.append(a_orig)
+            a_orig = coeff_scaled / ((s_u ** p) * (s_v ** q) + 0.0)
+            poly_coeffs_unscaled.append(a_orig.cpu().detach())
         poly_coeffs_unscaled = np.array(poly_coeffs_unscaled)
 
-        # --- B. PREPARE HILL BLOCKS ---
+        # HILLS: extract hill block and split into inc/dec in duplicate-major order
         hill_block = effective[num_poly : num_poly + num_hill] if num_hill > 0 else np.array([])
         if hill_block.size:
-            # Try to reshape if strict structure exists
+            # shape (dup, 2 * n_hill_single)
             try:
                 hb = hill_block.reshape(dup, 2 * n_hill_single)
             except Exception:
+                # fall back: if shapes don't match, flatten to inc/dec halves conservatively
                 hb = hill_block.reshape(dup, -1)
             hill_inc_all = hb[:, :n_hill_single].reshape(-1) if n_hill_single > 0 else np.array([])
             hill_dec_all = hb[:, n_hill_single:].reshape(-1) if n_hill_single > 0 else np.array([])
@@ -490,16 +441,12 @@ class BINN(nn.Module):
             hill_inc_all = np.array([])
             hill_dec_all = np.array([])
 
-        # --- C. INCREASING HILL TERMS ---
-        # Form: Amp * (u^n) / (1 + K*u^n)
+        # Unscale hill coefficients using learned n and s_u/s_v
         hill_inc_unscaled = []
-        Ks_inc_unscaled = []
-        
+        # Ks_inc, ns_inc arrays are in duplicate-major order already (from stacking)
         for (term_tuple, coeff_scaled, K_scaled, n_val) in zip(hill_terms * dup, hill_inc_all, Ks_inc, ns_inc):
             n_f = float(n_val)
-            reg_species = term_tuple[0] # Species inside the Hill function
-            
-            # Check for Multiplier (e.g. v * Hill(u))
+            reg_species = term_tuple[0]
             multiplier_power = 1 if len(term_tuple) > 1 else 0
             mult_species = term_tuple[1] if multiplier_power else None
 
@@ -508,25 +455,12 @@ class BINN(nn.Module):
             if multiplier_power:
                 s_mult = s_u if mult_species == 0 else s_v
 
-            # 1. Unscale Amplitude
-            # Amp_phys = Amp_net * S_out / (S_reg^n * S_mult)
-            b_orig = (coeff_scaled * s_out) / ((s_reg ** n_f) * (s_mult ** multiplier_power) + 1e-9)
+            b_orig = coeff_scaled / ((s_reg ** n_f) * (s_mult ** multiplier_power) + 0.0)
+            # K unscaling will be handled separately in Ks_inc_unscaled
             hill_inc_unscaled.append(float(b_orig))
-            
-            # 2. Unscale K
-            # K_phys = K_net / (S_reg^n)
-            # Because net term is 1 + K_net*(u/S)^n = 1 + (K_net/S^n)*u^n
-            K_orig = float(K_scaled / (s_reg ** n_f + 1e-9))
-            Ks_inc_unscaled.append(K_orig)
-            
         hill_inc_unscaled = np.array(hill_inc_unscaled)
-        Ks_inc_unscaled = np.array(Ks_inc_unscaled)
 
-        # --- D. DECREASING HILL TERMS ---
-        # Form: Amp * [ (1/K) - u^n/(1 + K*u^n) ]
         hill_dec_unscaled = []
-        Ks_dec_unscaled = []
-        
         for (term_tuple, coeff_scaled, K_scaled, n_val) in zip(hill_terms * dup, hill_dec_all, Ks_dec, ns_dec):
             n_f = float(n_val)
             reg_species = term_tuple[0]
@@ -538,40 +472,53 @@ class BINN(nn.Module):
             if multiplier_power:
                 s_mult = s_u if mult_species == 0 else s_v
 
-            # 1. Unscale Amplitude
-            # Same logic as increasing
-            b_orig = (coeff_scaled * s_out) / ((s_reg ** n_f) * (s_mult ** multiplier_power) + 1e-9)
+            b_orig = coeff_scaled / ((s_reg ** n_f) * (s_mult ** multiplier_power) + 0.0)
             hill_dec_unscaled.append(float(b_orig))
-            
-            # 2. Unscale K
-            K_orig = float(K_scaled / (s_reg ** n_f + 1e-9))
-            Ks_dec_unscaled.append(K_orig)
-            
         hill_dec_unscaled = np.array(hill_dec_unscaled)
+
+        # Ks unscaled: K_orig = K_scaled / (s_reg ** n)
+        Ks_inc_unscaled = []
+        for (term_tuple, K_scaled, n_val) in zip(hill_terms * dup, Ks_inc, ns_inc):
+            n_f = float(n_val)
+            reg_species = term_tuple[0]
+            s_reg = s_u if reg_species == 0 else s_v
+            K_orig = float(K_scaled / (s_reg ** n_f + 0.0))
+            Ks_inc_unscaled.append(K_orig)
+        Ks_inc_unscaled = np.array(Ks_inc_unscaled)
+
+        Ks_dec_unscaled = []
+        for (term_tuple, K_scaled, n_val) in zip(hill_terms * dup, Ks_dec, ns_dec):
+            n_f = float(n_val)
+            reg_species = term_tuple[0]
+            s_reg = s_u if reg_species == 0 else s_v
+            K_orig = float(K_scaled / (s_reg ** n_f + 0.0))
+            Ks_dec_unscaled.append(K_orig)
         Ks_dec_unscaled = np.array(Ks_dec_unscaled)
 
-        # --- E. RECONSTRUCT RAW WEIGHTS VECTOR ---
-        # This is for visualization/logging consistency
+        # Build raw_w_unscaled: same length as effective. For poly entries use poly_coeffs_unscaled,
+        # for hill entries use concatenation of inc then dec arrays
         raw_w_unscaled_list = []
+        # poly part
         if poly_coeffs_unscaled.size:
             raw_w_unscaled_list.extend(poly_coeffs_unscaled.tolist())
+        # hill part: concatenate inc then dec in the same ordering as effective's hill block
         if hill_inc_all.size:
-            # Must maintain network order: Inc block then Dec block (per duplicate)
+            # hill_block order was dup rows [inc_block | dec_block], flattened to dup*n_hill_single ordering.
+            # hill_inc_unscaled and hill_dec_unscaled are already in exactly that duplicate-major ordering.
             raw_w_unscaled_list.extend(hill_inc_unscaled.tolist())
             raw_w_unscaled_list.extend(hill_dec_unscaled.tolist())
 
         raw_w_unscaled = np.array(raw_w_unscaled_list) if len(raw_w_unscaled_list) else np.array([])
         effective_unscaled = (raw_w_unscaled * gates)
         
-        # -----------------------
-        # RETURN
-        # -----------------------
+        # Non-full (quick) return: minimal keys requested
         if not full:
             return {
                 'raw_w_unscaled': raw_w_unscaled,
                 'effective_unscaled': effective_unscaled
             }
 
+        # Full return (everything)
         return {
             'raw_w': raw_w,
             'raw_w_unscaled': raw_w_unscaled,

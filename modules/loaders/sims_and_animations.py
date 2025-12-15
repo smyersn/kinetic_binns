@@ -30,18 +30,8 @@ def simulate_uvmlp(training_data, model):
         input_tensor = torch.cat([spatial_coords, t_column], dim=1).to(device)
 
         # Calculate surface
-        with torch.no_grad():           
-            # 1. NORMALIZE INPUTS (Using BINN helper)
-            input_norm = model.model.scale_inputs(input_tensor)
-            
-            # 2. PREDICT (Returns Dimensionless [0, 1])
-            uv_hat = model.model.surface_fitter(input_norm)
-            
-            # 3. UNSCALE OUTPUT (To Physical)
-            uv_phys = uv_hat * model.model.max_scale
-            
-            # Reshape for storage
-            uv = uv_phys.view(len(points), len(points), 2)
+        with torch.no_grad():
+            uv = model.model(input_tensor).view(len(points), len(points), 2)
             
         u_array[n] = uv
 
@@ -150,8 +140,12 @@ def simulate_feql(training_data, model):
     dimensions = model.model.dimensions
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
+    # Get model scale
+    max_scale = model.model.max_scale.to(device)
+    
     xt = training_data[:, :dimensions+1]
-    times = torch.unique(xt[:, dimensions])   
+    times = torch.unique(xt[:, dimensions])
+    
     points_raw = torch.unique(xt[:, 0])
     points_len = len(points_raw)
     
@@ -174,9 +168,6 @@ def simulate_feql(training_data, model):
     dt = 0.0001
     nits = int(T / dt)
     
-    # Get Scales from Model (Buffers)
-    u_scale = model.model.max_scale # Shape [1, 2]
-    
     # Get diffusion coefficients
     if model.model.diff_coeffs:
         du, dv = model.model.diff_coeffs
@@ -188,6 +179,7 @@ def simulate_feql(training_data, model):
     D_tensor = torch.tensor([du, dv], device=device).view(1, 2, 1, 1)
 
     # --- Laplacian kernel (Grouped Conv2d) ---
+    # OPTIMIZATION 2: Grouped Convolution (2 separate channels, same kernel)
     laplace_kernel = torch.tensor([[0, 1, 0],
                                    [1, -4, 1],
                                    [0, 1, 0]], dtype=torch.float32, device=device)
@@ -219,37 +211,30 @@ def simulate_feql(training_data, model):
     # This fuses the physics operations into fewer kernels
     @torch.compile 
     def physics_step(current_state):
-        # 1. Diffusion (Physical Units)
-        # current_state is Physical. laplace kernel is unitless. dx is Physical.
-        # So lap_uv is Physical concentration / length^2.
+        # 1. Diffusion
         lap_uv = conv(current_state) / (dx**2)
         
         # 2. Reaction 
         state_permuted = current_state.permute(0, 2, 3, 1).contiguous()
-        uv_flat_phys = state_permuted.view(-1, 2) # Physical Units
+        uv_flat = state_permuted.view(-1, 2)
+        uv_norm = uv_flat / max_scale
         
-        # --- SCALING FIX START ---
-        # A. Normalize Input: Physical -> [0, 1]
-        uv_flat_norm = uv_flat_phys / u_scale
+        # Run Reaction Network
+        r_flat = reaction(uv_norm) 
         
-        # B. Run Network: [0, 1] -> Dimensionless Rate
-        r_flat_hat = reaction(uv_flat_norm) 
+        # Reshape R back to grid: (1, 1, H, W)
+        r_grid = r_flat.view(1, 1, nx, ny) 
         
-        # C. Scale Output: Dimensionless Rate -> Physical Rate
-        # Recall: F_phys = F_hat * s_u_max
-        r_flat_phys = r_flat_hat * u_scale[0, 0] 
-        # --- SCALING FIX END ---
-        
-        # Reshape R back to grid
-        r_grid = r_flat_phys.view(1, 1, nx, ny) 
-        
-        # 3. Construct Reaction Update
+        # 3. Construct Reaction Update: [ +R, -R ]
+        # This adds R to u (channel 0) and subtracts R from v (channel 1)
         reaction_term = torch.cat([r_grid, -r_grid], dim=1) 
         
-        # Euler Step (All Physical)
+        # Euler Step
         new_state = current_state + dt * (D_tensor * lap_uv + reaction_term)
-        return new_state
-        
+        # print(f'current state: {current_state.shape}, uv_flat: {uv_flat.shape}, r_flat: {r_flat.shape}, r_grid: {r_grid.shape}, reaction_term: {reaction_term.shape}, new_state: {new_state.shape}')
+        # print(reaction_term[0, :, 0, 0])
+        return new_state      
+    
     # --- Progress Tracking Variables ---
     print_interval = nits // 10  # 10%
     last_time = time.time()

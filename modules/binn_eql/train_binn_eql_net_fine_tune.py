@@ -165,19 +165,16 @@ s_v = model.model.max_scale[0, 1].cpu().detach().numpy()
 uv_nans_scaled[:, 0] = uv_nans[:, 0] / s_u
 uv_nans_scaled[:, 1] = uv_nans[:, 1] / s_v
 
-# Predict (Dimensionless Output) then unscale
-input_tensor = torch.tensor(uv_nans_scaled).float().to(device)
-with torch.no_grad():
-    F_mlp_hat = model.model.reaction(input_tensor)
-F_mlp_hat_cpu = F_mlp_hat.cpu().detach().numpy()
-F_mlp_phys = F_mlp_hat_cpu * s_u
-
-# Scale and reshape for plotting
-F_mlp = F_mlp_phys.reshape(501, 501)
+# Generate learned learned surface after initial training
+uv_nans_scaled = np.zeros_like(uv_nans)
+uv_nans_scaled[:, 0] = uv_nans[:, 0] / model.model.max_scale[0, 0].cpu().detach().numpy()
+uv_nans_scaled[:, 1] = uv_nans[:, 1] / model.model.max_scale[0, 1].cpu().detach().numpy()
+F_mlp_unformatted = model.model.reaction(torch.tensor(uv_nans_scaled).float().to(device))
+F_mlp = F_mlp_unformatted.cpu().detach().numpy().reshape(501, 501)
 
 # Visualize surfaces
 visualize_surface(dir_name, u_triangle_mesh, v_triangle_mesh,
-                F_true, F_mlp, 'f_mlp_surfaces')
+                F_true, F_mlp, 'feql_surface')
 
 # Simulate uvmlp
 uvmlp_u_array, uvmlp_times = simulate_uvmlp(training_data, model)
