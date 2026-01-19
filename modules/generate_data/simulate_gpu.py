@@ -8,7 +8,7 @@ from modules.utils.imports import *
 from modules.utils.numpy_torch_conversion import *
 from modules.loaders.format_data import format_data_general
 from modules.loaders.visualize_training_data import animate_data
-from modules.generate_data.simulate_system import wave_pinning
+from modules.generate_data.simulate_system import wave_pinning, traveling_wave
     
 def simulate_surface(reaction, params=(1, 1, 0.01), diff_coeffs=(0.01, 1), early_stop=True):
     # --- Set Parameters --- 
@@ -121,11 +121,11 @@ if __name__ == '__main__':
     a = float(sys.argv[1]) 
     diff_coeffs = [float(sys.argv[2]), float(sys.argv[3])]
 
-    params = (a, 1, 0.01)
+    params = [0.1, 1, 0.6, 0.01]
 
     # save_name = f'/work/users/s/m/smyersn/elston/projects/kinetics_binns/data/2d/pos_feedback_new_ic/a_{a}_b_1_k_0.01'
-    save_name = f'/work/users/s/m/smyersn/elston/projects/kinetics_binns/data/2d/diff_coeffs/wave_pinning/select_torch/du_{diff_coeffs[0]}_dv_{diff_coeffs[1]}' 
-    u_array, x_array, t_array = simulate_surface(wave_pinning, params, diff_coeffs)
+    save_name = f'/work/users/s/m/smyersn/elston/projects/kinetics_binns/data/2d/traveling_wave/a_0.1_b_1_c_0.6_k_0.01' 
+    u_array, x_array, t_array = simulate_surface(traveling_wave, params, diff_coeffs)
     torch.save({'u_array': u_array, 'x_array': x_array, 't_array': t_array}, f'{save_name}.pt')
     
     anim = animate_new_sim(u_array, t_array, f'{save_name}.gif')

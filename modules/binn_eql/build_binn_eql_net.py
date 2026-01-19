@@ -46,7 +46,7 @@ class uv_MLP(nn.Module):
         # We iterate through the network we just built and wrap every Linear layer
         for module in self.mlp.MLP:
             if isinstance(module, nn.Linear):
-                utils.weight_norm(module)  # <--- Change 2: Weight Norm
+                utils.parametrizations.weight_norm(module)  # <--- Change 2: Weight Norm
                 
     def forward(self, inputs):
         # inputs are [-1, 1]
@@ -204,24 +204,24 @@ class BINN(nn.Module):
 
         return torch.mean(pde_loss)
                     
-    def reg_loss(self, epoch):
-        # # 1. Get probabilities
-        # gate_probs = self.reaction.eql_layer.l0_gate.expected_l0()
+    def reg_loss(self, lux_tax, epoch):
+        # 1. Get probabilities
+        gate_probs = self.reaction.eql_layer.l0_gate.expected_l0()
         
-        # # 2. Slice
-        # num_poly = self.reaction.eql_layer.num_poly_features
-        # poly_probs = gate_probs[:num_poly]
-        # hill_probs = gate_probs[num_poly:]
+        # 2. Slice
+        num_poly = self.reaction.eql_layer.num_poly_features
+        poly_probs = gate_probs[:num_poly]
+        hill_probs = gate_probs[num_poly:]
         
-        # # 3. Luxury Tax
-        # l0_poly = poly_probs.sum()
-        # l0_hill = hill_probs.sum() * self.l05_weight
-        # total_l0 = l0_poly + l0_hill
+        # 3. Luxury Tax
+        l0_poly = poly_probs.sum()
+        l0_hill = hill_probs.sum() * lux_tax
+        total_l0 = l0_poly + l0_hill
                 
-        # # 5. Total weighted L0 norm
-        # total_l0 = l0_poly + l0_hill
+        # 5. Total weighted L0 norm
+        total_l0 = l0_poly + l0_hill
 
-        total_l0 = self.reaction.eql_layer.l0_gate.expected_l0().sum()
+        # total_l0 = self.reaction.eql_layer.l0_gate.expected_l0().sum()
         
         # Penalize cheating Hill functions (K = 0)
         def small_K_hinge_penalty(K_vals, K_thresh=1e-3, weight=1e3):
@@ -242,9 +242,9 @@ class BINN(nn.Module):
                               
         return total_l0 + K_pen
 
-    def loss(self, pred, true, epoch, pde_weight, l0_weight):       
+    def loss(self, pred, true, epoch, gls_weight, pde_weight, l0_weight, lux_tax):       
         # GLS Loss
-        self.gls_loss_val = self.gls_loss(pred, true)
+        self.gls_loss_val = gls_weight * self.gls_loss(pred, true)
         
         # PDE Sampling
         x = torch.empty(self.num_samples, self.dimensions, device=pred.device).uniform_(self.lb[0,0], self.ub[0,0])
@@ -258,7 +258,7 @@ class BINN(nn.Module):
                                                        epoch)
               
         # Reg Loss            
-        l0_loss = self.reg_loss(epoch)
+        l0_loss = self.reg_loss(lux_tax, epoch)
         self.reg_loss_val = l0_weight * l0_loss  
               
         # if epoch % 1000 == 0:
@@ -301,11 +301,7 @@ class BINN(nn.Module):
     def extract_params(self, full=True):
         """
         Return a dict of parameter arrays on CPU (numpy) that are safe to log/plot.
-
-        If full is False returns only:
-            {'raw_w_unscaled', 'gates', 'effective'}
-
-        If full is True returns many more keys (see docstring in code).
+        Indexing updated to match duplicate-major [Inc, Dec] order.
         """
         eql = self.reaction.eql_layer
 
@@ -339,7 +335,7 @@ class BINN(nn.Module):
         n_hill_single = len(hill_terms)
         dup = int(self.duplicates)
 
-        # Collect raw hill parameter tensors into lists (on device) then stack once
+        # Collect raw hill parameter tensors into lists
         raw_ns_inc_list = []
         raw_Ks_inc_list = []
         raw_ns_dec_list = []
@@ -362,7 +358,7 @@ class BINN(nn.Module):
                 raw_ns_dec_list.append(hf.raw_n.view(-1))
                 raw_Ks_dec_list.append(hf.raw_logK.view(-1))
 
-        # stack (if empty, create empty numpy arrays)
+        # stack
         def _stack_to_numpy(lst):
             if len(lst) == 0:
                 return np.array([])
@@ -374,172 +370,273 @@ class BINN(nn.Module):
         raw_ns_dec = _stack_to_numpy(raw_ns_dec_list)
         raw_Ks_dec = _stack_to_numpy(raw_Ks_dec_list)
 
-        # map raw to interpretable numeric params (numpy)
+        # map raw to interpretable numeric params
         if raw_ns_inc.size:
-            # ns_inc = (1.0 / (1.0 + np.exp(-raw_ns_inc))) * 5.0
             ns_inc = (1 / (1 + np.exp(-raw_ns_inc))) * 3 + 1
         else:
             ns_inc = np.array([])
         if raw_ns_dec.size:
-            # ns_dec = (1.0 / (1.0 + np.exp(-raw_ns_dec))) * 5.0
             ns_dec = (1 / (1 + np.exp(-raw_ns_dec))) * 3 + 1
         else:
             ns_dec = np.array([])
 
         if raw_Ks_inc.size:
-            # Ks_inc = (1.0 / (1.0 + np.exp(-raw_Ks_inc))) * float(self.param_bounds)
             Ks_inc = np.exp(raw_Ks_inc)
         else:
             Ks_inc = np.array([])
         if raw_Ks_dec.size:
-            # Ks_dec = (1.0 / (1.0 + np.exp(-raw_Ks_dec))) * float(self.param_bounds)
             Ks_dec = np.exp(raw_Ks_dec)
         else:
             Ks_dec = np.array([])
 
-        # diffusion (if present) - try to get in one shot
         D_vals = None
         if hasattr(self, 'diffusion_fitter') and self.diffusion_fitter is not None:
             try:
                 with torch.no_grad():
                     D_vals = self.diffusion_fitter().detach().cpu().numpy()
             except Exception:
-                try:
-                    rawD = self.diffusion_fitter.raw.detach().cpu().numpy()
-                    s = 1.0 / (1.0 + np.exp(-rawD))
-                    D_vals = s * float(self.param_bounds)
-                except Exception:
-                    D_vals = None
+                D_vals = None
 
-        # ------- Build unscaled coefficients (original units) -------
-        # We assume EQL was trained on scaled inputs using self.u_scale_pct / self.v_scale_pct.
         s_u, s_v = self.max_scale[0, 0], self.max_scale[0, 1]
         
-        # POLYNOMIALS: first num_poly entries correspond to poly_terms * duplicates ordering
+        # POLYNOMIALS
         poly_coeffs_scaled = effective[:num_poly] if num_poly > 0 else np.array([])
         poly_coeffs_unscaled = []
         for term_tuple, coeff_scaled in zip(poly_terms * dup, poly_coeffs_scaled):
-            # count powers of u (index 0) and v (index 1)
             p = sum(1 for ind in term_tuple if ind == 0)
             q = sum(1 for ind in term_tuple if ind == 1)
             a_orig = coeff_scaled / ((s_u ** p) * (s_v ** q) + 0.0)
             poly_coeffs_unscaled.append(a_orig.cpu().detach())
         poly_coeffs_unscaled = np.array(poly_coeffs_unscaled)
 
-        # HILLS: extract hill block and split into inc/dec in duplicate-major order
+        # --- CORRECTED HILL INDEXING ---
         hill_block = effective[num_poly : num_poly + num_hill] if num_hill > 0 else np.array([])
-        if hill_block.size:
-            # shape (dup, 2 * n_hill_single)
-            try:
-                hb = hill_block.reshape(dup, 2 * n_hill_single)
-            except Exception:
-                # fall back: if shapes don't match, flatten to inc/dec halves conservatively
-                hb = hill_block.reshape(dup, -1)
-            hill_inc_all = hb[:, :n_hill_single].reshape(-1) if n_hill_single > 0 else np.array([])
-            hill_dec_all = hb[:, n_hill_single:].reshape(-1) if n_hill_single > 0 else np.array([])
-        else:
-            hill_inc_all = np.array([])
-            hill_dec_all = np.array([])
+        hill_inc_unscaled_list = []
+        hill_dec_unscaled_list = []
+        
+        # Sequentially slice Inc then Dec for each duplicate to follow constructor order
+        ptr = 0
+        for d in range(dup):
+            # 1. Increasing block for this duplicate
+            inc_slice = hill_block[ptr : ptr + n_hill_single]
+            for (term_tuple, coeff_scaled, K_scaled, n_val) in zip(hill_terms, inc_slice, 
+                                                                Ks_inc[d*n_hill_single : (d+1)*n_hill_single], 
+                                                                ns_inc[d*n_hill_single : (d+1)*n_hill_single]):
+                n_f = float(n_val)
+                s_reg = s_u if term_tuple[0] == 0 else s_v
+                multiplier_power = 1 if len(term_tuple) > 1 else 0
+                s_mult = (s_u if term_tuple[1] == 0 else s_v) if multiplier_power else 1.0
+                b_orig = coeff_scaled / ((s_reg ** n_f) * (s_mult ** multiplier_power) + 0.0)
+                hill_inc_unscaled_list.append(float(b_orig))
+            ptr += n_hill_single
 
-        # Unscale hill coefficients using learned n and s_u/s_v
-        hill_inc_unscaled = []
-        # Ks_inc, ns_inc arrays are in duplicate-major order already (from stacking)
-        for (term_tuple, coeff_scaled, K_scaled, n_val) in zip(hill_terms * dup, hill_inc_all, Ks_inc, ns_inc):
-            n_f = float(n_val)
-            reg_species = term_tuple[0]
-            multiplier_power = 1 if len(term_tuple) > 1 else 0
-            mult_species = term_tuple[1] if multiplier_power else None
+            # 2. Decreasing block for this duplicate
+            dec_slice = hill_block[ptr : ptr + n_hill_single]
+            for (term_tuple, coeff_scaled, K_scaled, n_val) in zip(hill_terms, dec_slice, 
+                                                                Ks_dec[d*n_hill_single : (d+1)*n_hill_single], 
+                                                                ns_dec[d*n_hill_single : (d+1)*n_hill_single]):
+                n_f = float(n_val)
+                s_reg = s_u if term_tuple[0] == 0 else s_v
+                multiplier_power = 1 if len(term_tuple) > 1 else 0
+                s_mult = (s_u if term_tuple[1] == 0 else s_v) if multiplier_power else 1.0
+                b_orig = coeff_scaled / ((s_reg ** n_f) * (s_mult ** multiplier_power) + 0.0)
+                hill_dec_unscaled_list.append(float(b_orig))
+            ptr += n_hill_single
 
-            s_reg = s_u if reg_species == 0 else s_v
-            s_mult = 1.0
-            if multiplier_power:
-                s_mult = s_u if mult_species == 0 else s_v
+        hill_inc_unscaled = np.array(hill_inc_unscaled_list)
+        hill_dec_unscaled = np.array(hill_dec_unscaled_list)
 
-            b_orig = coeff_scaled / ((s_reg ** n_f) * (s_mult ** multiplier_power) + 0.0)
-            # K unscaling will be handled separately in Ks_inc_unscaled
-            hill_inc_unscaled.append(float(b_orig))
-        hill_inc_unscaled = np.array(hill_inc_unscaled)
-
-        hill_dec_unscaled = []
-        for (term_tuple, coeff_scaled, K_scaled, n_val) in zip(hill_terms * dup, hill_dec_all, Ks_dec, ns_dec):
-            n_f = float(n_val)
-            reg_species = term_tuple[0]
-            multiplier_power = 1 if len(term_tuple) > 1 else 0
-            mult_species = term_tuple[1] if multiplier_power else None
-
-            s_reg = s_u if reg_species == 0 else s_v
-            s_mult = 1.0
-            if multiplier_power:
-                s_mult = s_u if mult_species == 0 else s_v
-
-            b_orig = coeff_scaled / ((s_reg ** n_f) * (s_mult ** multiplier_power) + 0.0)
-            hill_dec_unscaled.append(float(b_orig))
-        hill_dec_unscaled = np.array(hill_dec_unscaled)
-
-        # Ks unscaled: K_orig = K_scaled / (s_reg ** n)
+        # Ks unscaled
         Ks_inc_unscaled = []
         for (term_tuple, K_scaled, n_val) in zip(hill_terms * dup, Ks_inc, ns_inc):
-            n_f = float(n_val)
-            reg_species = term_tuple[0]
-            s_reg = s_u if reg_species == 0 else s_v
-            K_orig = float(K_scaled / (s_reg ** n_f + 0.0))
-            Ks_inc_unscaled.append(K_orig)
+            s_reg = s_u if term_tuple[0] == 0 else s_v
+            Ks_inc_unscaled.append(float(K_scaled / (s_reg ** float(n_val) + 0.0)))
         Ks_inc_unscaled = np.array(Ks_inc_unscaled)
 
         Ks_dec_unscaled = []
         for (term_tuple, K_scaled, n_val) in zip(hill_terms * dup, Ks_dec, ns_dec):
-            n_f = float(n_val)
-            reg_species = term_tuple[0]
-            s_reg = s_u if reg_species == 0 else s_v
-            K_orig = float(K_scaled / (s_reg ** n_f + 0.0))
-            Ks_dec_unscaled.append(K_orig)
+            s_reg = s_u if term_tuple[0] == 0 else s_v
+            Ks_dec_unscaled.append(float(K_scaled / (s_reg ** float(n_val) + 0.0)))
         Ks_dec_unscaled = np.array(Ks_dec_unscaled)
 
-        # Build raw_w_unscaled: same length as effective. For poly entries use poly_coeffs_unscaled,
-        # for hill entries use concatenation of inc then dec arrays
+        # Build raw_w_unscaled: maintain sequential order for effective_unscaled alignment
         raw_w_unscaled_list = []
-        # poly part
         if poly_coeffs_unscaled.size:
             raw_w_unscaled_list.extend(poly_coeffs_unscaled.tolist())
-        # hill part: concatenate inc then dec in the same ordering as effective's hill block
-        if hill_inc_all.size:
-            # hill_block order was dup rows [inc_block | dec_block], flattened to dup*n_hill_single ordering.
-            # hill_inc_unscaled and hill_dec_unscaled are already in exactly that duplicate-major ordering.
-            raw_w_unscaled_list.extend(hill_inc_unscaled.tolist())
-            raw_w_unscaled_list.extend(hill_dec_unscaled.tolist())
+        
+        # Follow the same sequential d=0(inc, dec), d=1(inc, dec) order for the master list
+        ptr_inc, ptr_dec = 0, 0
+        for d in range(dup):
+            raw_w_unscaled_list.extend(hill_inc_unscaled[ptr_inc : ptr_inc + n_hill_single].tolist())
+            ptr_inc += n_hill_single
+            raw_w_unscaled_list.extend(hill_dec_unscaled[ptr_dec : ptr_dec + n_hill_single].tolist())
+            ptr_dec += n_hill_single
 
         raw_w_unscaled = np.array(raw_w_unscaled_list) if len(raw_w_unscaled_list) else np.array([])
         effective_unscaled = (raw_w_unscaled * gates)
-        
-        # Non-full (quick) return: minimal keys requested
-        if not full:
-            return {
-                'raw_w_unscaled': raw_w_unscaled,
-                'effective_unscaled': effective_unscaled
-            }
+        # print(f'poly unscaled: {poly_coeffs_unscaled}')
+        # print(f'hill inc unscaled: {hill_inc_unscaled}')
+        # print(f'hill dec unscaled: {hill_dec_unscaled}')
+        # print(f'raw w unscaled: {raw_w_unscaled}')
+        # print(f'gates: {gates}')
+        # print(f'effective unscaled: {effective_unscaled}')
+        # print(f'effective: {effective}')
 
-        # Full return (everything)
+        if not full:
+            return {'raw_w_unscaled': raw_w_unscaled, 'effective_unscaled': effective_unscaled}
+
         return {
-            'raw_w': raw_w,
-            'raw_w_unscaled': raw_w_unscaled,
-            'gates': gates,
-            'effective': effective,
-            'effective_unscaled': effective_unscaled,
-            'num_poly': num_poly,
-            'num_hill': num_hill,
-            'ns_inc': ns_inc,
-            'Ks_inc': Ks_inc,
-            'ns_dec': ns_dec,
-            'Ks_dec': Ks_dec,
-            'D': D_vals,
-            'poly_terms': poly_terms,
-            'hill_terms': hill_terms,
+            'raw_w': raw_w, 'raw_w_unscaled': raw_w_unscaled, 'gates': gates,
+            'effective': effective, 'effective_unscaled': effective_unscaled,
+            'num_poly': num_poly, 'num_hill': num_hill,
+            'ns_inc': ns_inc, 'Ks_inc': Ks_inc, 'ns_dec': ns_dec, 'Ks_dec': Ks_dec,
+            'D': D_vals, 'poly_terms': poly_terms, 'hill_terms': hill_terms,
             'poly_coeffs_unscaled': poly_coeffs_unscaled,
-            'hill_inc_unscaled': hill_inc_unscaled,
-            'hill_dec_unscaled': hill_dec_unscaled,
-            'Ks_inc_unscaled': Ks_inc_unscaled,
-            'Ks_dec_unscaled': Ks_dec_unscaled
+            'hill_inc_unscaled': hill_inc_unscaled, 'hill_dec_unscaled': hill_dec_unscaled,
+            'Ks_inc_unscaled': Ks_inc_unscaled, 'Ks_dec_unscaled': Ks_dec_unscaled
         }
+                
+    @torch.no_grad()
+    def fine_tune_eql(self, threshold=0.01, epsilon=0.05):
+        """
+        Fine-tunes the discovered EQL equation.
+        Sequence: Zeroing -> Poly Merging -> Hill Merging/Averaging -> Poly Simplification.
+        """
+        eql = self.reaction.eql_layer
+        device = eql.fc.weight.device
+        
+        # 1. EVALUATION DATA (Standard Normalized Range)
+        u_norm = self.train_data[:, -2:-1].to(device) / self.max_scale[0, 0]
+        v_norm = self.train_data[:, -1:].to(device) / self.max_scale[0, 1]
+        uv_norm = torch.cat([u_norm, v_norm], dim=1)
+        
+        # 2. ALIGNED FEATURES: Sequential Duplicate-Major [Poly, Inc, Dec]
+        features = eql.get_features(uv_norm) 
+        
+        # --- TASK 1: ZEROING (Pruning Noise) ---
+        params = self.extract_params(full=True)
+        eff_unscaled = torch.tensor(params['effective_unscaled'], device=device)
+        
+        # Identify terms that contribute less than the threshold to the physical rate
+        small_mask = torch.abs(eff_unscaled) < threshold
+        eql.fc.weight.data[0, small_mask] = 0.0
+        eql.l0_gate.log_alpha.data[small_mask] = -10.0 # Lock gate shut
+
+        # Refresh params after pruning
+        params = self.extract_params(full=True)
+        num_poly = eql.num_poly_features
+        num_hill = eql.num_hill_features
+        n_poly_single = num_poly // self.duplicates
+        n_hill_single = len(params['hill_terms'])
+
+        # --- TASK 2: COMBINE DUPLICATE POLYNOMIALS ---
+        for i in range(n_poly_single):
+            indices = [i + j * n_poly_single for j in range(self.duplicates)]
+            primary = indices[0]
+            for other in indices[1:]:
+                if torch.abs(eql.fc.weight.data[0, other]) < 1e-8: continue
+                eql.fc.weight.data[0, primary] += eql.fc.weight.data[0, other]
+                eql.fc.weight.data[0, other] = 0.0
+                # Transfer gate importance
+                eql.l0_gate.log_alpha.data[primary] = torch.max(
+                    eql.l0_gate.log_alpha.data[primary], 
+                    eql.l0_gate.log_alpha.data[other]
+                )
+                eql.l0_gate.log_alpha.data[other] = -10.0
+
+        # --- TASK 3A: MERGE DUPLICATE HILLS (With Parameter Averaging) ---
+        for i in range(num_hill):
+            h_idx = num_poly + i
+            if torch.abs(eql.fc.weight.data[0, h_idx]) < 1e-8: continue
+            
+            f_hill = features[:, h_idx]
+            
+            for next_h_idx in range(h_idx + 1, num_poly + num_hill):
+                if torch.abs(eql.fc.weight.data[0, next_h_idx]) < 1e-8: continue
+                
+                f_other = features[:, next_h_idx]
+                # Shape-only check (Normalized)
+                diff = torch.mean(torch.abs(f_hill/f_hill.max() - f_other/f_other.max()))
+                
+                if diff < epsilon:
+                    print(f"Merging Duplicate Hills: {h_idx} and {next_h_idx} (diff: {diff:.4f})")
+                    
+                    # Update Hill weights and average internal n/K parameters
+                    eql.fc.weight.data[0, h_idx] += eql.fc.weight.data[0, next_h_idx]
+                    eql.fc.weight.data[0, next_h_idx] = 0.0
+                    
+                    self._average_hill_params(h_idx - num_poly, next_h_idx - num_poly)
+                    
+                    # Consolidate Gate
+                    eql.l0_gate.log_alpha.data[h_idx] = torch.max(
+                        eql.l0_gate.log_alpha.data[h_idx], 
+                        eql.l0_gate.log_alpha.data[next_h_idx]
+                    )
+                    eql.l0_gate.log_alpha.data[next_h_idx] = -10.0
+
+        # --- TASK 3B: SIMPLIFY TO POLYNOMIALS (With Least-Squares Optimization) ---
+        # Refresh params again to get updated n/K values for projection math
+        params = self.extract_params(full=True)
+        
+        for i in range(num_hill):
+            h_idx = num_poly + i
+            if torch.abs(eql.fc.weight.data[0, h_idx]) < 1e-8: continue
+            
+            f_hill = features[:, h_idx]
+            
+            for p_idx in range(num_poly):
+                f_poly = features[:, p_idx]
+                
+                # 1. Gatekeeper: Shape Similarity (Normalized)
+                diff = torch.mean(torch.abs(f_hill/f_hill.max() - f_poly/f_poly.max()))
+                
+                if diff < epsilon:
+                    # 2. Optimization: Find optimal weight multiplier m*
+                    # m* = dot(f_hill, f_poly) / norm(f_poly)^2
+                    dot_product = torch.sum(f_hill * f_poly)
+                    poly_norm_sq = torch.sum(f_poly * f_poly)
+                    m_star = dot_product / (poly_norm_sq + 1e-12)
+                    
+                    print(f"Simplifying Hill {h_idx} to Poly {p_idx}")
+                    print(f"  Shape Diff: {diff:.4f}, Multiplier: {m_star:.4f}")
+                    
+                    # 3. Transfer Weight (scaled) and Gate log_alpha
+                    eql.fc.weight.data[0, p_idx] += eql.fc.weight.data[0, h_idx] * m_star
+                    eql.l0_gate.log_alpha.data[p_idx] = eql.l0_gate.log_alpha.data[h_idx].clone()
+                    
+                    # 4. Kill Hill
+                    eql.fc.weight.data[0, h_idx] = 0.0
+                    eql.l0_gate.log_alpha.data[h_idx] = -10.0
+                    break
+
+        # Final Sync
+        _ = self.extract_params(full=True)
+        print("Fine-tuning committed.")
+
+    def _average_hill_params(self, idx1, idx2):
+        """
+        Helper to average n and logK for two Hill modules.
+        Ensures 'Consolidated Hills' maintain correct physical shapes.
+        """
+        eql = self.reaction.eql_layer
+        
+        # Construct a flat list of Hill modules following Sequential Ptr logic
+        all_hf = []
+        for hm in eql.hill.hill_modules:
+            all_hf.extend(hm.hill_inc_raw + list(hm.hill_inc_cross.values()))
+            all_hf.extend(hm.hill_dec_raw + list(hm.hill_dec_cross.values()))
+            
+        hf1 = all_hf[idx1]
+        hf2 = all_hf[idx2]
+        
+        with torch.no_grad():
+            # Update primary module with average parameters
+            hf1.raw_n.data = (hf1.raw_n.data + hf2.raw_n.data) / 2.0
+            hf1.raw_logK.data = (hf1.raw_logK.data + hf2.raw_logK.data) / 2.0
+            
+            # Prune parameters of merged module
+            hf2.raw_n.data.fill_(0.0)
+            hf2.raw_logK.data.fill_(0.0)
         
     def generate_equation(self, eps=1e-12):
         p = self.extract_params(full=True)

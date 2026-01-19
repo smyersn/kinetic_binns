@@ -1,5 +1,0 @@
-[0.01, 5.0]
-(1.0, 1, 0.01)
-/work/users/s/m/smyersn/elston/projects/kinetics_binns/data/2d/diff_coeffs/wave_pinning/select_torch/du_0.01_dv_5.0
-Progress: 0.0%
-slurmstepd: error: *** JOB 8145062 ON c1140 CANCELLED AT 2025-07-12T00:26:02 ***

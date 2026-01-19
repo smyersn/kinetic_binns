@@ -50,6 +50,13 @@ def turing_type(uv, params=(1, 1)):
     F = a * u**2 * v - b * u
     return F
 
+def traveling_wave(uv, params=(0.1, 1, 0.6, 0.01)):
+    u, v = uv[:, 0], uv[:, 1]
+    a, b, c, k = params
+    
+    F = a * v + (b * u**2 * v) / (1 + k * u**2) - c * u
+    return F
+
 # Define update functions for simulation
 def update_laplace(u, v, reaction, Du, Dv, dt, dx, points, dim, params=None):
     if params:
@@ -193,12 +200,15 @@ if __name__ == '__main__':
     dim = 2
     
     # Define reaction
-    reaction = turing_type
-    params = [1, 1]
+    # reaction = turing_type
+    # params = [1, 1]
+    # Du, Dv = 0.01, 1
+    reaction = traveling_wave
+    params = [0.1, 1, 0.6, 0.01]
     Du, Dv = 0.01, 1
     
     # Calculate initial conditions for grid
-    save_name = '/work/users/s/m/smyersn/elston/projects/kinetics_binns/data/2d/turing_type'
+    save_name = '/work/users/s/m/smyersn/elston/projects/kinetics_binns/data/2d/traveling_wave'
     
     u0, v0 = generate_initial_conditions(u0, v0, N, dim, random=True)
     

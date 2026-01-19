@@ -22,6 +22,7 @@ class HillFunction(nn.Module):
     def forward(self, x):
         # Use sigmoid to ensure n and K are positive and scale to maxes
         n = torch.sigmoid(self.raw_n) * 3 + 1
+        # n = torch.sigmoid(self.raw_n) * 3 + 2
         K = torch.exp(self.raw_logK)
         x_n = x.pow(n)
         
@@ -146,6 +147,13 @@ class EQLLayer(nn.Module):
         self.l0_gate = HardConcreteGate(self.total_features)
         # nn.init.uniform_(self.fc.weight, a=-param_bounds, b=param_bounds)
         nn.init.uniform_(self.fc.weight, a=-1, b=1)
+        
+    def get_features(self, x):
+        poly_feats = self.poly(x)
+        hill_feats = self.hill(x)
+        features = torch.cat([poly_feats, hill_feats], dim=1)
+        
+        return features
 
     def forward(self, x, training=True):
         poly_feats = self.poly(x)

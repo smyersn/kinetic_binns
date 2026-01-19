@@ -1,5 +1,0 @@
-Traceback (most recent call last):
-  File "/work/users/s/m/smyersn/elston/projects/kinetics_binns/modules/generate_data/simulate_gpu.py", line 128, in <module>
-    save_name = f'/work/users/s/m/smyersn/elston/projects/kinetics_binns/data/2d/diff_coeffs/wave_pinning/select_torch/du_{diff_coeffs[0]}_dv_{diff_coeffs[1]}' 
-                                                                                                                                               ~~~~~~~~~~~^^^
-IndexError: list index out of range

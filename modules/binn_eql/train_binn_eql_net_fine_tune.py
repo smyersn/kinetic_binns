@@ -38,6 +38,7 @@ degree = int(config['degree'])
 pde_weight=float(config['pde_weight'])
 l0_weight = float(config['l0_weight'])
 warm_up = float(config['warm_up'])
+lux_tax = float(config['lux_tax'])
 param_bounds = float(config['param_bounds'])
 
 dir_name = sys.argv[1]
@@ -113,13 +114,41 @@ binn = BINN(
 
 binn.to(device)
 
-parameters = binn.parameters()
+# Initialize optimizer
+param_groups = [
+    {'params': binn.surface_fitter.parameters(), 
+     'lr': 1e-2, 
+     'weight_decay': 1e-5,  
+     'name': 'surface'},
+    
+    {'params': binn.reaction.parameters(), 
+     'lr': 1e-3, 
+     'weight_decay': 0.0,   
+     'name': 'reaction'}]
 
-opt = torch.optim.Adam(parameters, lr=0.001)
+if binn.diffusion_fitter:
+    param_groups.append({
+        'params': binn.diffusion_fitter.parameters(), 
+        'lr': 1e-3,
+        'weight_decay': 0.0,
+        'name': 'diffusion'})
+
+opt = torch.optim.AdamW(param_groups, weight_decay=0.0)
+
+# Initialize Scheduler (OneCycleLR)
+scheduler = torch.optim.lr_scheduler.OneCycleLR(
+    opt,
+    # Provide a list of max_lrs matching the order of param_groups
+    max_lr=[group['lr'] for group in param_groups],
+    total_steps=int(warm_up),  
+    pct_start=0.3,        
+    div_factor=25,               
+    final_div_factor=1e4)
 
 model = model_wrapper(
     model=binn,
     optimizer=opt,
+    scheduler=scheduler,
     loss=binn.loss,
     dir_name=dir_name,
     save_name=f'{dir_name}/binn')
@@ -131,6 +160,7 @@ param_history, train_loss_dict, val_loss_dict = model.fit(
     pde_weight=pde_weight,
     l0_weight=l0_weight,
     warm_up=warm_up,
+    lux_tax=lux_tax,
     batch_size=batch_size,
     epochs=epochs,
     early_stopping=5000)

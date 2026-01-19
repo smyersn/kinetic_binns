@@ -89,6 +89,7 @@ class model_wrapper():
             pde_weight,
             l0_weight,
             warm_up,
+            lux_tax,
             batch_size=None,
             epochs=1,
             initial_epoch=0,
@@ -107,10 +108,10 @@ class model_wrapper():
         # simple history container
         self.param_history = {'raw_w_unscaled': [], 'effective_unscaled': [],'epoch': []}
         
-        phase_1_end = int(warm_up)
-        phase_2_end = int(warm_up * 1.5)
-        phase_3_end = int(warm_up * 2)
-        min_epochs_before_stop = int(warm_up * 3)
+        phase_1_end = 20_000
+        phase_2_end = 20_000 + int(warm_up * 0.5)
+        phase_3_end = 20_000 + int(warm_up * 1)
+        min_epochs_before_stop = 20_000 + int(warm_up * 1)
         last_improved = min_epochs_before_stop
       
         # loop over epochs
@@ -131,21 +132,34 @@ class model_wrapper():
             self.set_training_phase(phase)
             
             # -----------------------------
-            # 2. Determine Weights
+            # 2. Determine Weights and learning rates
             # -----------------------------
             
-            # Phase 1: Data Only
+            # Phase 1: Data Only (The Sprint)
             if phase == 1:
+                gls_weight_eff = 1.0
                 pde_weight_eff = 0.0
                 l0_weight_eff = 0.0
+                # LR Strategy: Trust the OneCycleLR Scheduler completely.
                 
             # Phase 2: Physics On, No Reg
             elif phase == 2:
+                gls_weight_eff = 0.0
                 pde_weight_eff = pde_weight
                 l0_weight_eff = 0.0
                 
-            # Phase 3: Physics On, Ramp Reg
+                # LR Strategy: Manual Constant (Stabilize Surface, Wake Reaction)
+                for pg in self.optimizer.param_groups:
+                    if pg.get('name') == 'surface':
+                        pg['lr'] = 0.0   # Lock it down (Micro-adjustments only)
+                    elif pg.get('name') == 'reaction':
+                        pg['lr'] = 1e-3   # Wake up! (Standard learning)
+                    elif pg.get('name') == 'diffusion':
+                        pg['lr'] = 1e-3   # Wake up!
+
+            # Phase 3: Physics On, Ramp Reg (The Selection)
             elif phase == 3:
+                gls_weight_eff = 0.0
                 pde_weight_eff = pde_weight
                 
                 # Calculate progress through Phase 3 (0.0 to 1.0)
@@ -153,11 +167,32 @@ class model_wrapper():
                 progress = (epoch - phase_2_end) / phase_duration
                 l0_weight_eff = progress * l0_weight
                 
-            # Phase 4: Max Reg
+                # LR Strategy: Constant (Keep steady pressure against L0 tax)
+                for pg in self.optimizer.param_groups:
+                    if pg.get('name') == 'surface':
+                        pg['lr'] = 0.0   # Keep locked
+                    elif pg.get('name') == 'reaction':
+                        pg['lr'] = 1e-3   # Keep strong to fight Regularization
+                    elif pg.get('name') == 'diffusion':
+                        pg['lr'] = 1e-3
+
+            # Phase 4: Max Reg (The Alignment / Fine Tuning)
             elif phase == 4:
+                gls_weight_eff = 0.0
                 pde_weight_eff = pde_weight
                 l0_weight_eff = l0_weight
-
+                
+                # LR Strategy: Decay Reaction for precision
+                for pg in self.optimizer.param_groups:
+                    if pg.get('name') == 'surface':
+                        pg['lr'] = 0.0   # Still locked
+                    elif pg.get('name') == 'reaction':
+                        # pg['lr'] = 1e-4   # Drop for fine-tuning
+                        pg['lr'] = 1e-3   # Drop for fine-tuning
+                    elif pg.get('name') == 'diffusion':
+                        # pg['lr'] = 1e-4
+                        pg['lr'] = 1e-3   # Drop for fine-tuning
+                        
             # -----------------------------
             # 3. Train Step
             # -----------------------------
@@ -214,8 +249,10 @@ class model_wrapper():
                 train_loss, train_gls_loss, train_pde_loss, train_reg_loss = self.loss(y_pred, 
                                                                                        y_true, 
                                                                                        epoch,
+                                                                                       gls_weight_eff,
                                                                                        pde_weight_eff,
-                                                                                       l0_weight_eff)
+                                                                                       l0_weight_eff,
+                                                                                       lux_tax)
                                                                             
                 # compute backward pass and update weights
                 train_loss.backward()
@@ -228,6 +265,10 @@ class model_wrapper():
                 train_pde_losses += train_pde_loss.item() * len(x_true)
                 train_reg_losses += train_reg_loss.item() * len(x_true)
 
+            # Step scheduler after all training batches
+            if self.scheduler is not None and phase == 1:
+                self.scheduler.step()
+                
             # update book keeping for this epoch
             self.train_loss_dict['loss'].append(np.sum(train_losses) / len(train_data))
             self.train_loss_dict['gls'].append(np.sum(train_gls_losses) / len(train_data))
@@ -286,8 +327,10 @@ class model_wrapper():
                 val_loss, val_gls_loss, val_pde_loss, val_reg_loss = self.loss(y_pred,
                                                                                y_true,
                                                                                epoch,
+                                                                               gls_weight_eff,
                                                                                pde_weight_eff,
-                                                                               l0_weight_eff)
+                                                                               l0_weight_eff,
+                                                                               lux_tax)
                 
                 val_losses += val_loss.item() * len(x_true)
                 val_gls_losses += val_gls_loss.item() * len(x_true)
@@ -300,26 +343,33 @@ class model_wrapper():
             self.val_loss_dict['pde'].append(np.sum(val_pde_losses) / len(val_data))
             self.val_loss_dict['reg'].append(np.sum(val_reg_losses) / len(val_data))
 
-            # if validation error improved
-            rel_diff = (best_val_loss - self.val_loss_dict['loss'][-1])
-            rel_diff /= best_val_loss
-            
-            if epoch >= min_epochs_before_stop:
-                if rel_diff > rel_save_thresh:
+            if phase == 4:
+                # Calculate improvement relative to best SEEN IN PHASE 4
+                rel_diff = (best_val_loss - self.val_loss_dict['loss'][-1])
+                rel_diff /= best_val_loss
+                
+                # Check against min_epochs (just in case phase 4 started earlier)
+                if epoch >= min_epochs_before_stop:
                     
-                    # update best validation loss
-                    best_val_loss = self.val_loss_dict['loss'][-1]
+                    # 1. Did we improve?
+                    if rel_diff > rel_save_thresh:
+                        # Update best validation loss
+                        best_val_loss = self.val_loss_dict['loss'][-1]
+                        
+                        # Save checkpoint
+                        if self.save_best_val:
+                            self.save(self.save_name+'_best_val')
+                        
+                        # Reset Early Stopping Counter
+                        last_improved = epoch
                     
-                    # optionally save model and optimizer
-                    if self.save_best_val:
-                        # print(f'Pruned and saved at epoch {epoch}')
-                        # self.model.prune(thresh=prune_thresh)
-                        # self.freeze_pruned_params()
-                        self.save(self.save_name+'_best_val')
-                    
-                    # update early stopper
-                    last_improved = epoch               
-                                
+                    # 2. Should we stop?
+                    # Only triggers if we haven't improved for 'early_stopping' epochs
+                    if early_stopping is not None:
+                        if epoch - last_improved >= early_stopping:
+                            print(f"Early stopping triggered at epoch {epoch}")
+                            break  
+                                                      
             # update user
             elapsed, remaining, ms = time_remaining(
                 current_iter=epoch+1,
@@ -336,15 +386,7 @@ class model_wrapper():
                 p += ' | Remaining = ' + remaining + '           '
                 #sys.stdout.write(p)
                 print(p, flush=True)
-                
-            # optional early stopping
-            if early_stopping is not None:
-                # Logic: Only check stopping if we have passed the minimum epoch threshold
-                if epoch > min_epochs_before_stop:
-                    if epoch - last_improved >= early_stopping:
-                        print(f"Early stopping triggered at epoch {epoch}")
-                        break
-                            
+                                            
             # optional learning rate annealing
             if lr_dec_epoch is not None:
                 if np.mod(epoch, lr_dec_epoch) == 0 and epoch != 0:
@@ -418,8 +460,6 @@ class model_wrapper():
                 for p in self.model.diffusion_fitter.parameters(): p.requires_grad = True
                 
         # Phase 4: Joint Fine-Tuning
-        # The equation is mostly found. Now we let the surface adjust slightly
-        # to the physics, and the physics adjust slightly to the surface.
         elif phase == 4:
             # Unfreeze Everything
             for p in self.model.surface_fitter.parameters(): p.requires_grad = True

@@ -1,0 +1,13 @@
+Pweave
+sphinx
+breathe
+rst_include
+sphinx_rtd_theme
+commonmark
+recommonmark
+sphinxcontrib-plantuml
+sphinxcontrib-napoleon
+sphinxcontrib-programoutput2
+sphinxcontrib-inlinesyntaxhighlight
+sphinx-autodoc-typehints
+smoldyn

@@ -1,8 +1,0 @@
-Traceback (most recent call last):
-  File "/work/users/s/m/smyersn/elston/projects/kinetics_binns/modules/generate_data/simulate_gpu.py", line 122, in <module>
-    diff_coeffs = [float(x) for x in sys.argv[2].strip("()").split()]
-                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/work/users/s/m/smyersn/elston/projects/kinetics_binns/modules/generate_data/simulate_gpu.py", line 122, in <listcomp>
-    diff_coeffs = [float(x) for x in sys.argv[2].strip("()").split()]
-                   ^^^^^^^^
-ValueError: could not convert string to float: '0.01[*]'

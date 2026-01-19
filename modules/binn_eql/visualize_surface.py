@@ -101,7 +101,7 @@ def visualize_surface(model_dir, u_triangle_mesh, v_triangle_mesh, F_true,
     fig = make_subplots(rows=1, cols=2,
                         specs=[[{'type':'scene'}, {'type':'scene'}]],
                         subplot_titles=("F<sub>True</sub>(u, v)", 
-                                        "F<sub>MLP</sub>(u, v)"),
+                                        "F<sub>EQL</sub>(u, v)"),
                         horizontal_spacing = 0)
 
     fig.layout.annotations[0].update(y=0.8)

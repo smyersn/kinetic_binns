@@ -7,7 +7,7 @@ conda activate binns
 # as=("1" "3" "5")
 as=("1")
 du=0.01
-dv=0.1
+dv=1
 # dv=0.5
 # dv=1
 # dv=5

@@ -1,0 +1,41 @@
+file(REMOVE_RECURSE
+  "CMakeFiles/Steve.dir/Geometry.c.o"
+  "CMakeFiles/Steve.dir/Geometry.c.o.d"
+  "CMakeFiles/Steve.dir/List.c.o"
+  "CMakeFiles/Steve.dir/List.c.o.d"
+  "CMakeFiles/Steve.dir/Rn.c.o"
+  "CMakeFiles/Steve.dir/Rn.c.o.d"
+  "CMakeFiles/Steve.dir/RnSort.c.o"
+  "CMakeFiles/Steve.dir/RnSort.c.o.d"
+  "CMakeFiles/Steve.dir/RnSparse.c.o"
+  "CMakeFiles/Steve.dir/RnSparse.c.o.d"
+  "CMakeFiles/Steve.dir/SFMT/SFMT.c.o"
+  "CMakeFiles/Steve.dir/SFMT/SFMT.c.o.d"
+  "CMakeFiles/Steve.dir/SimCommand.c.o"
+  "CMakeFiles/Steve.dir/SimCommand.c.o.d"
+  "CMakeFiles/Steve.dir/Sphere.c.o"
+  "CMakeFiles/Steve.dir/Sphere.c.o.d"
+  "CMakeFiles/Steve.dir/SurfaceParam.c.o"
+  "CMakeFiles/Steve.dir/SurfaceParam.c.o.d"
+  "CMakeFiles/Steve.dir/Zn.c.o"
+  "CMakeFiles/Steve.dir/Zn.c.o.d"
+  "CMakeFiles/Steve.dir/math2.c.o"
+  "CMakeFiles/Steve.dir/math2.c.o.d"
+  "CMakeFiles/Steve.dir/opengl2.c.o"
+  "CMakeFiles/Steve.dir/opengl2.c.o.d"
+  "CMakeFiles/Steve.dir/parse.c.o"
+  "CMakeFiles/Steve.dir/parse.c.o.d"
+  "CMakeFiles/Steve.dir/queue.c.o"
+  "CMakeFiles/Steve.dir/queue.c.o.d"
+  "CMakeFiles/Steve.dir/random2.c.o"
+  "CMakeFiles/Steve.dir/random2.c.o.d"
+  "CMakeFiles/Steve.dir/rxnparam.c.o"
+  "CMakeFiles/Steve.dir/rxnparam.c.o.d"
+  "CMakeFiles/Steve.dir/string2.c.o"
+  "CMakeFiles/Steve.dir/string2.c.o.d"
+)
+
+# Per-language clean rules from dependency scanning.
+foreach(lang C)
+  include(CMakeFiles/Steve.dir/cmake_clean_${lang}.cmake OPTIONAL)
+endforeach()

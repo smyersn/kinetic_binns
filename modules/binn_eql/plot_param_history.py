@@ -76,18 +76,20 @@ def plot_param_history(binn_model,
 
     groups_hill_inc = defaultdict(list)
     groups_hill_dec = defaultdict(list)
-    base = n_poly_total
+    
+    current_idx = n_poly_total  # Start after all polynomials
+    
     for d in range(dup):
-        start = base + d * 2 * n_hill_single
-        inc_idxs = [start + i for i in range(n_hill_single)]
-        dec_idxs = [start + n_hill_single + i for i in range(n_hill_single)]
-        # assign inc indices
+        # 1. Assign Increasing indices for this duplicate
         for i, name in enumerate(hill_inc_names):
-            groups_hill_inc[name].append(inc_idxs[i])
-        # assign dec indices
+            groups_hill_inc[name].append(current_idx)
+            current_idx += 1
+            
+        # 2. Assign Decreasing indices for this duplicate
         for i, name in enumerate(hill_dec_names):
-            groups_hill_dec[name].append(dec_idxs[i])
-
+            groups_hill_dec[name].append(current_idx)
+            current_idx += 1
+            
     # --- selection of top terms (optional)
     def pick_top(groups, arr, K):
         keys = list(groups.keys())

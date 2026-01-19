@@ -1,6 +1,9 @@
 /development/
 /data/__pycache__/
+/modules/pbs/runs/
+/modules/pbs/gifs/
 *.pyc
 *.pt
 *.npz
 *.gif
+*.out

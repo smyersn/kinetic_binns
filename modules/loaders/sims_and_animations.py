@@ -134,18 +134,17 @@ def simulate_uvmlp(training_data, model):
 ####
 # NEW ATTEMPT 1
 ####
-
 def simulate_feql(training_data, model):
     # --- Initial Conditions ---
     dimensions = model.model.dimensions
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
-    # Get model scale
+    # 1. Get Model Scale
+    # Shape: (1, 2) -> [[s_u_max, s_v_max]]
     max_scale = model.model.max_scale.to(device)
     
     xt = training_data[:, :dimensions+1]
     times = torch.unique(xt[:, dimensions])
-    
     points_raw = torch.unique(xt[:, 0])
     points_len = len(points_raw)
     
@@ -160,7 +159,6 @@ def simulate_feql(training_data, model):
 
     # --- Parameters ---
     T = float(xt[:, dimensions].max().item())
-    # T = 10
     L = float(xt[:, 0].max().item())
 
     nx, ny = points_len, points_len
@@ -173,13 +171,13 @@ def simulate_feql(training_data, model):
         du, dv = model.model.diff_coeffs
     else:        
         with torch.no_grad():
-            du, dv = model.model.diffusion_fitter()
+            D_vals = model.model.diffusion_fitter()
+            du, dv = float(D_vals[0]), float(D_vals[1])
             
     # Create a tensor for diffusion coeffs to broadcast: shape (1, 2, 1, 1)
     D_tensor = torch.tensor([du, dv], device=device).view(1, 2, 1, 1)
 
     # --- Laplacian kernel (Grouped Conv2d) ---
-    # OPTIMIZATION 2: Grouped Convolution (2 separate channels, same kernel)
     laplace_kernel = torch.tensor([[0, 1, 0],
                                    [1, -4, 1],
                                    [0, 1, 0]], dtype=torch.float32, device=device)
@@ -208,31 +206,36 @@ def simulate_feql(training_data, model):
     u_array = torch.zeros((len(times), nx, ny, 2), device=device)
     storage_idx = 0
 
-    # This fuses the physics operations into fewer kernels
     @torch.compile 
     def physics_step(current_state):
         # 1. Diffusion
         lap_uv = conv(current_state) / (dx**2)
         
         # 2. Reaction 
+        # Permute to (Batch, H, W, Channels) -> Flatten
         state_permuted = current_state.permute(0, 2, 3, 1).contiguous()
-        uv_flat = state_permuted.view(-1, 2)
-        uv_norm = uv_flat / max_scale
+        uv_flat_phys = state_permuted.view(-1, 2)
+        
+        # --- NORMALIZATION UPDATE START ---
+        # Normalize: Physical -> [0, 1] using the model's max_scale
+        uv_flat_norm = uv_flat_phys / max_scale
         
         # Run Reaction Network
-        r_flat = reaction(uv_norm) 
+        # Output is Physical Rate because pde_loss = (ut_phys - (lap_phys + F))**2
+        r_flat_phys = reaction(uv_flat_norm) 
+        
+        # Note: I removed the extra multiplication by u_scale[0,0] because 
+        # your reaction network is trained to output physical units directly.
+        # --- NORMALIZATION UPDATE END ---
         
         # Reshape R back to grid: (1, 1, H, W)
-        r_grid = r_flat.view(1, 1, nx, ny) 
+        r_grid = r_flat_phys.view(1, 1, nx, ny) 
         
         # 3. Construct Reaction Update: [ +R, -R ]
-        # This adds R to u (channel 0) and subtracts R from v (channel 1)
         reaction_term = torch.cat([r_grid, -r_grid], dim=1) 
         
         # Euler Step
         new_state = current_state + dt * (D_tensor * lap_uv + reaction_term)
-        # print(f'current state: {current_state.shape}, uv_flat: {uv_flat.shape}, r_flat: {r_flat.shape}, r_grid: {r_grid.shape}, reaction_term: {reaction_term.shape}, new_state: {new_state.shape}')
-        # print(reaction_term[0, :, 0, 0])
         return new_state      
     
     # --- Progress Tracking Variables ---
@@ -264,7 +267,7 @@ def simulate_feql(training_data, model):
             elif t == 0:
                 print("Progress: 0%", flush=True)
 
-    return u_array.cpu(), times  
+    return u_array.cpu(), times
 
 def format_training_data_for_animation(training_data):
     # 1. Extract raw columns
