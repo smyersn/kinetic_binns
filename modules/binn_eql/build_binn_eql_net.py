@@ -53,9 +53,9 @@ class uv_MLP(nn.Module):
         return self.mlp(inputs) # Outputs [0, 1] roughly (scaled space)
 
 class F_EQL(nn.Module):
-    def __init__(self, species, duplicates, param_bounds):
+    def __init__(self, species, duplicates, param_bounds, max_scale):
         super(F_EQL, self).__init__()
-        self.eql_layer = EQLLayer(species, duplicates, param_bounds)
+        self.eql_layer = EQLLayer(species, duplicates, param_bounds, max_scale)
 
     def forward(self, x):
         return self.eql_layer(x)
@@ -124,7 +124,7 @@ class BINN(nn.Module):
             self.surface_fitter = uv_MLP(input_features=dimensions+1)
         
         # Reaction (Dimensionless Input -> Dimensionless Rate)
-        self.reaction = F_EQL(species, duplicates, self.param_bounds)
+        self.reaction = F_EQL(species, duplicates, self.param_bounds, self.max_scale)
         
         # Sampling config
         self.num_samples = 10000
@@ -234,7 +234,8 @@ class BINN(nn.Module):
         rawK_list = []
         for hm in self.reaction.eql_layer.hill.hill_modules:
             for hf in hm.hill_inc_raw + list(hm.hill_inc_cross.values()) + hm.hill_dec_raw + list(hm.hill_dec_cross.values()):
-                K_val = torch.exp(hf.raw_logK)
+                # K_val = torch.exp(hf.raw_logK)
+                K_val = torch.sigmoid(hf.raw_K) * self.param_bounds
                 rawK_list.append(K_val.view(-1))
 
         K_vals = torch.cat(rawK_list)
@@ -300,202 +301,139 @@ class BINN(nn.Module):
     
     def extract_params(self, full=True):
         """
-        Return a dict of parameter arrays on CPU (numpy) that are safe to log/plot.
-        Indexing updated to match duplicate-major [Inc, Dec] order.
+        Extracts PHYSICAL parameters.
+        Adapted for Inverse Scaling with Physical Inputs:
+        - Weights are already physical (no division needed).
+        - K is already physical (no division needed).
         """
         eql = self.reaction.eql_layer
+        
+        # 1. Get Physical Weights directly
+        # The forward pass applied constraints and scaling, so raw_w here represents 
+        # the physical rate constant bounded by [-param_bounds, param_bounds].
+        raw_w_t = (torch.tanh(eql.fc.weight[0]) * eql.param_bounds).detach()
 
-        # raw linear weights (1 x M) as tensor on device
-        raw_w_t = eql.fc.weight[0].detach()
-
-        # deterministic gate values (stretched-sigmoid proxy)
+        # 2. Get Gates
         try:
-            gates_t = eql.l0_gate.get_gates().detach()  # tensor (M,)
-        except Exception:
-            # fallback: stretched-sigmoid proxy from log_alpha
+            gates_t = eql.l0_gate.get_gates().detach()
+        except:
+            # Fallback for hard concrete gate (stretched sigmoid)
             log_alpha = eql.l0_gate.log_alpha.detach()
-            gamma = float(eql.l0_gate.gamma)
-            zeta = float(eql.l0_gate.zeta)
-            s = torch.sigmoid(log_alpha)
-            s_stretched = s * (zeta - gamma) + gamma
-            gates_t = s_stretched.clamp(0.0, 1.0)
+            gates_t = torch.sigmoid(log_alpha).clamp(0, 1)
 
-        # effective (gated) weights (tensor)
+        # 3. Effective Physical Weights
         effective_t = (raw_w_t * gates_t).detach()
-
-        # Convert main arrays to numpy (single batched transfers)
+        
+        # Convert to numpy
         raw_w = raw_w_t.cpu().numpy().reshape(-1)
         gates = gates_t.cpu().numpy().reshape(-1)
         effective = effective_t.cpu().numpy().reshape(-1)
 
-        # gather feature structure
+        # Gather structure
         num_poly = int(eql.num_poly_features)
         num_hill = int(eql.num_hill_features)
-        poly_terms, hill_terms = self.generate_terms()  # lists for single duplicate
+        poly_terms, hill_terms = self.generate_terms()
         n_hill_single = len(hill_terms)
         dup = int(self.duplicates)
-
-        # Collect raw hill parameter tensors into lists
-        raw_ns_inc_list = []
-        raw_Ks_inc_list = []
-        raw_ns_dec_list = []
-        raw_Ks_dec_list = []
+        
+        # --- EXTRACT HILL PARAMS (n, K) ---
+        # Since we feed PHYSICAL inputs (x * scale) into the HillFunction,
+        # the learned K is the Physical K. No unscaling is required.
+        
+        raw_ns_inc_list, raw_Ks_inc_list = [], []
+        raw_ns_dec_list, raw_Ks_dec_list = [], []
 
         for hill_module in eql.hill.hill_modules:
+            # Helper to extract Sigmoid n and Sigmoid K
+            def get_phys_NK(raw_n, raw_K):
+                n_val = torch.sigmoid(raw_n) * 3 + 1
+                # Standard Sigmoid K (Physical)
+                K_val = torch.sigmoid(raw_K) * eql.param_bounds
+                return n_val.item(), K_val.item()
+
+            # Iterate in the exact order of feature generation:
+            # 1. Inc Raw
             for hf in hill_module.hill_inc_raw:
-                raw_ns_inc_list.append(hf.raw_n.view(-1))
-                raw_Ks_inc_list.append(hf.raw_logK.view(-1))
+                n, k = get_phys_NK(hf.raw_n, hf.raw_K)
+                raw_ns_inc_list.append(n); raw_Ks_inc_list.append(k)
+            # 2. Inc Cross
             for key in getattr(hill_module, 'hill_inc_cross', {}):
                 hf = hill_module.hill_inc_cross[key]
-                raw_ns_inc_list.append(hf.raw_n.view(-1))
-                raw_Ks_inc_list.append(hf.raw_logK.view(-1))
-
+                n, k = get_phys_NK(hf.raw_n, hf.raw_K)
+                raw_ns_inc_list.append(n); raw_Ks_inc_list.append(k)
+            
+            # 3. Dec Raw
             for hf in hill_module.hill_dec_raw:
-                raw_ns_dec_list.append(hf.raw_n.view(-1))
-                raw_Ks_dec_list.append(hf.raw_logK.view(-1))
+                n, k = get_phys_NK(hf.raw_n, hf.raw_K)
+                raw_ns_dec_list.append(n); raw_Ks_dec_list.append(k)
+            # 4. Dec Cross
             for key in getattr(hill_module, 'hill_dec_cross', {}):
                 hf = hill_module.hill_dec_cross[key]
-                raw_ns_dec_list.append(hf.raw_n.view(-1))
-                raw_Ks_dec_list.append(hf.raw_logK.view(-1))
+                n, k = get_phys_NK(hf.raw_n, hf.raw_K)
+                raw_ns_dec_list.append(n); raw_Ks_dec_list.append(k)
 
-        # stack
-        def _stack_to_numpy(lst):
-            if len(lst) == 0:
-                return np.array([])
-            stacked = torch.cat(lst, dim=0).view(-1)
-            return stacked.detach().cpu().numpy()
+        ns_inc = np.array(raw_ns_inc_list)
+        Ks_inc = np.array(raw_Ks_inc_list)
+        ns_dec = np.array(raw_ns_dec_list)
+        Ks_dec = np.array(raw_Ks_dec_list) # Fixed typo (was Ks_inc)
+
+        # --- POLYNOMIAL COEFFICIENTS ---
+        # No unscaling needed. The weight is physical.
+        poly_coeffs_unscaled = effective[:num_poly] if num_poly > 0 else np.array([])
         
-        raw_ns_inc = _stack_to_numpy(raw_ns_inc_list)
-        raw_Ks_inc = _stack_to_numpy(raw_Ks_inc_list)
-        raw_ns_dec = _stack_to_numpy(raw_ns_dec_list)
-        raw_Ks_dec = _stack_to_numpy(raw_Ks_dec_list)
-
-        # map raw to interpretable numeric params
-        if raw_ns_inc.size:
-            ns_inc = (1 / (1 + np.exp(-raw_ns_inc))) * 3 + 1
-        else:
-            ns_inc = np.array([])
-        if raw_ns_dec.size:
-            ns_dec = (1 / (1 + np.exp(-raw_ns_dec))) * 3 + 1
-        else:
-            ns_dec = np.array([])
-
-        if raw_Ks_inc.size:
-            Ks_inc = np.exp(raw_Ks_inc)
-        else:
-            Ks_inc = np.array([])
-        if raw_Ks_dec.size:
-            Ks_dec = np.exp(raw_Ks_dec)
-        else:
-            Ks_dec = np.array([])
-
-        D_vals = None
-        if hasattr(self, 'diffusion_fitter') and self.diffusion_fitter is not None:
-            try:
-                with torch.no_grad():
-                    D_vals = self.diffusion_fitter().detach().cpu().numpy()
-            except Exception:
-                D_vals = None
-
-        s_u, s_v = self.max_scale[0, 0], self.max_scale[0, 1]
-        
-        # POLYNOMIALS
-        poly_coeffs_scaled = effective[:num_poly] if num_poly > 0 else np.array([])
-        poly_coeffs_unscaled = []
-        for term_tuple, coeff_scaled in zip(poly_terms * dup, poly_coeffs_scaled):
-            p = sum(1 for ind in term_tuple if ind == 0)
-            q = sum(1 for ind in term_tuple if ind == 1)
-            a_orig = coeff_scaled / ((s_u ** p) * (s_v ** q) + 0.0)
-            poly_coeffs_unscaled.append(a_orig.cpu().detach())
-        poly_coeffs_unscaled = np.array(poly_coeffs_unscaled)
-
-        # --- CORRECTED HILL INDEXING ---
+        # --- HILL COEFFICIENTS ---
+        # Slice the effective array into increasing/decreasing blocks for each duplicate
         hill_block = effective[num_poly : num_poly + num_hill] if num_hill > 0 else np.array([])
+        
         hill_inc_unscaled_list = []
         hill_dec_unscaled_list = []
-        
-        # Sequentially slice Inc then Dec for each duplicate to follow constructor order
         ptr = 0
+        
         for d in range(dup):
-            # 1. Increasing block for this duplicate
+            # Increasing Block
             inc_slice = hill_block[ptr : ptr + n_hill_single]
-            for (term_tuple, coeff_scaled, K_scaled, n_val) in zip(hill_terms, inc_slice, 
-                                                                Ks_inc[d*n_hill_single : (d+1)*n_hill_single], 
-                                                                ns_inc[d*n_hill_single : (d+1)*n_hill_single]):
-                n_f = float(n_val)
-                s_reg = s_u if term_tuple[0] == 0 else s_v
-                multiplier_power = 1 if len(term_tuple) > 1 else 0
-                s_mult = (s_u if term_tuple[1] == 0 else s_v) if multiplier_power else 1.0
-                b_orig = coeff_scaled / ((s_reg ** n_f) * (s_mult ** multiplier_power) + 0.0)
-                hill_inc_unscaled_list.append(float(b_orig))
+            hill_inc_unscaled_list.extend(inc_slice)
             ptr += n_hill_single
-
-            # 2. Decreasing block for this duplicate
+            
+            # Decreasing Block
             dec_slice = hill_block[ptr : ptr + n_hill_single]
-            for (term_tuple, coeff_scaled, K_scaled, n_val) in zip(hill_terms, dec_slice, 
-                                                                Ks_dec[d*n_hill_single : (d+1)*n_hill_single], 
-                                                                ns_dec[d*n_hill_single : (d+1)*n_hill_single]):
-                n_f = float(n_val)
-                s_reg = s_u if term_tuple[0] == 0 else s_v
-                multiplier_power = 1 if len(term_tuple) > 1 else 0
-                s_mult = (s_u if term_tuple[1] == 0 else s_v) if multiplier_power else 1.0
-                b_orig = coeff_scaled / ((s_reg ** n_f) * (s_mult ** multiplier_power) + 0.0)
-                hill_dec_unscaled_list.append(float(b_orig))
+            hill_dec_unscaled_list.extend(dec_slice)
             ptr += n_hill_single
 
         hill_inc_unscaled = np.array(hill_inc_unscaled_list)
         hill_dec_unscaled = np.array(hill_dec_unscaled_list)
 
-        # Ks unscaled
-        Ks_inc_unscaled = []
-        for (term_tuple, K_scaled, n_val) in zip(hill_terms * dup, Ks_inc, ns_inc):
-            s_reg = s_u if term_tuple[0] == 0 else s_v
-            Ks_inc_unscaled.append(float(K_scaled / (s_reg ** float(n_val) + 0.0)))
-        Ks_inc_unscaled = np.array(Ks_inc_unscaled)
+        # --- K VALUES ---
+        # No unscaling needed. We used physical inputs.
+        Ks_inc_unscaled = Ks_inc
+        Ks_dec_unscaled = Ks_dec
 
-        Ks_dec_unscaled = []
-        for (term_tuple, K_scaled, n_val) in zip(hill_terms * dup, Ks_dec, ns_dec):
-            s_reg = s_u if term_tuple[0] == 0 else s_v
-            Ks_dec_unscaled.append(float(K_scaled / (s_reg ** float(n_val) + 0.0)))
-        Ks_dec_unscaled = np.array(Ks_dec_unscaled)
-
-        # Build raw_w_unscaled: maintain sequential order for effective_unscaled alignment
-        raw_w_unscaled_list = []
-        if poly_coeffs_unscaled.size:
-            raw_w_unscaled_list.extend(poly_coeffs_unscaled.tolist())
-        
-        # Follow the same sequential d=0(inc, dec), d=1(inc, dec) order for the master list
-        ptr_inc, ptr_dec = 0, 0
-        for d in range(dup):
-            raw_w_unscaled_list.extend(hill_inc_unscaled[ptr_inc : ptr_inc + n_hill_single].tolist())
-            ptr_inc += n_hill_single
-            raw_w_unscaled_list.extend(hill_dec_unscaled[ptr_dec : ptr_dec + n_hill_single].tolist())
-            ptr_dec += n_hill_single
-
-        raw_w_unscaled = np.array(raw_w_unscaled_list) if len(raw_w_unscaled_list) else np.array([])
-        effective_unscaled = (raw_w_unscaled * gates)
-        # print(f'poly unscaled: {poly_coeffs_unscaled}')
-        # print(f'hill inc unscaled: {hill_inc_unscaled}')
-        # print(f'hill dec unscaled: {hill_dec_unscaled}')
-        # print(f'raw w unscaled: {raw_w_unscaled}')
-        # print(f'gates: {gates}')
-        # print(f'effective unscaled: {effective_unscaled}')
-        # print(f'effective: {effective}')
+        # --- RECONSTRUCT RAW_W_UNSCALED ---
+        # Just for consistency with other parts of your code that expect this key
+        # We reconstruct it to match the order: Poly -> (Inc -> Dec) * Duplicates
+        raw_w_unscaled = raw_w 
+        effective_unscaled = effective
 
         if not full:
-            return {'raw_w_unscaled': raw_w_unscaled, 'effective_unscaled': effective_unscaled}
+             return {'raw_w_unscaled': raw_w_unscaled, 'effective_unscaled': effective_unscaled}
 
         return {
-            'raw_w': raw_w, 'raw_w_unscaled': raw_w_unscaled, 'gates': gates,
-            'effective': effective, 'effective_unscaled': effective_unscaled,
+            'raw_w': raw_w, 
+            'raw_w_unscaled': raw_w_unscaled, 
+            'gates': gates,
+            'effective': effective, 
+            'effective_unscaled': effective_unscaled,
             'num_poly': num_poly, 'num_hill': num_hill,
-            'ns_inc': ns_inc, 'Ks_inc': Ks_inc, 'ns_dec': ns_dec, 'Ks_dec': Ks_dec,
-            'D': D_vals, 'poly_terms': poly_terms, 'hill_terms': hill_terms,
+            'ns_inc': ns_inc, 'Ks_inc': Ks_inc, 
+            'ns_dec': ns_dec, 'Ks_dec': Ks_dec,
+            'poly_terms': poly_terms, 'hill_terms': hill_terms,
             'poly_coeffs_unscaled': poly_coeffs_unscaled,
-            'hill_inc_unscaled': hill_inc_unscaled, 'hill_dec_unscaled': hill_dec_unscaled,
-            'Ks_inc_unscaled': Ks_inc_unscaled, 'Ks_dec_unscaled': Ks_dec_unscaled
+            'hill_inc_unscaled': hill_inc_unscaled, 
+            'hill_dec_unscaled': hill_dec_unscaled,
+            'Ks_inc_unscaled': Ks_inc_unscaled,
+            'Ks_dec_unscaled': Ks_dec_unscaled
         }
-                
+                        
     @torch.no_grad()
     def fine_tune_eql(self, threshold=0.01, epsilon=0.05):
         """
@@ -632,11 +570,13 @@ class BINN(nn.Module):
         with torch.no_grad():
             # Update primary module with average parameters
             hf1.raw_n.data = (hf1.raw_n.data + hf2.raw_n.data) / 2.0
-            hf1.raw_logK.data = (hf1.raw_logK.data + hf2.raw_logK.data) / 2.0
+            # hf1.raw_logK.data = (hf1.raw_logK.data + hf2.raw_logK.data) / 2.0
+            hf1.raw_logK.data = (hf1.raw_K.data + hf2.raw_K.data) / 2.0
             
             # Prune parameters of merged module
             hf2.raw_n.data.fill_(0.0)
-            hf2.raw_logK.data.fill_(0.0)
+            # hf2.raw_logK.data.fill_(0.0)
+            hf2.raw_K.data.fill_(0.0)
         
     def generate_equation(self, eps=1e-12):
         p = self.extract_params(full=True)
