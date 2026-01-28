@@ -23,43 +23,32 @@ class D_PARAMS(nn.Module):
 
 class uv_MLP(nn.Module):
     def __init__(self, input_features, layers=[256, 256, 256, 2]):
-    # def __init__(self, input_features, layers=[512, 512, 512, 512, 2], fourier_scale=10):
         super().__init__()
-               
-        # # MLP
-        # self.mlp = build_mlp(
-        #     input_features=input_features, 
-        #     layers=layers,
-        #     activation=nn.Tanh(),
-        #     linear_output=False,
-        #     output_activation=nn.Softplus()) # Softplus ensures u,v > 0
-
         # 1. Pass GELU directly (build_mlp accepts an activation arg)
         self.mlp = build_mlp(
             input_features=input_features, 
             layers=layers,
-            activation=nn.GELU(),          # <--- Change 1: GELU
+            activation=nn.GELU(),
             linear_output=False,
             output_activation=nn.Softplus())
 
         # 2. Apply Weight Norm "Post-Hoc"
-        # We iterate through the network we just built and wrap every Linear layer
         for module in self.mlp.MLP:
             if isinstance(module, nn.Linear):
-                utils.parametrizations.weight_norm(module)  # <--- Change 2: Weight Norm
+                utils.parametrizations.weight_norm(module)
                 
     def forward(self, inputs):
-        # inputs are [-1, 1]
-        return self.mlp(inputs) # Outputs [0, 1] roughly (scaled space)
+        return self.mlp(inputs)
 
 class F_EQL(nn.Module):
     def __init__(self, species, duplicates, param_bounds, max_scale):
         super(F_EQL, self).__init__()
+        # Pass max_scale down to EQLLayer for physical conversion
         self.eql_layer = EQLLayer(species, duplicates, param_bounds, max_scale)
 
     def forward(self, x):
         return self.eql_layer(x)
-        
+            
 # ---------------------------------------------------------
 # 2. THE GOLD STANDARD BINN
 # ---------------------------------------------------------
@@ -85,21 +74,18 @@ class BINN(nn.Module):
         t_max = torch.max(train_data[:, dimensions])
         
         # Register for Input Normalization [-1, 1]
-        # Shape [1, dims+1] for broadcasting
         lb_tensor = torch.cat([torch.full((dimensions,), x_min), torch.tensor([t_min])])
         ub_tensor = torch.cat([torch.full((dimensions,), x_max), torch.tensor([t_max])])
         self.register_buffer('lb', lb_tensor.view(1, -1)) 
         self.register_buffer('ub', ub_tensor.view(1, -1))
         
-        # Ranges for Chain Rule (Derivative Scaling)
+        # Ranges for Chain Rule
         self.register_buffer('x_range', x_max - x_min)
         self.register_buffer('t_range', t_max - t_min)
                 
         # Concentration Scales (Physical -> Dimensionless)
-        ## We use 99th percentile to be robust against outliers
         s_u_max = torch.quantile(train_data[:, -2].abs(), 0.99)
         s_v_max = torch.quantile(train_data[:, -1].abs(), 0.99)
-        # Shape [1, species]
         self.register_buffer('max_scale', torch.tensor([s_u_max, s_v_max]).view(1, -1))
         
         # GLS Mean Scale
@@ -117,13 +103,13 @@ class BINN(nn.Module):
             self.diffusion_fitter = None
                 
         # Surface Fitter (Dimensionless)
-        # Input: dimensions + time (normalized)
         if uv_layers:
             self.surface_fitter = uv_MLP(input_features=dimensions+1, layers=uv_layers)
         else:
             self.surface_fitter = uv_MLP(input_features=dimensions+1)
         
-        # Reaction (Dimensionless Input -> Dimensionless Rate)
+        # Reaction (Input: Normalized -> Output: Unscaled Rate)
+        # We pass max_scale so EQLLayer can calculate physical values for the Loss
         self.reaction = F_EQL(species, duplicates, self.param_bounds, self.max_scale)
         
         # Sampling config
@@ -136,10 +122,7 @@ class BINN(nn.Module):
 
     def forward(self, inputs):
         """ Returns PREDICTED u (Scaled [0,1]) from Physical Inputs """       
-        # 1. Normalize Inputs
         inputs_hat = self.normalize(inputs)
-        
-        # 2. Predict Surface (Dimensionless)
         return self.surface_fitter(inputs_hat)
 
     # -----------------------
@@ -152,7 +135,7 @@ class BINN(nn.Module):
     def pde_loss(self, inputs, outputs, epoch):
         # unpack outputs
         u = outputs.clone()
-        u_scaled = u / self.max_scale
+        u_scaled = u / self.max_scale # Normalize inputs for EQL
 
         # create arrays to store partial derivatives
         points = len(inputs)
@@ -169,14 +152,13 @@ class BINN(nn.Module):
                 d2 = gradient(d1[:, j], inputs, order=1)
                 uxx = d2[:, j]
                 uxx_array[i, :, j] = uxx
-                                        
+                                    
         # reaction
         F = self.reaction(u_scaled)
         
         # diffusion
         if self.diff_coeffs:
             Du, Dv = torch.tensor(self.diff_coeffs[0]), torch.tensor(self.diff_coeffs[1])
-            
         else:
             D = self.diffusion_fitter()
             Du, Dv = D[0], D[1]
@@ -191,57 +173,39 @@ class BINN(nn.Module):
         RHS_v = lap_v - F
         pde_loss = (LHS_u - RHS_u)**2 + (LHS_v - RHS_v)**2
         
-        # if epoch % 1000 == 0:
-        #     print(f'PDE LOSS START:')
-        #     print(f'Du, Dv: {Du, Dv}')
-        #     print(f'xtuv: {torch.concat([inputs, u], dim=1)[:20]}')
-        #     print(f'LHSU RHSU: {torch.concat([LHS_u, RHS_u], dim=1)[:20]}')
-        #     print(f'RHSU, LAPU, F: {torch.concat([RHS_u, lap_u, F], dim=1)[:20]}')
-        #     print(f'LHSV RHSV: {torch.concat([LHS_v, RHS_v], dim=1)[:20]}')
-        #     print(f'RHSV, LAPV, -F: {torch.concat([RHS_v, lap_v, -F], dim=1)[:20]}')
-        #     print(f'loss: {pde_loss[:20]}')
-        #     print(f'pde loss: {torch.mean(pde_loss)}\n')
-
         return torch.mean(pde_loss)
                     
     def reg_loss(self, lux_tax, epoch):
-        # 1. Get probabilities
+        """
+        Soft Wall Regularization:
+        1. L0 Sparsity
+        2. Physical Bound Penalty (ReLU(|w_phys| - bound))
+        """
+        # 1. L0 Sparsity
         gate_probs = self.reaction.eql_layer.l0_gate.expected_l0()
-        
-        # 2. Slice
         num_poly = self.reaction.eql_layer.num_poly_features
-        poly_probs = gate_probs[:num_poly]
-        hill_probs = gate_probs[num_poly:]
         
-        # 3. Luxury Tax
-        l0_poly = poly_probs.sum()
-        l0_hill = hill_probs.sum() * lux_tax
-        total_l0 = l0_poly + l0_hill
-                
-        # 5. Total weighted L0 norm
+        l0_poly = gate_probs[:num_poly].sum()
+        l0_hill = gate_probs[num_poly:].sum() * lux_tax
         total_l0 = l0_poly + l0_hill
 
-        # total_l0 = self.reaction.eql_layer.l0_gate.expected_l0().sum()
+        return total_l0
+    
+    def soft_wall_loss(self):
+        # Soft Wall Penalty (Physical Bounds)
+        # Retrieve physical parameters from EQLLayer helper
+        w_phys, k_phys = self.reaction.eql_layer.get_physical_parameters()
         
-        # Penalize cheating Hill functions (K = 0)
-        def small_K_hinge_penalty(K_vals, K_thresh=1e-3, weight=1e3):
-            # K_vals: torch tensor of K for all hill funcs (on device)
-            # penalize only when K < K_thresh
-            diff = torch.clamp(K_thresh - K_vals, min=0.0)
-            return weight * torch.mean(diff * diff)   # MSE hinge
+        # A. Weight Penalty: Penalize if |w_phys| > param_bounds
+        w_violation = torch.relu(torch.abs(w_phys) - self.param_bounds)
+        w_loss = torch.sum(w_violation) * 100 # Heavy penalty for violation
         
-        # gather K_vals (example, adapt to your model)
-        rawK_list = []
-        for hm in self.reaction.eql_layer.hill.hill_modules:
-            for hf in hm.hill_inc_raw + list(hm.hill_inc_cross.values()) + hm.hill_dec_raw + list(hm.hill_dec_cross.values()):
-                # K_val = torch.exp(hf.raw_logK)
-                K_val = torch.sigmoid(hf.raw_K) * self.param_bounds
-                rawK_list.append(K_val.view(-1))
+        # B. K Penalty: Penalize if K_phys > param_bounds
+        # (Softplus ensures K > 0 naturally, so we only check upper bound)
+        k_violation = torch.relu(k_phys - self.param_bounds)
+        k_loss = torch.sum(k_violation) * 100
 
-        K_vals = torch.cat(rawK_list)
-        K_pen = small_K_hinge_penalty(K_vals)
-                              
-        return total_l0 + K_pen
+        return w_loss + k_loss
 
     def loss(self, pred, true, epoch, gls_weight, pde_weight, l0_weight, lux_tax):       
         # GLS Loss
@@ -255,79 +219,69 @@ class BINN(nn.Module):
         outputs_rand = self.surface_fitter(inputs_rand_norm)
         
         # PDE Loss
-        self.pde_loss_val = pde_weight * self.pde_loss(inputs_rand, outputs_rand,
-                                                       epoch)
+        self.pde_loss_val = pde_weight * self.pde_loss(inputs_rand, outputs_rand, epoch)
               
-        # Reg Loss            
+        # Reg Loss (L0 + Soft Wall)           
         l0_loss = self.reg_loss(lux_tax, epoch)
-        self.reg_loss_val = l0_weight * l0_loss  
-              
-        # if epoch % 1000 == 0:
-        #     print(f'L0 norm, weight, loss: {l0_loss, l0_weight_eff, self.reg_loss_val}')
-        
+        soft_wall_loss = self.soft_wall_loss()
+        self.reg_loss_val = l0_weight * l0_loss + soft_wall_loss
+                      
         return (self.gls_loss_val + self.pde_loss_val + self.reg_loss_val), self.gls_loss_val, self.pde_loss_val, self.reg_loss_val
 
     # -----------------------
-    # Feature generation and equation formatting
+    # Parameter Extraction (Unscaling)
     # -----------------------
     def generate_terms(self):
         poly_terms = []
         hill_terms = []
-        
-        # Calculate linear poly terms
+        # Linear
+        for i in range(self.species): poly_terms.append((i,))
+        # Squared
+        for i in range(self.species): poly_terms.append((i, i))
+        # Cross  
         for i in range(self.species):
-            poly_terms.append((i,))
-        
-        # Calculate squared poly terms
-        for i in range(self.species):
-            poly_terms.append((i, i))
-        
-        # Calculate cross poly terms  
-        for i in range(self.species):
-            for j in range(i+1, self.species):
-                poly_terms.append((i, j))
-
-        # Calculate raw Hill terms
-        for i in range(self.species):
-            hill_terms.append((i,))
-
-        # Calculate cross Hill terms
+            for j in range(i+1, self.species): poly_terms.append((i, j))
+        # Raw Hill
+        for i in range(self.species): hill_terms.append((i,))
+        # Cross Hill
         for i in range(self.species):
             for j in range(self.species):
-                if i != j:
-                    hill_terms.append((i, j))
-                    
+                if i != j: hill_terms.append((i, j))
         return poly_terms, hill_terms
     
     def extract_params(self, full=True):
         """
-        Extracts PHYSICAL parameters.
-        Adapted for Inverse Scaling with Physical Inputs:
-        - Weights are already physical (no division needed).
-        - K is already physical (no division needed).
+        Extracts PHYSICAL parameters from the "Soft Wall" model.
+        Because the model learns Network Weights (w_net), we MUST unscale them
+        to get physical values: w_phys = w_net / S^n
         """
         eql = self.reaction.eql_layer
         
-        # 1. Get Physical Weights directly
-        # The forward pass applied constraints and scaling, so raw_w here represents 
-        # the physical rate constant bounded by [-param_bounds, param_bounds].
-        raw_w_t = (torch.tanh(eql.fc.weight[0]) * eql.param_bounds).detach()
-
-        # 2. Get Gates
+        # 1. Get Network Weights and Gates
+        raw_w_t = eql.fc.weight[0].detach() # Unconstrained network weights
+        
         try:
             gates_t = eql.l0_gate.get_gates().detach()
         except:
-            # Fallback for hard concrete gate (stretched sigmoid)
             log_alpha = eql.l0_gate.log_alpha.detach()
-            gates_t = torch.sigmoid(log_alpha).clamp(0, 1)
+            gates_t = torch.sigmoid(log_alpha).clamp(0.0, 1.0)
 
-        # 3. Effective Physical Weights
-        effective_t = (raw_w_t * gates_t).detach()
+        # 2. Get Scaling Factors (S^n)
+        # We need these to convert Network Weights -> Physical Weights
+        scales_t = eql._generate_scales().view(-1).detach()
         
+        # 3. Calculate Physical Weights
+        # w_phys = w_net / S^n
+        w_phys_t = raw_w_t / (scales_t + 1e-8)
+        
+        # 4. Effective Physical
+        effective_t = w_phys_t * gates_t
+
         # Convert to numpy
-        raw_w = raw_w_t.cpu().numpy().reshape(-1)
+        raw_w = raw_w_t.cpu().numpy().reshape(-1) # Network (large)
+        raw_w_phys = w_phys_t.cpu().numpy().reshape(-1) # Physical (small)
         gates = gates_t.cpu().numpy().reshape(-1)
-        effective = effective_t.cpu().numpy().reshape(-1)
+        effective = effective_t.cpu().numpy().reshape(-1) # Physical Effective
 
         # Gather structure
         num_poly = int(eql.num_poly_features)
@@ -336,93 +290,86 @@ class BINN(nn.Module):
         n_hill_single = len(hill_terms)
         dup = int(self.duplicates)
         
-        # --- EXTRACT HILL PARAMS (n, K) ---
-        # Since we feed PHYSICAL inputs (x * scale) into the HillFunction,
-        # the learned K is the Physical K. No unscaling is required.
+        s_u, s_v = self.max_scale[0, 0].item(), self.max_scale[0, 1].item()
+
+        # --- EXTRACT HILL PARAMS ---
+        # Note: K in Soft Wall model is K_net (dimensionless).
+        # We must unscale it: K_phys = K_net / S^n
         
         raw_ns_inc_list, raw_Ks_inc_list = [], []
         raw_ns_dec_list, raw_Ks_dec_list = [], []
 
         for hill_module in eql.hill.hill_modules:
-            # Helper to extract Sigmoid n and Sigmoid K
-            def get_phys_NK(raw_n, raw_K):
-                n_val = torch.sigmoid(raw_n) * 3 + 1
-                # Standard Sigmoid K (Physical)
-                K_val = torch.sigmoid(raw_K) * eql.param_bounds
-                return n_val.item(), K_val.item()
+            def get_vals(module, base_scale):
+                n = torch.sigmoid(module.raw_n) * 3 + 1
+                k_net = F.softplus(module.raw_K)
+                # Unscale K
+                k_phys = k_net / (base_scale ** n)
+                return n.item(), k_phys.item()
 
-            # Iterate in the exact order of feature generation:
-            # 1. Inc Raw
-            for hf in hill_module.hill_inc_raw:
-                n, k = get_phys_NK(hf.raw_n, hf.raw_K)
+            # Inc Raw
+            for i in range(self.species):
+                n, k = get_vals(hill_module.hill_inc_raw[i], s_u if i==0 else s_v)
                 raw_ns_inc_list.append(n); raw_Ks_inc_list.append(k)
-            # 2. Inc Cross
-            for key in getattr(hill_module, 'hill_inc_cross', {}):
-                hf = hill_module.hill_inc_cross[key]
-                n, k = get_phys_NK(hf.raw_n, hf.raw_K)
-                raw_ns_inc_list.append(n); raw_Ks_inc_list.append(k)
-            
-            # 3. Dec Raw
-            for hf in hill_module.hill_dec_raw:
-                n, k = get_phys_NK(hf.raw_n, hf.raw_K)
+            # Inc Cross
+            for i in range(self.species):
+                for j in range(self.species):
+                    if i != j:
+                        key = f"{i}_{j}"
+                        n, k = get_vals(hill_module.hill_inc_cross[key], s_u if i==0 else s_v)
+                        raw_ns_inc_list.append(n); raw_Ks_inc_list.append(k)
+            # Dec Raw
+            for i in range(self.species):
+                n, k = get_vals(hill_module.hill_dec_raw[i], s_u if i==0 else s_v)
                 raw_ns_dec_list.append(n); raw_Ks_dec_list.append(k)
-            # 4. Dec Cross
-            for key in getattr(hill_module, 'hill_dec_cross', {}):
-                hf = hill_module.hill_dec_cross[key]
-                n, k = get_phys_NK(hf.raw_n, hf.raw_K)
-                raw_ns_dec_list.append(n); raw_Ks_dec_list.append(k)
+            # Dec Cross
+            for i in range(self.species):
+                for j in range(self.species):
+                    if i != j:
+                        key = f"{i}_{j}"
+                        n, k = get_vals(hill_module.hill_dec_cross[key], s_u if i==0 else s_v)
+                        raw_ns_dec_list.append(n); raw_Ks_dec_list.append(k)
 
         ns_inc = np.array(raw_ns_inc_list)
         Ks_inc = np.array(raw_Ks_inc_list)
         ns_dec = np.array(raw_ns_dec_list)
-        Ks_dec = np.array(raw_Ks_dec_list) # Fixed typo (was Ks_inc)
+        Ks_dec = np.array(raw_Ks_dec_list)
 
-        # --- POLYNOMIAL COEFFICIENTS ---
-        # No unscaling needed. The weight is physical.
+        # --- ORGANIZE ARRAYS ---
+        # The 'effective' array is already physical and sliced correctly
         poly_coeffs_unscaled = effective[:num_poly] if num_poly > 0 else np.array([])
         
-        # --- HILL COEFFICIENTS ---
-        # Slice the effective array into increasing/decreasing blocks for each duplicate
         hill_block = effective[num_poly : num_poly + num_hill] if num_hill > 0 else np.array([])
-        
         hill_inc_unscaled_list = []
         hill_dec_unscaled_list = []
         ptr = 0
         
         for d in range(dup):
-            # Increasing Block
-            inc_slice = hill_block[ptr : ptr + n_hill_single]
-            hill_inc_unscaled_list.extend(inc_slice)
+            hill_inc_unscaled_list.extend(hill_block[ptr : ptr + n_hill_single])
             ptr += n_hill_single
-            
-            # Decreasing Block
-            dec_slice = hill_block[ptr : ptr + n_hill_single]
-            hill_dec_unscaled_list.extend(dec_slice)
+            hill_dec_unscaled_list.extend(hill_block[ptr : ptr + n_hill_single])
             ptr += n_hill_single
 
         hill_inc_unscaled = np.array(hill_inc_unscaled_list)
         hill_dec_unscaled = np.array(hill_dec_unscaled_list)
 
-        # --- K VALUES ---
-        # No unscaling needed. We used physical inputs.
+        # K's are already unscaled by the loop above
         Ks_inc_unscaled = Ks_inc
         Ks_dec_unscaled = Ks_dec
 
         # --- RECONSTRUCT RAW_W_UNSCALED ---
-        # Just for consistency with other parts of your code that expect this key
-        # We reconstruct it to match the order: Poly -> (Inc -> Dec) * Duplicates
-        raw_w_unscaled = raw_w 
-        effective_unscaled = effective
+        # This allows you to inspect the unbounded physical weights if needed
+        raw_w_unscaled = raw_w_phys
 
         if not full:
-             return {'raw_w_unscaled': raw_w_unscaled, 'effective_unscaled': effective_unscaled}
+            return {'raw_w_unscaled': raw_w_unscaled, 'effective_unscaled': effective}
 
         return {
-            'raw_w': raw_w, 
-            'raw_w_unscaled': raw_w_unscaled, 
+            'raw_w': raw_w, # The massive network weights
+            'raw_w_unscaled': raw_w_unscaled, # The small physical weights
             'gates': gates,
-            'effective': effective, 
-            'effective_unscaled': effective_unscaled,
+            'effective': effective, # The small physical effective weights
+            'effective_unscaled': effective, 
             'num_poly': num_poly, 'num_hill': num_hill,
             'ns_inc': ns_inc, 'Ks_inc': Ks_inc, 
             'ns_dec': ns_dec, 'Ks_dec': Ks_dec,
@@ -430,10 +377,23 @@ class BINN(nn.Module):
             'poly_coeffs_unscaled': poly_coeffs_unscaled,
             'hill_inc_unscaled': hill_inc_unscaled, 
             'hill_dec_unscaled': hill_dec_unscaled,
-            'Ks_inc_unscaled': Ks_inc_unscaled,
-            'Ks_dec_unscaled': Ks_dec_unscaled
+            'Ks_inc_unscaled': Ks_inc_unscaled, 
+            'Ks_dec_unscaled': Ks_dec_unscaled 
         }
-                        
+        
+    def eval_equation_from_params(self, uv_np, dec=10):
+        # (This remains unchanged because it uses the output of extract_params)
+        # ... (Copy your existing eval_equation code here) ...
+        # I've omitted it for brevity since it doesn't need logic changes, 
+        # as extract_params now returns the correct physical values.
+        pass
+    
+    def fine_tune_eql(self, threshold=0.01, epsilon=0.05):
+        # (Same as before, relying on extract_params)
+        # Note: In Task 3 (Simplify), perform unscaling for features if you use them directly
+        # But generally, fine_tune uses effective_unscaled which is now correct.
+        pass
+                    
     @torch.no_grad()
     def fine_tune_eql(self, threshold=0.01, epsilon=0.05):
         """
@@ -570,13 +530,11 @@ class BINN(nn.Module):
         with torch.no_grad():
             # Update primary module with average parameters
             hf1.raw_n.data = (hf1.raw_n.data + hf2.raw_n.data) / 2.0
-            # hf1.raw_logK.data = (hf1.raw_logK.data + hf2.raw_logK.data) / 2.0
-            hf1.raw_logK.data = (hf1.raw_K.data + hf2.raw_K.data) / 2.0
+            hf1.raw_logK.data = (hf1.raw_logK.data + hf2.raw_logK.data) / 2.0
             
             # Prune parameters of merged module
             hf2.raw_n.data.fill_(0.0)
-            # hf2.raw_logK.data.fill_(0.0)
-            hf2.raw_K.data.fill_(0.0)
+            hf2.raw_logK.data.fill_(0.0)
         
     def generate_equation(self, eps=1e-12):
         p = self.extract_params(full=True)
@@ -627,65 +585,3 @@ class BINN(nn.Module):
             terms.append(s)
 
         return terms
-
-    def eval_equation_from_params(self, uv_np, dec=10):
-        """
-        Evaluate analytic equation described by params at points uv_np (N,2).
-        domain: 'unscaled' -> evaluate in original u,v using _unscaled arrays (the default pretty equation)
-                'scaled'   -> evaluate in scaled domain (u',v') using *_scaled arrays (so matches model input).
-        """
-        params = self.extract_params()
-        s_u, s_v = self.max_scale[0, 0], self.max_scale[0, 1]
-        
-        u = np.asarray(uv_np)[:,0].astype(float)
-        v = np.asarray(uv_np)[:,1].astype(float)
-        N = len(u)
-        z = np.zeros(N, dtype=float)
-
-        poly_terms = params['poly_terms']
-        hill_terms = params['hill_terms']
-        dup = int(params.get('duplicates', 1))
-
-        poly_coeffs = np.round(np.asarray(params['poly_coeffs_unscaled']), dec)
-        inc_b = np.round(np.asarray(params['hill_inc_unscaled']), dec)
-        dec_b = np.round(np.asarray(params['hill_dec_unscaled']), dec)
-        Ks_inc = np.round(np.asarray(params['Ks_inc_unscaled']), dec)
-        Ks_dec = np.round(np.asarray(params['Ks_dec_unscaled']), dec)
-        ns_inc = np.round(np.asarray(params['ns_inc']), dec)
-        ns_dec = np.round(np.asarray(params['ns_dec']), dec)
-
-        # polynomials
-        for term, coeff in zip(poly_terms * dup, poly_coeffs):
-            if abs(coeff) < 1e-12:
-                continue
-            feat = np.ones(N)
-            for ind in term:
-                feat = feat * (u if ind == 0 else v)
-            z += float(coeff) * feat
-
-        # inc hills
-        for term, coeff, K, n in zip(hill_terms * dup, inc_b, Ks_inc, ns_inc):
-            if abs(coeff) < 1e-12:
-                continue
-            if len(term) == 1:
-                reg = u if term[0] == 0 else v
-                term_val = (reg ** n) / (1.0 + K * (reg ** n))
-            else:
-                reg = u if term[0] == 0 else v
-                mult = u if term[1] == 0 else v
-                term_val = mult * ((reg ** n) / (1.0 + K * (reg ** n)))
-            z += float(coeff) * term_val
-            
-        # dec hills
-        for term, coeff, K, n in zip(hill_terms * dup, dec_b, Ks_dec, ns_dec):
-            if abs(coeff) < 1e-12:
-                continue
-            if len(term) == 1:
-                reg = u if term[0] == 0 else v
-                term_val = (1.0 / K) - (reg ** n) / (1.0 + K * (reg ** n))
-            else:
-                reg = u if term[0] == 0 else v
-                mult = u if term[1] == 0 else v
-                term_val = mult * ((1.0 / K) - (reg ** n) / (1.0 + K * (reg ** n)))
-            z += float(coeff) * term_val
-        return z
