@@ -120,8 +120,27 @@ class EQLLayer(nn.Module):
         self.l0_gate = HardConcreteGate(self.total_features)
         
         # Initialize small. 
-        # Since we removed constraints, weights can grow as needed.
         nn.init.uniform_(self.fc.weight, a=-0.1, b=0.1)
+        
+        # Bias the Gates
+        self._initialize_biased_gates()
+
+    def _initialize_biased_gates(self):
+        """
+        Initializes Polynomial gates to be OPEN (high prob) 
+        and Hill gates to be CLOSED (low prob).
+        """
+        # HardConcreteGate parameter is log_alpha.
+        # log_alpha = 0.5  -> Prob ~ 0.6 (Open-ish)
+        # log_alpha = -0.5 -> Prob ~ 0.3
+        # log_alpha = -2.0 -> Prob ~ 0.1 (Closed-ish)
+        
+        with torch.no_grad():
+            # Open Polynomials
+            self.l0_gate.log_alpha[:self.num_poly_features].fill_(0.5) 
+            
+            # Close Hill Functions (Start suppressed)
+            self.l0_gate.log_alpha[self.num_poly_features:].fill_(-2.0)
         
     def forward(self, x):
         # 1. Standard Forward Pass (FAST)
@@ -219,3 +238,10 @@ class EQLLayer(nn.Module):
                     if i!=j: scales_list.append(get_scale(hm.hill_dec_cross[f"{i}_{j}"], s[i], s[j]))
 
         return torch.stack(scales_list).view(1, -1)
+    
+    def get_features(self, x):
+        poly_feats = self.poly(x)
+        hill_feats = self.hill(x)
+        features = torch.cat([poly_feats, hill_feats], dim=1)
+        
+        return features

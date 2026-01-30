@@ -109,9 +109,8 @@ class model_wrapper():
         self.param_history = {'raw_w_unscaled': [], 'effective_unscaled': [],'epoch': []}
         
         phase_1_end = 20_000
-        phase_2_end = 20_000 + int(warm_up * 0.5)
-        phase_3_end = 20_000 + int(warm_up * 1)
-        min_epochs_before_stop = 20_000 + int(warm_up * 1)
+        phase_2_end = 20_000 + int(warm_up)
+        min_epochs_before_stop = 20_000 + int(warm_up)
         last_improved = min_epochs_before_stop
       
         # loop over epochs
@@ -123,10 +122,8 @@ class model_wrapper():
                 phase = 1
             elif epoch < phase_2_end:
                 phase = 2
-            elif epoch < phase_3_end:
-                phase = 3
             else:
-                phase = 4
+                phase = 3
                 
             # Apply Freezing (Idempotent, safe to call every epoch)
             self.set_training_phase(phase)
@@ -142,11 +139,15 @@ class model_wrapper():
                 l0_weight_eff = 0.0
                 # LR Strategy: Trust the OneCycleLR Scheduler completely.
                 
-            # Phase 2: Physics On, No Reg
+            # Phase 2: Physics On, Reg Ramp
             elif phase == 2:
                 gls_weight_eff = 0.0
                 pde_weight_eff = pde_weight
-                l0_weight_eff = 0.0
+                
+                # Calculate progress through Phase 3 (0.0 to 1.0)
+                phase_duration = phase_2_end - phase_1_end
+                progress = (epoch - phase_2_end) / phase_duration
+                l0_weight_eff = progress * l0_weight
                 
                 # LR Strategy: Manual Constant (Stabilize Surface, Wake Reaction)
                 for pg in self.optimizer.param_groups:
@@ -157,27 +158,8 @@ class model_wrapper():
                     elif pg.get('name') == 'diffusion':
                         pg['lr'] = 1e-3   # Wake up!
 
-            # Phase 3: Physics On, Ramp Reg (The Selection)
+            # Phase 3: Pysics On, Max Reg
             elif phase == 3:
-                gls_weight_eff = 0.0
-                pde_weight_eff = pde_weight
-                
-                # Calculate progress through Phase 3 (0.0 to 1.0)
-                phase_duration = phase_3_end - phase_2_end
-                progress = (epoch - phase_2_end) / phase_duration
-                l0_weight_eff = progress * l0_weight
-                
-                # LR Strategy: Constant (Keep steady pressure against L0 tax)
-                for pg in self.optimizer.param_groups:
-                    if pg.get('name') == 'surface':
-                        pg['lr'] = 0.0   # Keep locked
-                    elif pg.get('name') == 'reaction':
-                        pg['lr'] = 1e-3   # Keep strong to fight Regularization
-                    elif pg.get('name') == 'diffusion':
-                        pg['lr'] = 1e-3
-
-            # Phase 4: Max Reg (The Alignment / Fine Tuning)
-            elif phase == 4:
                 gls_weight_eff = 0.0
                 pde_weight_eff = pde_weight
                 l0_weight_eff = l0_weight
