@@ -109,10 +109,10 @@ class model_wrapper():
         self.param_history = {'raw_w_unscaled': [], 'effective_unscaled': [],'epoch': []}
         
         phase_1_end = 20_000
-        phase_2_end = 20_000 + int(warm_up)
-        min_epochs_before_stop = 20_000 + int(warm_up)
-        last_improved = min_epochs_before_stop
-      
+        phase_2_end = 20_000 + int(warm_up * 0.5)
+        phase_3_end = 20_000 + int(warm_up * 1)
+        last_improved = 20_000 + int(warm_up * 1)
+              
         # loop over epochs
         for epoch in range(initial_epoch, initial_epoch + epochs):
             # -----------------------------
@@ -122,8 +122,10 @@ class model_wrapper():
                 phase = 1
             elif epoch < phase_2_end:
                 phase = 2
-            else:
+            elif epoch < phase_3_end:
                 phase = 3
+            else:
+                phase = 4
                 
             # Apply Freezing (Idempotent, safe to call every epoch)
             self.set_training_phase(phase)
@@ -139,15 +141,11 @@ class model_wrapper():
                 l0_weight_eff = 0.0
                 # LR Strategy: Trust the OneCycleLR Scheduler completely.
                 
-            # Phase 2: Physics On, Reg Ramp
+            # Phase 2: Physics On, No Reg
             elif phase == 2:
                 gls_weight_eff = 0.0
                 pde_weight_eff = pde_weight
-                
-                # Calculate progress through Phase 3 (0.0 to 1.0)
-                phase_duration = phase_2_end - phase_1_end
-                progress = (epoch - phase_2_end) / phase_duration
-                l0_weight_eff = progress * l0_weight
+                l0_weight_eff = 0.0
                 
                 # LR Strategy: Manual Constant (Stabilize Surface, Wake Reaction)
                 for pg in self.optimizer.param_groups:
@@ -158,8 +156,27 @@ class model_wrapper():
                     elif pg.get('name') == 'diffusion':
                         pg['lr'] = 1e-3   # Wake up!
 
-            # Phase 3: Pysics On, Max Reg
+            # Phase 3: Physics On, Ramp Reg (The Selection)
             elif phase == 3:
+                gls_weight_eff = 0.0
+                pde_weight_eff = pde_weight
+                
+                # Calculate progress through Phase 3 (0.0 to 1.0)
+                phase_duration = phase_3_end - phase_2_end
+                progress = (epoch - phase_2_end) / phase_duration
+                l0_weight_eff = progress * l0_weight
+                
+                # LR Strategy: Constant (Keep steady pressure against L0 tax)
+                for pg in self.optimizer.param_groups:
+                    if pg.get('name') == 'surface':
+                        pg['lr'] = 0.0   # Keep locked
+                    elif pg.get('name') == 'reaction':
+                        pg['lr'] = 1e-3   # Keep strong to fight Regularization
+                    elif pg.get('name') == 'diffusion':
+                        pg['lr'] = 1e-3
+
+            # Phase 4: Max Reg (The Alignment / Fine Tuning)
+            elif phase == 4:
                 gls_weight_eff = 0.0
                 pde_weight_eff = pde_weight
                 l0_weight_eff = l0_weight
@@ -257,21 +274,15 @@ class model_wrapper():
             self.train_loss_dict['pde'].append(np.sum(train_pde_losses) / len(train_data))
             self.train_loss_dict['reg'].append(np.sum(train_reg_losses) / len(train_data))
             
-            # if train error improved
-            rel_diff = (best_train_loss - self.train_loss_dict['loss'][-1])
-            rel_diff /= best_train_loss
-            if rel_diff > rel_save_thresh:
+            if phase == 4:
+                rel_diff = (best_train_loss - self.train_loss_dict['loss'][-1]) / best_train_loss
                 
-                # update best training loss
-                best_train_loss = self.train_loss_dict['loss'][-1]
-                
-                # optionally save model and optimizer
-                if self.save_best_train:
-                    # print(f'Pruned and saved at epoch {epoch}')
-                    # self.model.prune(thresh=prune_thresh)
-                    # self.freeze_pruned_params()
-                    self.save(self.save_name+'_best_train')
-
+                if rel_diff > rel_save_thresh:
+                    best_train_loss = self.train_loss_dict['loss'][-1]
+                    
+                    if self.save_best_train:
+                        self.save(self.save_name + '_best_train')
+                        
             # -----------------------------
             # 3. Validation Step
             # -----------------------------
@@ -326,32 +337,22 @@ class model_wrapper():
             self.val_loss_dict['reg'].append(np.sum(val_reg_losses) / len(val_data))
 
             if phase == 4:
-                # Calculate improvement relative to best SEEN IN PHASE 4
-                rel_diff = (best_val_loss - self.val_loss_dict['loss'][-1])
-                rel_diff /= best_val_loss
+                rel_diff = (best_val_loss - self.val_loss_dict['loss'][-1]) / best_val_loss
                 
-                # Check against min_epochs (just in case phase 4 started earlier)
-                if epoch >= min_epochs_before_stop:
+                if rel_diff > rel_save_thresh:
+                    best_val_loss = self.val_loss_dict['loss'][-1]
                     
-                    # 1. Did we improve?
-                    if rel_diff > rel_save_thresh:
-                        # Update best validation loss
-                        best_val_loss = self.val_loss_dict['loss'][-1]
-                        
-                        # Save checkpoint
-                        if self.save_best_val:
-                            self.save(self.save_name+'_best_val')
-                        
-                        # Reset Early Stopping Counter
-                        last_improved = epoch
+                    if self.save_best_val:
+                        self.save(self.save_name + '_best_val')
                     
-                    # 2. Should we stop?
-                    # Only triggers if we haven't improved for 'early_stopping' epochs
-                    if early_stopping is not None:
-                        if epoch - last_improved >= early_stopping:
-                            print(f"Early stopping triggered at epoch {epoch}")
-                            break  
-                                                      
+                    # Reset Early Stopping Counter
+                    last_improved = epoch
+
+                # Trigger Early Stopping (usually only in Phase 4)
+                if epoch - last_improved >= early_stopping:
+                    print(f"Early stopping triggered at epoch {epoch}")
+                    break               
+                                                           
             # update user
             elapsed, remaining, ms = time_remaining(
                 current_iter=epoch+1,

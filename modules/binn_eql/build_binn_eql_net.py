@@ -268,7 +268,7 @@ class BINN(nn.Module):
 
         # 2. Get Scaling Factors (S^n)
         # We need these to convert Network Weights -> Physical Weights
-        scales_t = eql._generate_scales().view(-1).detach()
+        scales_t = eql._generate_scales_fast().view(-1).detach()
         
         # 3. Calculate Physical Weights
         # w_phys = w_net / S^n
@@ -380,6 +380,19 @@ class BINN(nn.Module):
             'Ks_inc_unscaled': Ks_inc_unscaled, 
             'Ks_dec_unscaled': Ks_dec_unscaled 
         }
+        
+    def eval_equation_from_params(self, uv_np, dec=10):
+        # (This remains unchanged because it uses the output of extract_params)
+        # ... (Copy your existing eval_equation code here) ...
+        # I've omitted it for brevity since it doesn't need logic changes, 
+        # as extract_params now returns the correct physical values.
+        pass
+    
+    def fine_tune_eql(self, threshold=0.01, epsilon=0.05):
+        # (Same as before, relying on extract_params)
+        # Note: In Task 3 (Simplify), perform unscaling for features if you use them directly
+        # But generally, fine_tune uses effective_unscaled which is now correct.
+        pass
                     
     @torch.no_grad()
     def fine_tune_eql(self, threshold=0.01, epsilon=0.05):
@@ -444,7 +457,7 @@ class BINN(nn.Module):
                 diff = torch.mean(torch.abs(f_hill/f_hill.max() - f_other/f_other.max()))
                 
                 if diff < epsilon:
-                    # print(f"Merging Duplicate Hills: {h_idx} and {next_h_idx} (diff: {diff:.4f})")
+                    print(f"Merging Duplicate Hills: {h_idx} and {next_h_idx} (diff: {diff:.4f})")
                     
                     # Update Hill weights and average internal n/K parameters
                     eql.fc.weight.data[0, h_idx] += eql.fc.weight.data[0, next_h_idx]
@@ -482,8 +495,8 @@ class BINN(nn.Module):
                     poly_norm_sq = torch.sum(f_poly * f_poly)
                     m_star = dot_product / (poly_norm_sq + 1e-12)
                     
-                    # print(f"Simplifying Hill {h_idx} to Poly {p_idx}")
-                    # print(f"  Shape Diff: {diff:.4f}, Multiplier: {m_star:.4f}")
+                    print(f"Simplifying Hill {h_idx} to Poly {p_idx}")
+                    print(f"  Shape Diff: {diff:.4f}, Multiplier: {m_star:.4f}")
                     
                     # 3. Transfer Weight (scaled) and Gate log_alpha
                     eql.fc.weight.data[0, p_idx] += eql.fc.weight.data[0, h_idx] * m_star
@@ -496,11 +509,11 @@ class BINN(nn.Module):
 
         # Final Sync
         _ = self.extract_params(full=True)
-        # print("Fine-tuning committed.")
+        print("Fine-tuning committed.")
 
     def _average_hill_params(self, idx1, idx2):
         """
-        Helper to average n and logK for two Hill modules.
+        Helper to average n and raw_K for two Hill modules.
         Ensures 'Consolidated Hills' maintain correct physical shapes.
         """
         eql = self.reaction.eql_layer

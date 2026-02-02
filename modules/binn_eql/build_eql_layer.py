@@ -13,15 +13,15 @@ class HillFunction(nn.Module):
         self.raw_n = nn.Parameter(torch.empty(1).uniform_(-4, 4))
         
         # K is Unbounded positive (Softplus). 
-        # The Soft Wall Loss will constrain its physical value.
+        # We initialize it randomly here, but EQLLayer will overwrite it 
+        # immediately with _smart_initialize_K to prevent explosion.
         self.raw_K = nn.Parameter(torch.empty(1).uniform_(-2, 2))
 
     def forward(self, x):
         n = torch.sigmoid(self.raw_n) * 3 + 1
         
-        # Softplus ensures K > 0 but allows it to grow large (e.g. 1000)
-        # This is necessary because it takes normalized inputs (u/S)
-        # K_net ~ K_phys * S^n
+        # Softplus ensures K > 0 but allows it to grow large (e.g. 10^5)
+        # to match the inverse scaling of S^n
         K = F.softplus(self.raw_K)
         
         x_n = x.pow(n)
@@ -31,7 +31,7 @@ class HillFunction(nn.Module):
         else:
             # Epsilon for stability
             return (1 / (K + 1e-8)) - (x_n / (1 + K * x_n))
-
+        
 class PolynomialFeatures(nn.Module):
     def __init__(self, species, duplicates):
         super(PolynomialFeatures, self).__init__()
@@ -104,111 +104,101 @@ class EQLLayer(nn.Module):
         self.species = species
         self.duplicates = duplicates
         self.param_bounds = param_bounds
-        
-        # Max scale [s_u, s_v] used for physical conversion in Loss
-        self.register_buffer('max_scale', max_scale)
+        self.register_buffer('max_scale', max_scale) # [1, 2] tensor of max values
 
         self.poly = PolynomialFeatures(species, duplicates)
         self.hill = DuplicateHillFeatures(species, param_bounds, duplicates)
 
-        # Feature Counts
+        # --- Feature Counts ---
         self.num_poly_features = duplicates * (species + species + (species * (species - 1)) // 2)
-        self.num_hill_features = duplicates * 2 * (species + species * (species - 1))
+        
+        # Hill: IncRaw(N) + IncCross(N*(N-1)) + DecRaw(N) + DecCross(N*(N-1))
+        n_hill_single = (species + species * (species - 1)) * 2 
+        self.num_hill_features = duplicates * n_hill_single
+        
         self.total_features = self.num_poly_features + self.num_hill_features
                 
         self.fc = nn.Linear(self.total_features, 1, bias=False)
         self.l0_gate = HardConcreteGate(self.total_features)
         
-        # Initialize small. 
-        nn.init.uniform_(self.fc.weight, a=-0.1, b=0.1)
-        
-        # Bias the Gates
-        self._initialize_biased_gates()
-
-    def _initialize_biased_gates(self):
-        """
-        Initializes Polynomial gates to be OPEN (high prob) 
-        and Hill gates to be CLOSED (low prob).
-        """
-        # HardConcreteGate parameter is log_alpha.
-        # log_alpha = 0.5  -> Prob ~ 0.6 (Open-ish)
-        # log_alpha = -0.5 -> Prob ~ 0.3
-        # log_alpha = -2.0 -> Prob ~ 0.1 (Closed-ish)
-        
-        with torch.no_grad():
-            # Open Polynomials
-            self.l0_gate.log_alpha[:self.num_poly_features].fill_(0.5) 
+        # --- 1. FLATTEN HILL MODULES (For Speed & Indexing) ---
+        self.all_hill_funcs = []
+        for hm in self.hill.hill_modules:
+            # Order must match generation: IncRaw -> IncCross -> DecRaw -> DecCross
+            self.all_hill_funcs.extend(hm.hill_inc_raw)
+            for i in range(species):
+                for j in range(species):
+                    if i!=j: self.all_hill_funcs.append(hm.hill_inc_cross[f"{i}_{j}"])
             
-            # Close Hill Functions (Start suppressed)
-            self.l0_gate.log_alpha[self.num_poly_features:].fill_(-2.0)
-        
-    def forward(self, x):
-        # 1. Standard Forward Pass (FAST)
-        # No scaling math, no tanh. Just feature generation and dot product.
+            self.all_hill_funcs.extend(hm.hill_dec_raw)
+            for i in range(species):
+                for j in range(species):
+                    if i!=j: self.all_hill_funcs.append(hm.hill_dec_cross[f"{i}_{j}"])
+
+        # --- 2. SMART K INITIALIZATION ---
+        # Initialize K_phys in safe range [0, 10] BEFORE weights
+        # (This ensures 'n' and 'K' are set before we calculate scales for weights)
+        self._smart_initialize_K()
+
+        # --- 3. SMART WEIGHT INITIALIZATION ---
+        # Initialize w_phys in safe range [-0.1, 0.1]
+        self._smart_initialize_weights()
+
+    def forward(self, x, training=True):
+        # FAST Forward: No scaling math here.
         poly_feats = self.poly(x)
         hill_feats = self.hill(x)
         features = torch.cat([poly_feats, hill_feats], dim=1)
         
         w = self.fc.weight
-        z = self.l0_gate()
+        z = self.l0_gate() 
 
         out = (features * (w * z)).sum(dim=1, keepdim=True)
         return out
 
     def get_physical_parameters(self):
         """
-        Calculates Physical Weights and Physical K values.
-        Called by the Loss Function to enforce Soft Walls.
+        Calculates Physical Weights and K for the Loss Function.
+        Returns: w_phys (tensor), k_phys (tensor)
         """
-        # 1. Generate Scales (S^n)
-        scales = self._generate_scales()
+        # 1. Scales
+        scales = self._generate_scales_fast().view(-1)
         
-        # 2. Physical Weights = w_net / S^n
-        w_net = self.fc.weight.view(-1)
-        w_phys = w_net / (scales + 1e-8)
+        # 2. Weights: w_phys = w_net / S^n
+        w_phys = self.fc.weight.view(-1) / (scales + 1e-8)
         
-        # 3. Physical K = K_net / S^n
-        # We need to gather K_net and its corresponding scale
+        # 3. K: K_phys = K_net / S^n
         k_phys_list = []
-        
         s = self.max_scale[0]
+        N = self.species
+        ptr = 0
         
-        for hm in self.hill.hill_modules:
-            # Helper to unscale K
-            def unscale_k(module, scale_base):
-                # K_net is Softplus
-                k_net = F.softplus(module.raw_K)
-                n = torch.sigmoid(module.raw_n) * 3 + 1
-                # K_phys = K_net / S^n
-                return k_net / (scale_base ** n)
+        def unscale_k(hf, base_scale):
+            n = torch.sigmoid(hf.raw_n) * 3 + 1
+            k_net = F.softplus(hf.raw_K)
+            return (k_net / (base_scale ** n)).view(1)
 
-            # Inc Raw
-            for i in range(self.species):
-                k_phys_list.append(unscale_k(hm.hill_inc_raw[i], s[i]))
-            # Inc Cross
-            for i in range(self.species):
-                for j in range(self.species):
-                    if i!=j: 
-                        k_phys_list.append(unscale_k(hm.hill_inc_cross[f"{i}_{j}"], s[i]))
-            # Dec Raw
-            for i in range(self.species):
-                k_phys_list.append(unscale_k(hm.hill_dec_raw[i], s[i]))
-            # Dec Cross
-            for i in range(self.species):
-                for j in range(self.species):
-                    if i!=j: 
-                        k_phys_list.append(unscale_k(hm.hill_dec_cross[f"{i}_{j}"], s[i]))
+        for _ in range(self.duplicates):
+            for i in range(N): # Inc Raw
+                k_phys_list.append(unscale_k(self.all_hill_funcs[ptr], s[i])); ptr+=1
+            for i in range(N): # Inc Cross
+                for j in range(N):
+                    if i!=j: k_phys_list.append(unscale_k(self.all_hill_funcs[ptr], s[i])); ptr+=1
+            for i in range(N): # Dec Raw
+                k_phys_list.append(unscale_k(self.all_hill_funcs[ptr], s[i])); ptr+=1
+            for i in range(N): # Dec Cross
+                for j in range(N):
+                    if i!=j: k_phys_list.append(unscale_k(self.all_hill_funcs[ptr], s[i])); ptr+=1
 
-        k_phys_tensor = torch.cat([k.view(1) for k in k_phys_list])
-        
-        return w_phys, k_phys_tensor
+        k_phys = torch.cat(k_phys_list)
+        return w_phys, k_phys
 
-    def _generate_scales(self):
-        """Internal helper to generate S^n for all terms"""
+    def _generate_scales_fast(self):
+        """Generates S^n vector for all terms (Poly + Hill)."""
         s = self.max_scale[0]
         scales_list = []
 
-        # Poly Scales
+        # --- Poly Scales ---
         poly_block = []
         for i in range(self.species): poly_block.append(s[i])
         for i in range(self.species): poly_block.append(s[i]**2)
@@ -217,28 +207,74 @@ class EQLLayer(nn.Module):
         
         scales_list.extend(poly_block * self.duplicates)
 
-        # Hill Scales
-        for hm in self.hill.hill_modules:
-            # Helper to get scale
-            def get_scale(module, base_scale, mult_scale=1.0):
-                n = torch.sigmoid(module.raw_n.view(())) * 3 + 1
-                return (base_scale ** n) * mult_scale
+        # --- Hill Scales ---
+        ptr = 0
+        N = self.species
+        
+        def get_s(hf, scale_val):
+            n = torch.sigmoid(hf.raw_n.view(())) * 3 + 1
+            return (scale_val ** n)
 
-            # Inc Raw
-            for i in range(self.species): scales_list.append(get_scale(hm.hill_inc_raw[i], s[i]))
-            # Inc Cross
-            for i in range(self.species):
-                for j in range(self.species):
-                    if i!=j: scales_list.append(get_scale(hm.hill_inc_cross[f"{i}_{j}"], s[i], s[j]))
-            # Dec Raw
-            for i in range(self.species): scales_list.append(get_scale(hm.hill_dec_raw[i], s[i]))
-            # Dec Cross
-            for i in range(self.species):
-                for j in range(self.species):
-                    if i!=j: scales_list.append(get_scale(hm.hill_dec_cross[f"{i}_{j}"], s[i], s[j]))
+        for _ in range(self.duplicates):
+            for i in range(N): # Inc Raw
+                scales_list.append(get_s(self.all_hill_funcs[ptr], s[i])); ptr+=1
+            for i in range(N): # Inc Cross
+                for j in range(N):
+                    if i!=j: scales_list.append(get_s(self.all_hill_funcs[ptr], s[i]) * s[j]); ptr+=1
+            for i in range(N): # Dec Raw
+                scales_list.append(get_s(self.all_hill_funcs[ptr], s[i])); ptr+=1
+            for i in range(N): # Dec Cross
+                for j in range(N):
+                    if i!=j: scales_list.append(get_s(self.all_hill_funcs[ptr], s[i]) * s[j]); ptr+=1
 
         return torch.stack(scales_list).view(1, -1)
-    
+
+    def _smart_initialize_weights(self):
+        """Sets w_net so w_phys starts in small safe range [-0.1, 0.1]."""
+        with torch.no_grad():
+            scales = self._generate_scales_fast().view(-1)
+            target_phys = torch.empty_like(scales).uniform_(-0.1, 0.1)
+            new_net_weights = target_phys * scales
+            self.fc.weight.data[0] = new_net_weights
+
+    def _smart_initialize_K(self):
+        """Sets raw_K so K_phys starts in safe range [0, param_bounds]."""
+        s = self.max_scale[0]
+        N = self.species
+        ptr = 0
+
+        def set_k(hf, scale):
+            with torch.no_grad():
+                # target_phys is a 1D tensor [val]
+                target_phys = torch.empty(1).uniform_(0.0, self.param_bounds)
+                
+                # n is a 1D tensor [val]
+                n = torch.sigmoid(hf.raw_n) * 3 + 1
+                
+                # target_net is a 1D tensor [val]
+                target_net = target_phys * (scale ** n)
+                
+                # Inverse Softplus: log(exp(y) - 1)
+                # FIX: Use .item() to convert 1D tensor to Python float for fill_()
+                if target_net.item() > 20.0:
+                    hf.raw_K.data.fill_(target_net.item())
+                else:
+                    # Calculate value then convert to item
+                    val = torch.log(torch.exp(target_net) - 1 + 1e-9)
+                    hf.raw_K.data.fill_(val.item())
+
+        for _ in range(self.duplicates):
+            for i in range(N): # Inc Raw
+                set_k(self.all_hill_funcs[ptr], s[i]); ptr+=1
+            for i in range(N): # Inc Cross
+                for j in range(N):
+                    if i!=j: set_k(self.all_hill_funcs[ptr], s[i]); ptr+=1
+            for i in range(N): # Dec Raw
+                set_k(self.all_hill_funcs[ptr], s[i]); ptr+=1
+            for i in range(N): # Dec Cross
+                for j in range(N):
+                    if i!=j: set_k(self.all_hill_funcs[ptr], s[i]); ptr+=1
+                                                
     def get_features(self, x):
         poly_feats = self.poly(x)
         hill_feats = self.hill(x)
