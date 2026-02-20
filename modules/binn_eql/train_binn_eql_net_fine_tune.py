@@ -163,7 +163,7 @@ param_history, train_loss_dict, val_loss_dict = model.fit(
     lux_tax=lux_tax,
     batch_size=batch_size,
     epochs=epochs,
-    early_stopping=5000)
+    early_stopping=10000)
 
 generate_loss_curves(train_loss_dict, val_loss_dict, dir_name, 20, 'training_loss_curves')
 

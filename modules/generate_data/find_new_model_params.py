@@ -14,13 +14,13 @@ Du, Dv = 0.01, 1
 # --- 1. Parameters ---
 L, N = 10.0, 200
 dx = L / N
-t_final = 100.0
+t_final = 5000.0
 
 # Time step criteria for stability: dt < dx^2 / (4 * max(Du, Dv))
 # 0.05^2 / 4 = 0.000625. We use 0.0005 to be safe.
 dt = 0.0001
 n_steps = int(t_final / dt)
-total_frames = 200
+total_frames = 500
 save_every = n_steps // total_frames
 
 # --- 2. JIT-Compiled Solver Kernel ---
@@ -120,6 +120,6 @@ ani = FuncAnimation(fig, animate, frames=len(history_u), blit=True)
 
 # Use PillowWriter for GIF generation
 writer = PillowWriter(fps=10)
-gif_path = f"gifs/a_{a}_b_{b}_k_{k}.gif"
+gif_path = f"gifs/a_{a}_b_{b}_k_{k}_long.gif"
 ani.save(gif_path, writer=writer)
 plt.close()

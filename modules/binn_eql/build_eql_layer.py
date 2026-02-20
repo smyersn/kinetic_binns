@@ -140,35 +140,37 @@ class EQLLayer(nn.Module):
         # (This ensures 'n' and 'K' are set before we calculate scales for weights)
         self._smart_initialize_K()
 
-        # --- 3. SMART WEIGHT INITIALIZATION ---
-        # Initialize w_phys in safe range [-0.1, 0.1]
-        self._smart_initialize_weights()
+        # --- 3. WEIGHT INITIALIZATION ---
+        # Initialize w_phys in safe range [-1, 1]
+        nn.init.uniform_(self.fc.weight, a=-1, b=1)
 
     def forward(self, x, training=True):
-        # FAST Forward: No scaling math here.
+        # 1. Generate Features
         poly_feats = self.poly(x)
         hill_feats = self.hill(x)
         features = torch.cat([poly_feats, hill_feats], dim=1)
         
+        # 2. Get Weights and Gate
         w = self.fc.weight
         z = self.l0_gate() 
 
-        out = (features * (w * z)).sum(dim=1, keepdim=True)
+        # 3. Apply Scaling (CRITICAL FIX)
+        # We multiply by scales here so 'w' can stay small (physical magnitude)
+        # while the output matches the large physical derivatives.
+        scales = self._generate_scales_fast().view(1, -1)
+        
+        out = (features * (w * z * scales)).sum(dim=1, keepdim=True)
         return out
-
+    
     def get_physical_parameters(self):
         """
         Calculates Physical Weights and K for the Loss Function.
-        Returns: w_phys (tensor), k_phys (tensor)
         """
-        # 1. Scales
-        scales = self._generate_scales_fast().view(-1)
+        # 1. Weights: w is ALREADY physical because we scaled in forward()
+        w_phys = self.fc.weight.view(-1) 
         
-        # 2. Weights: w_phys = w_net / S^n
-        w_phys = self.fc.weight.view(-1) / (scales + 1e-8)
-        
-        # 3. K: K_phys = K_net / S^n
-        k_phys_list = []
+        # K parameters still need unscaling because HillFunction internal math hasn't changed
+        k_phys_list = []        
         s = self.max_scale[0]
         N = self.species
         ptr = 0
@@ -229,14 +231,6 @@ class EQLLayer(nn.Module):
 
         return torch.stack(scales_list).view(1, -1)
 
-    def _smart_initialize_weights(self):
-        """Sets w_net so w_phys starts in small safe range [-0.1, 0.1]."""
-        with torch.no_grad():
-            scales = self._generate_scales_fast().view(-1)
-            target_phys = torch.empty_like(scales).uniform_(-0.1, 0.1)
-            new_net_weights = target_phys * scales
-            self.fc.weight.data[0] = new_net_weights
-
     def _smart_initialize_K(self):
         """Sets raw_K so K_phys starts in safe range [0, param_bounds]."""
         s = self.max_scale[0]
@@ -245,8 +239,8 @@ class EQLLayer(nn.Module):
 
         def set_k(hf, scale):
             with torch.no_grad():
-                # target_phys is a 1D tensor [val]
-                target_phys = torch.empty(1).uniform_(0.0, self.param_bounds)
+                # target_phys is a 1D tensor [val] (can be between 0 and 1)
+                target_phys = torch.empty(1).uniform_(0.0, 1.0)
                 
                 # n is a 1D tensor [val]
                 n = torch.sigmoid(hf.raw_n) * 3 + 1
@@ -279,5 +273,6 @@ class EQLLayer(nn.Module):
         poly_feats = self.poly(x)
         hill_feats = self.hill(x)
         features = torch.cat([poly_feats, hill_feats], dim=1)
+        scales = self._generate_scales_fast().view(1, -1)
         
-        return features
+        return features * scales

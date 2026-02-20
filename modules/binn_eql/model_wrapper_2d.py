@@ -111,8 +111,9 @@ class model_wrapper():
         phase_1_end = 20_000
         phase_2_end = 20_000 + int(warm_up * 0.5)
         phase_3_end = 20_000 + int(warm_up * 1)
-        last_improved = 20_000 + int(warm_up * 1)
-              
+        min_epochs_before_stop = 20_000 + int(warm_up * 1)
+        last_improved = min_epochs_before_stop
+      
         # loop over epochs
         for epoch in range(initial_epoch, initial_epoch + epochs):
             # -----------------------------
@@ -273,18 +274,20 @@ class model_wrapper():
             self.train_loss_dict['gls'].append(np.sum(train_gls_losses) / len(train_data))
             self.train_loss_dict['pde'].append(np.sum(train_pde_losses) / len(train_data))
             self.train_loss_dict['reg'].append(np.sum(train_reg_losses) / len(train_data))
-            
+                                
             if phase == 4:
                 rel_diff = (best_train_loss - self.train_loss_dict['loss'][-1]) / best_train_loss
                 
                 if rel_diff > rel_save_thresh:
                     best_train_loss = self.train_loss_dict['loss'][-1]
+                    best_train_idx = epoch
                     
-                    if self.save_best_train:
+                    if self.save_best_val:
                         self.save(self.save_name + '_best_train')
-                        
+
+
             # -----------------------------
-            # 3. Validation Step
+            # 4. Validation Step
             # -----------------------------
             self.train = False
             self.val = True
@@ -341,6 +344,7 @@ class model_wrapper():
                 
                 if rel_diff > rel_save_thresh:
                     best_val_loss = self.val_loss_dict['loss'][-1]
+                    best_val_idx = epoch
                     
                     if self.save_best_val:
                         self.save(self.save_name + '_best_val')
@@ -352,7 +356,7 @@ class model_wrapper():
                 if epoch - last_improved >= early_stopping:
                     print(f"Early stopping triggered at epoch {epoch}")
                     break               
-                                                           
+                                                      
             # update user
             elapsed, remaining, ms = time_remaining(
                 current_iter=epoch+1,
@@ -388,14 +392,15 @@ class model_wrapper():
         
         # prints
         if self.save_best_val:
-            idx = np.argmin(self.val_loss_dict['loss'])
+            best_idx = best_val_idx
         elif self.save_best_train:
-            idx = np.argmin(self.self.train_loss_dict['loss'])
+            best_idx = best_train_idx
         else:
-            idx = -1
+            best_idx = -1
+            
         p = 'Epoch {0}'.format(epoch)
-        p += ' | Train loss = {0:1.4e}'.format(self.train_loss_dict['loss'][idx])
-        p += ' | Val loss = {0:1.4e}'.format(self.val_loss_dict['loss'][idx])
+        p += ' | Train loss = {0:1.4e}'.format(self.train_loss_dict['loss'][best_idx])
+        p += ' | Val loss = {0:1.4e}'.format(self.val_loss_dict['loss'][best_idx])
         p += ' | Elapsed = ' + elapsed + '           '
         #sys.stdout.write(p)
         print(p, flush=True)
