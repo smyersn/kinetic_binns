@@ -26,4 +26,4 @@ def generate_loss_curves(train_loss_dict, val_loss_dict, dir_name, max, file_nam
     # Show the plot
     plt.tight_layout()
 
-    plt.savefig(f'{dir_name}/{file_name}.png')
+    plt.savefig(f'{dir_name}/{file_name}')

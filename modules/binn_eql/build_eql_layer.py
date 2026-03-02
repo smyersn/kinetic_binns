@@ -159,42 +159,55 @@ class EQLLayer(nn.Module):
         # while the output matches the large physical derivatives.
         scales = self._generate_scales_fast().view(1, -1)
         
-        out = (features * (w * z * scales)).sum(dim=1, keepdim=True)
+        out = (features * (w * z)).sum(dim=1, keepdim=True)
         return out
     
-    def get_physical_parameters(self):
+    def get_physical_parameters(self, epsilon=0.2):
         """
-        Calculates Physical Weights and K for the Loss Function.
+        Calculates Physical Weights, K, and a Dynamic K-Ceiling.
+        epsilon: The minimum fraction of u_max where the half-max (Kd) can occur.
         """
-        # 1. Weights: w is ALREADY physical because we scaled in forward()
         w_phys = self.fc.weight.view(-1) 
         
-        # K parameters still need unscaling because HillFunction internal math hasn't changed
-        k_phys_list = []        
-        s = self.max_scale[0]
+        k_phys_list = []
+        k_ceiling_list = []
+        
+        s = self.max_scale[0] # This IS u_max for each species
         N = self.species
         ptr = 0
         
-        def unscale_k(hf, base_scale):
+        def get_k_and_ceiling(hf, u_max):
             n = torch.sigmoid(hf.raw_n) * 3 + 1
-            k_net = F.softplus(hf.raw_K)
-            return (k_net / (base_scale ** n)).view(1)
+            k_phys = F.softplus(hf.raw_K)
+            
+            # Dynamic Ceiling: K_max = 1 / (epsilon * u_max)^n
+            k_d_min = epsilon * (u_max + 1e-6) # 1e-6 prevents div/0
+            k_ceiling = 1.0 / (k_d_min ** n)
+            
+            return k_phys.view(1), k_ceiling.view(1)
 
         for _ in range(self.duplicates):
             for i in range(N): # Inc Raw
-                k_phys_list.append(unscale_k(self.all_hill_funcs[ptr], s[i])); ptr+=1
+                k, ceil = get_k_and_ceiling(self.all_hill_funcs[ptr], s[i]); ptr+=1
+                k_phys_list.append(k); k_ceiling_list.append(ceil)
             for i in range(N): # Inc Cross
                 for j in range(N):
-                    if i!=j: k_phys_list.append(unscale_k(self.all_hill_funcs[ptr], s[i])); ptr+=1
+                    if i!=j:
+                        k, ceil = get_k_and_ceiling(self.all_hill_funcs[ptr], s[i]); ptr+=1
+                        k_phys_list.append(k); k_ceiling_list.append(ceil)
             for i in range(N): # Dec Raw
-                k_phys_list.append(unscale_k(self.all_hill_funcs[ptr], s[i])); ptr+=1
+                k, ceil = get_k_and_ceiling(self.all_hill_funcs[ptr], s[i]); ptr+=1
+                k_phys_list.append(k); k_ceiling_list.append(ceil)
             for i in range(N): # Dec Cross
                 for j in range(N):
-                    if i!=j: k_phys_list.append(unscale_k(self.all_hill_funcs[ptr], s[i])); ptr+=1
+                    if i!=j:
+                        k, ceil = get_k_and_ceiling(self.all_hill_funcs[ptr], s[i]); ptr+=1
+                        k_phys_list.append(k); k_ceiling_list.append(ceil)
 
         k_phys = torch.cat(k_phys_list)
-        return w_phys, k_phys
-
+        k_ceilings = torch.cat(k_ceiling_list)
+        return w_phys, k_phys, k_ceilings
+    
     def _generate_scales_fast(self):
         """Generates S^n vector for all terms (Poly + Hill)."""
         s = self.max_scale[0]
@@ -232,31 +245,39 @@ class EQLLayer(nn.Module):
         return torch.stack(scales_list).view(1, -1)
 
     def _smart_initialize_K(self):
-        """Sets raw_K so K_phys starts in safe range [0, param_bounds]."""
+        """
+        Initializes raw_K so that the physical K is strictly below the dynamic ceiling.
+        """
         s = self.max_scale[0]
         N = self.species
         ptr = 0
 
         def set_k(hf, scale):
             with torch.no_grad():
-                # target_phys is a 1D tensor [val] (can be between 0 and 1)
-                target_phys = torch.empty(1).uniform_(0.0, 1.0)
-                
-                # n is a 1D tensor [val]
+                # 1. Get the currently initialized 'n'
                 n = torch.sigmoid(hf.raw_n) * 3 + 1
                 
-                # target_net is a 1D tensor [val]
-                target_net = target_phys * (scale ** n)
+                # 2. Pick a random multiplier (alpha) strictly > 1.0
+                # By forcing Kd to be 1x to 3.0x of the max physical concentration, 
+                # we guarantee the curve starts out acting like a healthy polynomial.
+                alpha = torch.empty(1).uniform_(1, 3)
+                kd_initial = alpha * (scale + 1e-6) # 1e-6 prevents div/0
                 
-                # Inverse Softplus: log(exp(y) - 1)
-                # FIX: Use .item() to convert 1D tensor to Python float for fill_()
-                if target_net.item() > 20.0:
-                    hf.raw_K.data.fill_(target_net.item())
+                # 3. Convert Kd back to the physical K our network learns
+                # K_phys = 1 / (Kd^n)
+                k_phys_target = 1.0 / (kd_initial ** n)
+                
+                # 4. Safe Inverse Softplus 
+                # (Prevents PyTorch overflow crashes if 'scale' is very tiny)
+                if k_phys_target.item() > 20.0:
+                    val = k_phys_target.item()
                 else:
-                    # Calculate value then convert to item
-                    val = torch.log(torch.exp(target_net) - 1 + 1e-9)
-                    hf.raw_K.data.fill_(val.item())
+                    val = torch.log(torch.exp(k_phys_target) - 1 + 1e-9).item()
+                
+                # 5. Overwrite the raw parameter
+                hf.raw_K.data.fill_(val)
 
+        # Apply to all Hill functions
         for _ in range(self.duplicates):
             for i in range(N): # Inc Raw
                 set_k(self.all_hill_funcs[ptr], s[i]); ptr+=1
@@ -268,7 +289,7 @@ class EQLLayer(nn.Module):
             for i in range(N): # Dec Cross
                 for j in range(N):
                     if i!=j: set_k(self.all_hill_funcs[ptr], s[i]); ptr+=1
-                                                
+                                                                                        
     def get_features(self, x):
         poly_feats = self.poly(x)
         hill_feats = self.hill(x)

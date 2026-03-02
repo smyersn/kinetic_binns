@@ -112,7 +112,11 @@ class model_wrapper():
         phase_2_end = 20_000 + int(warm_up * 0.5)
         phase_3_end = 20_000 + int(warm_up * 1)
         min_epochs_before_stop = 20_000 + int(warm_up * 1)
-        last_improved = min_epochs_before_stop
+        # phase_1_end = 2
+        # phase_2_end = 2 + int(warm_up * 0.5)
+        # phase_3_end = 2 + int(warm_up * 1)
+        # min_epochs_before_stop = 2 + int(warm_up * 1)
+        # last_improved = min_epochs_before_stop
       
         # loop over epochs
         for epoch in range(initial_epoch, initial_epoch + epochs):
@@ -141,7 +145,7 @@ class model_wrapper():
                 pde_weight_eff = 0.0
                 l0_weight_eff = 0.0
                 # LR Strategy: Trust the OneCycleLR Scheduler completely.
-                
+                                
             # Phase 2: Physics On, No Reg
             elif phase == 2:
                 gls_weight_eff = 0.0
@@ -370,6 +374,9 @@ class model_wrapper():
                 p = 'Epoch {0}'.format(epoch)
                 p += ' | Train loss = {0:1.4e}'.format(self.train_loss_dict['loss'][-1])
                 p += ' | Val loss = {0:1.4e}'.format(self.val_loss_dict['loss'][-1])
+                p += ' | Val GLS = {0:1.4e},'.format(self.val_loss_dict['gls'][-1])
+                p += ' Val PDE = {0:1.4e},'.format(self.val_loss_dict['pde'][-1])
+                p += ' Val Reg = {0:1.4e}'.format(self.val_loss_dict['reg'][-1])
                 p += ' | Remaining = ' + remaining + '           '
                 #sys.stdout.write(p)
                 print(p, flush=True)
@@ -401,6 +408,10 @@ class model_wrapper():
         p = 'Epoch {0}'.format(epoch)
         p += ' | Train loss = {0:1.4e}'.format(self.train_loss_dict['loss'][best_idx])
         p += ' | Val loss = {0:1.4e}'.format(self.val_loss_dict['loss'][best_idx])
+        p += ' | Val GLS = {0:1.4e},'.format(self.val_loss_dict['gls'][best_idx])
+        p += ' Val PDE = {0:1.4e},'.format(self.val_loss_dict['pde'][best_idx])
+        p += ' Val Reg = {0:1.4e}'.format(self.val_loss_dict['reg'][best_idx])
+
         p += ' | Elapsed = ' + elapsed + '           '
         #sys.stdout.write(p)
         print(p, flush=True)

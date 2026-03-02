@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.utils as utils
 
-from modules.binn.build_mlp import build_mlp
+from modules.binn_eql.build_mlp import build_mlp
 from modules.utils.gradient import gradient
 from modules.binn_eql.build_eql_layer import EQLLayer
 
@@ -98,7 +98,7 @@ class BINN(nn.Module):
         # ---------------------------------------------------------
         # Diffusion Fitter
         if not self.diff_coeffs:
-            self.diffusion_fitter = D_PARAMS(self.species, param_bounds)
+            self.diffusion_fitter = D_PARAMS(self.species, self.param_bounds)
         else:
             self.diffusion_fitter = None
                 
@@ -135,7 +135,7 @@ class BINN(nn.Module):
     def pde_loss(self, inputs, outputs, epoch):
         # unpack outputs
         u = outputs.clone()
-        u_scaled = u / self.max_scale # Normalize inputs for EQL
+        # u_scaled = u / self.max_scale # Normalize inputs for EQL
 
         # create arrays to store partial derivatives
         points = len(inputs)
@@ -154,7 +154,8 @@ class BINN(nn.Module):
                 uxx_array[i, :, j] = uxx
                                     
         # reaction
-        F = self.reaction(u_scaled)
+        # F = self.reaction(u_scaled)
+        F = self.reaction(u)
         
         # diffusion
         if self.diff_coeffs:
@@ -192,21 +193,22 @@ class BINN(nn.Module):
         return total_l0
     
     def soft_wall_loss(self):
-        # Soft Wall Penalty (Physical Bounds)
-        # Retrieve physical parameters from EQLLayer helper
-        w_phys, k_phys = self.reaction.eql_layer.get_physical_parameters()
+        # We pass epsilon=0.15 to ensure the curve doesn't saturate 
+        # before 15% of the physical domain.
+        w_phys, k_phys, k_ceilings = self.reaction.eql_layer.get_physical_parameters(epsilon=0.15)
         
-        # A. Weight Penalty: Penalize if |w_phys| > param_bounds
+        # A. Weight Penalty (Rates)
         w_violation = torch.relu(torch.abs(w_phys) - self.param_bounds)
-        w_loss = torch.sum(w_violation) * 100 # Heavy penalty for violation
+        w_loss = torch.sum(w_violation) * 100 
         
-        # B. K Penalty: Penalize if K_phys > param_bounds
-        # (Softplus ensures K > 0 naturally, so we only check upper bound)
-        k_violation = torch.relu(k_phys - 1)
+        # B. Dynamic K Penalty (Affinities)
+        # This actively punishes the network if it tries to push K into 
+        # the flat, saturated, gradient-dead zone.
+        k_violation = torch.relu(k_phys - k_ceilings)
         k_loss = torch.sum(k_violation) * 100
 
         return w_loss + k_loss
-
+    
     def loss(self, pred, true, epoch, gls_weight, pde_weight, l0_weight, lux_tax):       
         # GLS Loss
         self.gls_loss_val = gls_weight * self.gls_loss(pred, true)
@@ -274,7 +276,7 @@ class BINN(nn.Module):
         effective_t = w_phys_t * gates_t
 
         # 4. Get Scales (S^n) - Needed ONLY for unscaling Hill K's
-        scales_t = eql._generate_scales_fast().view(-1).detach()
+        # scales_t = eql._generate_scales_fast().view(-1).detach()
 
         # Convert to numpy for export
         raw_w = raw_w_t.cpu().numpy().reshape(-1)
@@ -301,11 +303,17 @@ class BINN(nn.Module):
         # but iterating the module list is safer for matching S_u vs S_v
         
         for hill_module in eql.hill.hill_modules:
+            # def get_vals(module, base_scale):
+            #     n = torch.sigmoid(module.raw_n) * 3 + 1
+            #     k_net = F.softplus(module.raw_K)
+            #     # Unscale K: K_phys = K_net / S^n
+            #     k_phys = k_net / (base_scale ** n)
+            #     return n.item(), k_phys.item()
+            
             def get_vals(module, base_scale):
                 n = torch.sigmoid(module.raw_n) * 3 + 1
-                k_net = F.softplus(module.raw_K)
-                # Unscale K: K_phys = K_net / S^n
-                k_phys = k_net / (base_scale ** n)
+                # K is already physical
+                k_phys = F.softplus(module.raw_K)
                 return n.item(), k_phys.item()
 
             # Inc Raw

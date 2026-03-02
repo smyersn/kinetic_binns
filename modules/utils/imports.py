@@ -9,9 +9,6 @@ import importlib
 from pathlib import Path
 
 # plotting
-import plotly.offline as pyo
-from plotly.subplots import make_subplots
-import plotly.graph_objects as go
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from mpl_toolkits.mplot3d import axes3d
@@ -25,9 +22,7 @@ import torch.autograd as autograd
 # import torchist
 
 # utils
-from modules.utils.get_lowest_gpu import *
 from modules.utils.time_remaining import *
-from modules.utils.numpy_torch_conversion import *
 from modules.utils.triangle import *
 
 # publication quality plots
