@@ -155,11 +155,11 @@ class model_wrapper():
                 # LR Strategy: Manual Constant (Stabilize Surface, Wake Reaction)
                 for pg in self.optimizer.param_groups:
                     if pg.get('name') == 'surface':
-                        pg['lr'] = 0.0   # Lock it down (Micro-adjustments only)
+                        pg['lr'] = 0.0   # Lock it down
                     elif pg.get('name') == 'reaction':
                         pg['lr'] = 1e-3   # Wake up! (Standard learning)
                     elif pg.get('name') == 'diffusion':
-                        pg['lr'] = 1e-3   # Wake up!
+                        pg['lr'] = 0   # Lock it down
 
             # Phase 3: Physics On, Ramp Reg (The Selection)
             elif phase == 3:
@@ -178,7 +178,7 @@ class model_wrapper():
                     elif pg.get('name') == 'reaction':
                         pg['lr'] = 1e-3   # Keep strong to fight Regularization
                     elif pg.get('name') == 'diffusion':
-                        pg['lr'] = 1e-3
+                        pg['lr'] = 1e-3   # Wake up diffusion
 
             # Phase 4: Max Reg (The Alignment / Fine Tuning)
             elif phase == 4:
@@ -215,7 +215,10 @@ class model_wrapper():
                 for term in self.model.generate_equation():
                     file.write(f'{term}\n')
                 file.write(f'\n')
-
+                
+                if not self.model.diff_coeffs:          
+                    file.write(f'{[D.item() for D in self.model.diffusion_fitter()]}\n')
+                    file.write(f'\n')
                 file.close()
                 
                 # Save history
@@ -286,9 +289,8 @@ class model_wrapper():
                     best_train_loss = self.train_loss_dict['loss'][-1]
                     best_train_idx = epoch
                     
-                    if self.save_best_val:
+                    if self.save_best_train:
                         self.save(self.save_name + '_best_train')
-
 
             # -----------------------------
             # 4. Validation Step

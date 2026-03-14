@@ -12,15 +12,20 @@ from modules.binn_eql.build_eql_layer import EQLLayer
 # 1. SUB-NETWORKS
 # ---------------------------------------------------------
 class D_PARAMS(nn.Module):
-    def __init__(self, input_features=2, param_bounds=10):
+    def __init__(self, input_features=2, min_val=0.01, max_val=10.0):
         super().__init__()
-        self.param_bounds = param_bounds
-        # Initialize closer to 0 for stability
-        self.raw_D = nn.Parameter(torch.empty(input_features).uniform_(-4, 0))
+        self.min_val = min_val
+        self.max_val = max_val
+        
+        # Initialize at 0.0. 
+        # sigmoid(0) = 0.5, which puts the initial D exactly 
+        # halfway between min and max in log space (e.g., D = 0.1)
+        self.raw_D = nn.Parameter(torch.zeros(input_features))
         
     def forward(self):     
-        return torch.sigmoid(self.raw_D) * self.param_bounds
-
+        s = torch.sigmoid(self.raw_D)
+        return self.min_val * (self.max_val / self.min_val) ** s
+    
 class uv_MLP(nn.Module):
     def __init__(self, input_features, layers=[256, 256, 256, 2]):
         super().__init__()
@@ -98,7 +103,7 @@ class BINN(nn.Module):
         # ---------------------------------------------------------
         # Diffusion Fitter
         if not self.diff_coeffs:
-            self.diffusion_fitter = D_PARAMS(self.species, self.param_bounds)
+            self.diffusion_fitter = D_PARAMS(self.species)
         else:
             self.diffusion_fitter = None
                 
@@ -202,13 +207,19 @@ class BINN(nn.Module):
         w_loss = torch.sum(w_violation) * 100 
         
         # B. Dynamic K Penalty (Affinities)
-        # This actively punishes the network if it tries to push K into 
-        # the flat, saturated, gradient-dead zone.
         k_violation = torch.relu(k_phys - k_ceilings)
         k_loss = torch.sum(k_violation) * 100
 
-        return w_loss + k_loss
-    
+        # C. Diffusion L2 Anchor (The Anti-Scaling Fix)
+        d_loss = 0.0
+        # if not self.diff_coeffs: # Only apply if we are actively learning D
+        #     D_phys = self.diffusion_fitter()
+        #     # Penalize the square of the physical magnitude. 
+        #     # A multiplier of 1.0 or 0.1 provides a gentle but firm downward pressure.
+        #     d_loss = torch.sum(D_phys ** 2) * 1.0 
+
+        return w_loss + k_loss + d_loss
+        
     def loss(self, pred, true, epoch, gls_weight, pde_weight, l0_weight, lux_tax):       
         # GLS Loss
         self.gls_loss_val = gls_weight * self.gls_loss(pred, true)

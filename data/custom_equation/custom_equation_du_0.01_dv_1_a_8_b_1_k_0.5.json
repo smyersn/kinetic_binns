@@ -1,0 +1,9 @@
+{
+    "save_path": "/work/users/s/m/smyersn/elston/projects/kinetics_binns/data/custom_equation",
+    "reaction": "custom_equation",
+    "du": 0.01,
+    "dv": 1,
+    "a": 8,
+    "b": 1,
+    "k": 0.5
+}

@@ -346,22 +346,64 @@ def simulate_feql(training_data, model):
 
     return u_array.cpu(), x_array.cpu(), t_array.cpu()
 
+# if __name__ == '__main__':        
+#     # Load parameters
+#     save_path = str(sys.argv[1])
+#     Du, Dv = float(sys.argv[2]), float(sys.argv[3])
+#     diff_coeffs = (Du, Dv)
+#     params = [float(sys.argv[4]), float(sys.argv[5]), float(sys.argv[6])]
+#     reaction_fn = wave_pinning
+    
+#     # Create save name
+#     save_name = f'{save_path}/du_{Du}_dv_{Dv}_a_{params[0]}_b_{params[1]}_k_{params[2]}'
+    
+#     # Simulate and animate
+#     u_array, x_array, t_array = simulate_reaction(reaction_fn, params, diff_coeffs, early_stop=True)
+#     animate_u_array(u_array, t_array, name=f'{save_name}.gif', titles=("u", "v"))
+    
+#     # Reformat to training data and save
+#     training_data = format_u_array_to_training_data(u_array, x_array, t_array)
+#     torch.save({'training_data': training_data}, f'{save_name}.pt')
+
 if __name__ == '__main__':        
-    # Load parameters
-    save_path = str(sys.argv[1])
-    Du, Dv = float(sys.argv[2]), float(sys.argv[3])
+    import json
+    
+    # 1. Load the single JSON config argument
+    config_path = str(sys.argv[1])
+    
+    with open(config_path, "r") as f:
+        config = json.load(f)
+        
+    # 2. Extract parameters from the dictionary
+    save_path = config["save_path"]
+    Du, Dv = float(config["du"]), float(config["dv"])
     diff_coeffs = (Du, Dv)
-    params = [float(sys.argv[4]), float(sys.argv[5]), float(sys.argv[6])]
-    reaction_fn = wave_pinning
     
-    # Create save name
-    save_name = f'{save_path}/du_{Du}_dv_{Dv}_a_{params[0]}_b_{params[1]}_k_{params[2]}'
+    a, b, k = float(config["a"]), float(config["b"]), float(config["k"])
+    params = [a, b, k]
     
-    # Simulate and animate
-    u_array, x_array, t_array = simulate_reaction(reaction_fn, params, diff_coeffs, early_stop=True)
+    # 3. Dynamically map the reaction string to the imported function
+    reaction_str = config["reaction"]
+    if reaction_str == "wave_pinning":
+        reaction_fn = wave_pinning
+    elif reaction_str == "turing_type":
+        reaction_fn = turing_type
+    elif reaction_str == "custom_equation":
+        reaction_fn = custom_equation
+    else:
+        raise ValueError(f"Unknown reaction function specified: {reaction_str}")
+    
+    # 4. Create save name (matching your original format)
+    save_name = f'{save_path}/du_{Du}_dv_{Dv}_a_{a}_b_{b}_k_{k}'
+    
+    print(f"Starting simulation for: {save_name}", flush=True)
+    
+    # 5. Simulate and animate
+    u_array, x_array, t_array = simulate_reaction_cpu(reaction_fn, params, diff_coeffs, early_stop=False)
     animate_u_array(u_array, t_array, name=f'{save_name}.gif', titles=("u", "v"))
     
-    # Reformat to training data and save
+    # 6. Reformat to training data and save
     training_data = format_u_array_to_training_data(u_array, x_array, t_array)
     torch.save({'training_data': training_data}, f'{save_name}.pt')
     
+    print(f"Successfully saved data to {save_name}.pt", flush=True)    

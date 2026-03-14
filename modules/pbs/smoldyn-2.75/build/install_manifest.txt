@@ -1,6 +1,0 @@
-/nas/longleaf/home/smyersn/software/smoldyn_install/bin/smoldyn
-/nas/longleaf/home/smyersn/software/smoldyn_install/lib/libsmoldyn_shared.so
-/nas/longleaf/home/smyersn/software/smoldyn_install/lib/libsmoldyn_static.a
-/nas/longleaf/home/smyersn/software/smoldyn_install/include/libsmoldyn.h
-/nas/longleaf/home/smyersn/software/smoldyn_install/include/smoldyn.h
-/nas/longleaf/home/smyersn/software/smoldyn_install/include/smoldynconfigure.h
