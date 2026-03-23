@@ -248,18 +248,18 @@ class model_wrapper():
                                     
                 # require gradients
                 # x_true.requires_grad = True
-                
-                # run the model
-                y_pred = self.model(x_true)
-                                    
-                # compute loss and optional regularization
-                train_loss, train_gls_loss, train_pde_loss, train_reg_loss = self.loss(y_pred, 
-                                                                                       y_true, 
-                                                                                       epoch,
-                                                                                       gls_weight_eff,
-                                                                                       pde_weight_eff,
-                                                                                       l0_weight_eff,
-                                                                                       lux_tax)
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    # run the model
+                    y_pred = self.model(x_true)
+                                        
+                    # compute loss and optional regularization
+                    train_loss, train_gls_loss, train_pde_loss, train_reg_loss = self.loss(y_pred, 
+                                                                                        y_true, 
+                                                                                        epoch,
+                                                                                        gls_weight_eff,
+                                                                                        pde_weight_eff,
+                                                                                        l0_weight_eff,
+                                                                                        lux_tax)
                                                                             
                 # compute backward pass and update weights
                 train_loss.backward()
@@ -321,18 +321,18 @@ class model_wrapper():
                                                 
                 # require gradients
                 # x_true.requires_grad = True
-                                
-                # run the model
-                y_pred = self.model(x_true)
-                
-                # comptue loss
-                val_loss, val_gls_loss, val_pde_loss, val_reg_loss = self.loss(y_pred,
-                                                                               y_true,
-                                                                               epoch,
-                                                                               gls_weight_eff,
-                                                                               pde_weight_eff,
-                                                                               l0_weight_eff,
-                                                                               lux_tax)
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    # run the model
+                    y_pred = self.model(x_true)
+                    
+                    # comptue loss
+                    val_loss, val_gls_loss, val_pde_loss, val_reg_loss = self.loss(y_pred,
+                                                                                y_true,
+                                                                                epoch,
+                                                                                gls_weight_eff,
+                                                                                pde_weight_eff,
+                                                                                l0_weight_eff,
+                                                                                lux_tax)
                 
                 val_losses += val_loss.item() * len(x_true)
                 val_gls_losses += val_gls_loss.item() * len(x_true)

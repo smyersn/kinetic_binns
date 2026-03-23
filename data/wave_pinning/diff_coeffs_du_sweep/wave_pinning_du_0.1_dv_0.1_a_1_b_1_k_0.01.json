@@ -1,0 +1,9 @@
+{
+    "save_path": "/hpc/home/nsmyers1/projects/kinetic_binns/data/wave_pinning/diff_coeffs_du_sweep",
+    "reaction": "wave_pinning",
+    "du": 0.1,
+    "dv": 0.1,
+    "a": 1,
+    "b": 1,
+    "k": 0.01
+}

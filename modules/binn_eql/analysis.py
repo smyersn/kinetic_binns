@@ -56,8 +56,8 @@ reaction = reaction_map[config['reaction']]
 epochs = 100_000
 
 # Get GPU
-# device = 'cpu'
-device = 'cuda'
+device = 'cpu'
+# device = 'cuda'
 
 # Load training data (columns: x*dimensions, t, species concentrations)
 training_data = torch.load(training_data_path)['training_data']
@@ -131,21 +131,21 @@ model = model_wrapper(
     dir_name=dir_name,
     save_name=f'{dir_name}/binn')
 
-# train jointly
-param_history, train_loss_dict, val_loss_dict = model.fit(
-    train_data=train_data,
-    val_data=val_data,
-    pde_weight=pde_weight,
-    l0_weight=l0_weight,
-    warm_up=warm_up,
-    lux_tax=lux_tax,
-    batch_size=batch_size,
-    epochs=epochs,
-    early_stopping=5000)
+# # train jointly
+# param_history, train_loss_dict, val_loss_dict = model.fit(
+#     train_data=train_data,
+#     val_data=val_data,
+#     pde_weight=pde_weight,
+#     l0_weight=l0_weight,
+#     warm_up=warm_up,
+#     lux_tax=lux_tax,
+#     batch_size=batch_size,
+#     epochs=epochs,
+#     early_stopping=5000)
 
-generate_loss_curves(train_loss_dict, val_loss_dict, dir_name, 20, 'training_loss_curves.png')
+# generate_loss_curves(train_loss_dict, val_loss_dict, dir_name, 20, 'training_loss_curves.png')
 
-plot_param_history(binn, param_history, f"{dir_name}/param_history.png")
+# plot_param_history(binn, param_history, f"{dir_name}/param_history.png")
 
 # Load model and print equation
 model.load(f"{dir_name}/binn_best_val_model", device=device)

@@ -26,5 +26,5 @@ from modules.utils.time_remaining import *
 from modules.utils.triangle import *
 
 # publication quality plots
-from IPython.display import set_matplotlib_formats
-set_matplotlib_formats('png', 'pdf') # plt.savefig('name.pdf', format='pdf')
+# from IPython.display import set_matplotlib_formats
+# set_matplotlib_formats('png', 'pdf') # plt.savefig('name.pdf', format='pdf')

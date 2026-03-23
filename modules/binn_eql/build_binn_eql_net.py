@@ -46,10 +46,10 @@ class uv_MLP(nn.Module):
         return self.mlp(inputs)
 
 class F_EQL(nn.Module):
-    def __init__(self, species, duplicates, param_bounds, max_scale):
+    def __init__(self, species, duplicates, param_bounds, max_scale, degree):
         super(F_EQL, self).__init__()
         # Pass max_scale down to EQLLayer for physical conversion
-        self.eql_layer = EQLLayer(species, duplicates, param_bounds, max_scale)
+        self.eql_layer = EQLLayer(species, duplicates, param_bounds, max_scale, degree)
 
     def forward(self, x):
         return self.eql_layer(x)
@@ -68,6 +68,7 @@ class BINN(nn.Module):
         self.duplicates = duplicates
         self.diff_coeffs = diff_coeffs
         self.param_bounds = param_bounds
+        self.degree = degree
 
         # ---------------------------------------------------------
         # A. REGISTER BOUNDS & SCALES (Buffers)
@@ -115,12 +116,12 @@ class BINN(nn.Module):
         
         # Reaction (Input: Normalized -> Output: Unscaled Rate)
         # We pass max_scale so EQLLayer can calculate physical values for the Loss
-        self.reaction = F_EQL(species, duplicates, self.param_bounds, self.max_scale)
+        self.reaction = F_EQL(species, duplicates, self.param_bounds, self.max_scale, self.degree)
         
         # Sampling config
         self.num_samples = 10000
         self.name = 'Dumlp_Dvmlp_Fmlp'
-
+        
     def normalize(self, inputs):
         """ Maps Physical [lb, ub] -> Dimensionless [-1, 1] """
         return 2.0 * (inputs - self.lb) / (self.ub - self.lb) - 1.0
@@ -180,7 +181,7 @@ class BINN(nn.Module):
         pde_loss = (LHS_u - RHS_u)**2 + (LHS_v - RHS_v)**2
         
         return torch.mean(pde_loss)
-                    
+                        
     def reg_loss(self, lux_tax, epoch):
         """
         Soft Wall Regularization:
@@ -230,7 +231,7 @@ class BINN(nn.Module):
         inputs_rand = torch.cat([x, t], dim=1).requires_grad_()
         inputs_rand_norm = self.normalize(inputs_rand)
         outputs_rand = self.surface_fitter(inputs_rand_norm)
-        
+             
         # PDE Loss
         self.pde_loss_val = pde_weight * self.pde_loss(inputs_rand, outputs_rand, epoch)
               
@@ -399,123 +400,7 @@ class BINN(nn.Module):
             'Ks_dec_unscaled': Ks_dec_unscaled 
         }
                                     
-    @torch.no_grad()
-    # def fine_tune_eql(self, threshold=0.01, epsilon=0.05):
-    #     """
-    #     Fine-tunes the discovered EQL equation.
-    #     Sequence: Zeroing -> Poly Merging -> Hill Merging/Averaging -> Poly Simplification.
-    #     """
-    #     eql = self.reaction.eql_layer
-    #     device = eql.fc.weight.device
-        
-    #     # 1. EVALUATION DATA (Standard Normalized Range)
-    #     u_norm = self.train_data[:, -2:-1].to(device) / self.max_scale[0, 0]
-    #     v_norm = self.train_data[:, -1:].to(device) / self.max_scale[0, 1]
-    #     uv_norm = torch.cat([u_norm, v_norm], dim=1)
-        
-    #     # 2. ALIGNED FEATURES: Sequential Duplicate-Major [Poly, Inc, Dec]
-    #     features = eql.get_features(uv_norm) 
-        
-    #     # --- TASK 1: ZEROING (Pruning Noise) ---
-    #     params = self.extract_params(full=True)
-    #     eff_unscaled = torch.tensor(params['effective_unscaled'], device=device)
-        
-    #     # Identify terms that contribute less than the threshold to the physical rate
-    #     small_mask = torch.abs(eff_unscaled) < threshold
-    #     eql.fc.weight.data[0, small_mask] = 0.0
-    #     eql.l0_gate.log_alpha.data[small_mask] = -10.0 # Lock gate shut
-
-    #     # Refresh params after pruning
-    #     params = self.extract_params(full=True)
-    #     num_poly = eql.num_poly_features
-    #     num_hill = eql.num_hill_features
-    #     n_poly_single = num_poly // self.duplicates
-    #     n_hill_single = len(params['hill_terms'])
-
-    #     # --- TASK 2: COMBINE DUPLICATE POLYNOMIALS ---
-    #     for i in range(n_poly_single):
-    #         indices = [i + j * n_poly_single for j in range(self.duplicates)]
-    #         primary = indices[0]
-    #         for other in indices[1:]:
-    #             if torch.abs(eql.fc.weight.data[0, other]) < 1e-8: continue
-    #             eql.fc.weight.data[0, primary] += eql.fc.weight.data[0, other]
-    #             eql.fc.weight.data[0, other] = 0.0
-    #             # Transfer gate importance
-    #             eql.l0_gate.log_alpha.data[primary] = torch.max(
-    #                 eql.l0_gate.log_alpha.data[primary], 
-    #                 eql.l0_gate.log_alpha.data[other]
-    #             )
-    #             eql.l0_gate.log_alpha.data[other] = -10.0
-
-    #     # --- TASK 3A: MERGE DUPLICATE HILLS (With Parameter Averaging) ---
-    #     for i in range(num_hill):
-    #         h_idx = num_poly + i
-    #         if torch.abs(eql.fc.weight.data[0, h_idx]) < 1e-8: continue
-            
-    #         f_hill = features[:, h_idx]
-            
-    #         for next_h_idx in range(h_idx + 1, num_poly + num_hill):
-    #             if torch.abs(eql.fc.weight.data[0, next_h_idx]) < 1e-8: continue
-                
-    #             f_other = features[:, next_h_idx]
-    #             # Shape-only check (Normalized)
-    #             diff = torch.mean(torch.abs(f_hill/f_hill.max() - f_other/f_other.max()))
-                
-    #             if diff < epsilon:
-    #                 print(f"Merging Duplicate Hills: {h_idx} and {next_h_idx} (diff: {diff:.4f})")
-                    
-    #                 # Update Hill weights and average internal n/K parameters
-    #                 eql.fc.weight.data[0, h_idx] += eql.fc.weight.data[0, next_h_idx]
-    #                 eql.fc.weight.data[0, next_h_idx] = 0.0
-                    
-    #                 self._average_hill_params(h_idx - num_poly, next_h_idx - num_poly)
-                    
-    #                 # Consolidate Gate
-    #                 eql.l0_gate.log_alpha.data[h_idx] = torch.max(
-    #                     eql.l0_gate.log_alpha.data[h_idx], 
-    #                     eql.l0_gate.log_alpha.data[next_h_idx]
-    #                 )
-    #                 eql.l0_gate.log_alpha.data[next_h_idx] = -10.0
-
-    #     # --- TASK 3B: SIMPLIFY TO POLYNOMIALS (With Least-Squares Optimization) ---
-    #     # Refresh params again to get updated n/K values for projection math
-    #     params = self.extract_params(full=True)
-        
-    #     for i in range(num_hill):
-    #         h_idx = num_poly + i
-    #         if torch.abs(eql.fc.weight.data[0, h_idx]) < 1e-8: continue
-            
-    #         f_hill = features[:, h_idx]
-            
-    #         for p_idx in range(num_poly):
-    #             f_poly = features[:, p_idx]
-                
-    #             # 1. Gatekeeper: Shape Similarity (Normalized)
-    #             diff = torch.mean(torch.abs(f_hill/f_hill.max() - f_poly/f_poly.max()))
-                
-    #             if diff < epsilon:
-    #                 # 2. Optimization: Find optimal weight multiplier m*
-    #                 # m* = dot(f_hill, f_poly) / norm(f_poly)^2
-    #                 dot_product = torch.sum(f_hill * f_poly)
-    #                 poly_norm_sq = torch.sum(f_poly * f_poly)
-    #                 m_star = dot_product / (poly_norm_sq + 1e-12)
-                    
-    #                 print(f"Simplifying Hill {h_idx} to Poly {p_idx}")
-    #                 print(f"  Shape Diff: {diff:.4f}, Multiplier: {m_star:.4f}")
-                    
-    #                 # 3. Transfer Weight (scaled) and Gate log_alpha
-    #                 eql.fc.weight.data[0, p_idx] += eql.fc.weight.data[0, h_idx] * m_star
-    #                 eql.l0_gate.log_alpha.data[p_idx] = eql.l0_gate.log_alpha.data[h_idx].clone()
-                    
-    #                 # 4. Kill Hill
-    #                 eql.fc.weight.data[0, h_idx] = 0.0
-    #                 eql.l0_gate.log_alpha.data[h_idx] = -10.0
-    #                 break
-
-    #     # Final Sync
-    #     _ = self.extract_params(full=True)
-    #     print("Fine-tuning committed.")
-    
+    @torch.no_grad()    
     def fine_tune_eql(self, threshold=0.01, epsilon=0.05):
         """
         Fine-tunes the discovered EQL equation.

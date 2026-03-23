@@ -1,3 +1,4 @@
+import itertools
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -33,24 +34,37 @@ class HillFunction(nn.Module):
             return (1 / (K + 1e-8)) - (x_n / (1 + K * x_n))
         
 class PolynomialFeatures(nn.Module):
-    def __init__(self, species, duplicates):
+    def __init__(self, species, duplicates, degree):
         super(PolynomialFeatures, self).__init__()
         self.species = species
         self.duplicates = duplicates
+        self.degree = degree
+        self.powers = self._generate_powers()
+
+    def _generate_powers(self):
+        """Generates all combinations of powers where 1 <= sum <= degree"""
+        powers = []
+        for p in itertools.product(range(self.degree + 1), repeat=self.species):
+            if 1 <= sum(p) <= self.degree:
+                powers.append(p)
+        
+        # Sort by total degree first, then descending order of first species power
+        # This keeps the output clean: u, v, u^2, uv, v^2, u^3...
+        powers.sort(key=lambda x: (sum(x), tuple(-power for power in x)))
+        return powers
 
     def forward(self, x):
-        features = [x]                  # linear terms
-        features.append(x**2)           # squared terms
-        
-        cross_terms = []
-        for i in range(self.species):
-            for j in range(i+1, self.species):
-                cross_terms.append((x[:, i:i+1] * x[:, j:j+1]))
-        if cross_terms:
-            features.append(torch.cat(cross_terms, dim=1))
+        features = []
+        for p in self.powers:
+            # Start with a column of 1s
+            term = torch.ones((x.shape[0], 1), device=x.device, dtype=x.dtype)
+            for i, power in enumerate(p):
+                if power > 0:
+                    term = term * (x[:, i:i+1] ** power)
+            features.append(term)
             
         return torch.cat(features * self.duplicates, dim=1)
-
+    
 class HillFeatures(nn.Module):
     def __init__(self, species, param_bounds):
         super(HillFeatures, self).__init__()
@@ -99,18 +113,19 @@ class DuplicateHillFeatures(nn.Module):
     
 # EQL Layer that combines polynomial and hill features.
 class EQLLayer(nn.Module):
-    def __init__(self, species, duplicates, param_bounds, max_scale):
+    def __init__(self, species, duplicates, param_bounds, max_scale, degree):
         super(EQLLayer, self).__init__()
         self.species = species
         self.duplicates = duplicates
         self.param_bounds = param_bounds
+        self.degree = degree
         self.register_buffer('max_scale', max_scale) # [1, 2] tensor of max values
 
-        self.poly = PolynomialFeatures(species, duplicates)
+        self.poly = PolynomialFeatures(species, duplicates, degree)
         self.hill = DuplicateHillFeatures(species, param_bounds, duplicates)
-
+        
         # --- Feature Counts ---
-        self.num_poly_features = duplicates * (species + species + (species * (species - 1)) // 2)
+        self.num_poly_features = duplicates * len(self.poly.powers)
         
         # Hill: IncRaw(N) + IncCross(N*(N-1)) + DecRaw(N) + DecCross(N*(N-1))
         n_hill_single = (species + species * (species - 1)) * 2 
@@ -209,19 +224,19 @@ class EQLLayer(nn.Module):
         return w_phys, k_phys, k_ceilings
     
     def _generate_scales_fast(self):
-        """Generates S^n vector for all terms (Poly + Hill)."""
         s = self.max_scale[0]
         scales_list = []
 
-        # --- Poly Scales ---
+        # --- Dynamic Poly Scales ---
         poly_block = []
-        for i in range(self.species): poly_block.append(s[i])
-        for i in range(self.species): poly_block.append(s[i]**2)
-        for i in range(self.species):
-            for j in range(i+1, self.species): poly_block.append(s[i]*s[j])
+        for p in self.poly.powers:
+            val = 1.0
+            for i, power in enumerate(p):
+                if power > 0:
+                    val *= (s[i] ** power)
+            poly_block.append(val)
         
         scales_list.extend(poly_block * self.duplicates)
-
         # --- Hill Scales ---
         ptr = 0
         N = self.species

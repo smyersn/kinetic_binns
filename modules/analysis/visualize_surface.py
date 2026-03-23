@@ -10,8 +10,6 @@ sys.path.append(repo_start)
 
 from modules.utils.triangle import lltriangle
 
-
-
 def plot_surfaces(model_dir, u_triangle_mesh, v_triangle_mesh, F_true,
                   F_mlp, filename=None):
     fig = make_subplots(rows=1, cols=2,
@@ -72,8 +70,6 @@ def plot_surfaces(model_dir, u_triangle_mesh, v_triangle_mesh, F_true,
         scene2=scene_dict)
 
     fig.update_coloraxes(showscale=False)
-
-    fig.show()
     
     if filename:
         fig.write_image(f'{model_dir}/{filename}.png')

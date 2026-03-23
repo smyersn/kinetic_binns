@@ -189,7 +189,7 @@ def simulate_reaction_cpu(reaction, params, diff_coeffs, early_stop=True):
         if t % (nits // 10) == 0 and t > 0:
             print(f"Progress: {(t / nits) * 100:.0f}%", flush=True)  
             
-    return u_array, x_array, t_array
+    return torch.tensor(u_array), torch.tensor(x_array), torch.tensor(t_array)
 
 def simulate_uvmlp(training_data, model):
     # --- Initial Conditions ---

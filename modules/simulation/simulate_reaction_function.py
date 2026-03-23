@@ -9,18 +9,28 @@ from pathlib import Path
 # "combinations": Tests every possible combination of the lists below.
 # "lockstep": Pairs parameters directly (index 0 with index 0, etc.).
 #             *Note: In lockstep mode, ALL lists must be the exact same length!
-ITERATION_MODE = "lockstep" 
+ITERATION_MODE = "combinations" 
 # ==========================================
 
-# 1. Define parameter space
-save_path = "/work/users/s/m/smyersn/elston/projects/kinetics_binns/data/custom_equation"
+# # 1. Define parameter space
+# save_path = "/work/users/s/m/smyersn/elston/projects/kinetics_binns/data/custom_equation"
 
-reactions = ["custom_equation", "custom_equation", "custom_equation", "custom_equation"]
-dus = [0.01, 0.01, 0.01, 0.01]
-dvs = [1, 1, 1, 1]
-a_params = [1, 4, 8, 8] 
-b_params = [1, 4, 1, 4]
-k_params = [0.1, 0.05, 0.5, 0.05]
+# reactions = ["custom_equation", "custom_equation", "custom_equation", "custom_equation"]
+# dus = [0.01, 0.01, 0.01, 0.01]
+# dvs = [1, 1, 1, 1]
+# a_params = [1, 4, 8, 8] 
+# b_params = [1, 4, 1, 4]
+# k_params = [0.1, 0.05, 0.5, 0.05]
+
+# 1. Define parameter space
+save_path = "/hpc/home/nsmyers1/projects/kinetic_binns/data/wave_pinning/diff_coeffs_du_sweep"
+
+reactions = ["wave_pinning"]
+dus = [0.01, 0.025, 0.05, 0.1]
+dvs = [0.1, 1, 10]
+a_params = [1] 
+b_params = [1]
+k_params = [0.01]
 
 # Make sure the target data directory exists
 os.makedirs(save_path, exist_ok=True)
@@ -88,7 +98,7 @@ for combo in combo_generator:
     
     # CPU Alternative
     sbatch_cmd = [
-        "sbatch", "-p", "general", "-N", "1", "-n", "1", 
+        "sbatch", "-p", "common", "-N", "1", "-n", "1", 
         "--cpus-per-task=4", "--mem=16g", "-t", "12:00:00", 
         f"--output={out_file}",
         f"--wrap={wrap_command}"
