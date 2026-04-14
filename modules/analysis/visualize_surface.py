@@ -43,6 +43,7 @@ def plot_surfaces(model_dir, u_triangle_mesh, v_triangle_mesh, F_true,
         row=1, col=2)
 
     scene_dict = dict(
+        aspectmode='cube', # Forces the 3D bounding box to be a perfect cube
         xaxis_title='[u] (uM)',
         yaxis_title='[v] (uM)',
         zaxis_title='F',
@@ -61,16 +62,17 @@ def plot_surfaces(model_dir, u_triangle_mesh, v_triangle_mesh, F_true,
             range=[-1.5, 11]),
         camera=dict(eye=dict(x=1, y=-2.5, z=1)))
 
+    # 1. Update the overall figure layout (Remove scene and scene2 from here)
     fig.update_layout(autosize=True,
         width=1600, 
         height=800,
-        font=dict(color = '#000000',
-                size=20),     
-        scene=scene_dict,              
-        scene2=scene_dict)
+        font=dict(color = '#000000', size=20))
+        
+    # 2. Safely apply the scene dictionary to all 3D subplots
+    fig.update_scenes(**scene_dict)
 
     fig.update_coloraxes(showscale=False)
-    
+        
     if filename:
         fig.write_image(f'{model_dir}/{filename}.png')
 

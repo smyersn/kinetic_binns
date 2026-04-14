@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.lines as mlines
 from collections import defaultdict
-# epoch_arr = np.array(param_history['epoch'])
+import os
 
 def plot_param_history(binn_model,
                        param_history,
@@ -16,6 +16,7 @@ def plot_param_history(binn_model,
     Fixed 2x2 plotting: left column polynomials, right column hills.
     - increasing and decreasing hill terms are handled separately (no mixing).
     - legend order follows the colormap native order (for discrete colormaps like Set1).
+    - Creates a supplementary figure for diffusion coefficient convergence.
     """
     # --- load arrays
     if 'raw_w_unscaled' in param_history:
@@ -118,7 +119,9 @@ def plot_param_history(binn_model,
         palette = palette[:N]
     color_map = {name: palette[i] for i, name in enumerate(combined_names)}
 
-    # --- plotting
+    # ==========================================
+    # --- PLOTTING FIGURE 1: Reaction Terms
+    # ==========================================
     fig, axes = plt.subplots(2, 2, figsize=figsize, sharex=True)
     ax_raw_poly, ax_raw_hill = axes[0,0], axes[0,1]
     ax_eff_poly, ax_eff_hill = axes[1,0], axes[1,1]
@@ -143,7 +146,7 @@ def plot_param_history(binn_model,
 
     # raw polynomials (left top)
     plot_panel(ax_raw_poly, poly_plot_names, groups_poly, raw_arr, 'Raw polynomial weights')
-    # raw hills: show inc then dec separate in same axes (order of legend follows combined_names)
+    # raw hills: show inc then dec separate in same axes
     plot_panel(ax_raw_hill, hill_inc_plot_names + hill_dec_plot_names,
                {**groups_hill_inc, **groups_hill_dec}, raw_arr, 'Raw hill rates (inc & dec)')
     # effective polynomials
@@ -152,9 +155,45 @@ def plot_param_history(binn_model,
     plot_panel(ax_eff_hill, hill_inc_plot_names + hill_dec_plot_names,
                {**groups_hill_inc, **groups_hill_dec}, eff_arr, 'Effective hill rates (gated)')
 
-    plt.tight_layout()
+    fig.tight_layout()
     
+    # ==========================================
+    # --- PLOTTING FIGURE 2: Diffusion Coeffs
+    # ==========================================
+    fig_diff = None
+    axes_diff = None
+    
+    if 'diffusion_coeffs' in param_history and len(param_history['diffusion_coeffs']) > 0:
+        diff_arr = np.array(param_history['diffusion_coeffs'])
+        
+        # Ensure we actually have 2 coefficients to plot (d_u and d_v)
+        if diff_arr.ndim == 2 and diff_arr.shape[1] >= 2:
+            fig_diff, axes_diff = plt.subplots(figsize=(10, 5))
+            
+            axes_diff.plot(epoch_arr, diff_arr[:, 0], label='Learned $d_u$', color='#1f77b4', linewidth=2.5)
+            axes_diff.plot(epoch_arr, diff_arr[:, 1], label='Learned $d_v$', color='#ff7f0e', linewidth=2.5)
+            
+            axes_diff.set_title('Diffusion Coefficient Convergence')
+            axes_diff.set_xlabel('Epoch')
+            axes_diff.set_ylabel('Coefficient Magnitude')
+            axes_diff.grid(True, linestyle=':', alpha=0.6)
+            axes_diff.legend(loc='best')
+            
+            fig_diff.tight_layout()
+
+    # ==========================================
+    # --- Save or Return logic
+    # ==========================================
     if save_path:
-        plt.savefig(save_path)
+        # Save the primary 2x2 parameter history plot
+        fig.savefig(save_path)
+        
+        # Save the supplementary diffusion plot 
+        if fig_diff is not None:
+            base, ext = os.path.splitext(save_path)
+            diff_save_path = f"{base}_diffusion{ext}"
+            fig_diff.savefig(diff_save_path)
+            
     else:
-        return fig, axes
+        # Return both figures so they can be rendered directly in a Jupyter Notebook cell
+        return fig, axes, fig_diff, axes_diff

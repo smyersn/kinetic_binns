@@ -11,20 +11,30 @@ from modules.binn_eql.build_eql_layer import EQLLayer
 # ---------------------------------------------------------
 # 1. SUB-NETWORKS
 # ---------------------------------------------------------
-class D_PARAMS(nn.Module):
-    def __init__(self, input_features=2, min_val=0.01, max_val=10.0):
-        super().__init__()
-        self.min_val = min_val
-        self.max_val = max_val
+# class D_PARAMS(nn.Module):
+#     def __init__(self, input_features=2, min_val=0.01, max_val=10.0):
+#         super().__init__()
+#         self.min_val = min_val
+#         self.max_val = max_val
         
-        # Initialize at 0.0. 
-        # sigmoid(0) = 0.5, which puts the initial D exactly 
-        # halfway between min and max in log space (e.g., D = 0.1)
-        self.raw_D = nn.Parameter(torch.zeros(input_features))
+#         # Initialize at 0.0. 
+#         # sigmoid(0) = 0.5, which puts the initial D exactly 
+#         # halfway between min and max in log space (e.g., D = 0.1)
+#         self.raw_D = nn.Parameter(torch.zeros(input_features))
+        
+#     def forward(self):     
+#         s = torch.sigmoid(self.raw_D)
+#         return self.min_val * (self.max_val / self.min_val) ** s
+    
+class D_PARAMS(nn.Module):
+    def __init__(self, input_features=2, base_val=0.5, noise_std=1):
+        super().__init__()
+        base_log = torch.log(torch.tensor(base_val))         
+        noise = torch.randn(input_features) * noise_std
+        self.raw_D = nn.Parameter(base_log + noise)
         
     def forward(self):     
-        s = torch.sigmoid(self.raw_D)
-        return self.min_val * (self.max_val / self.min_val) ** s
+        return torch.exp(self.raw_D)
     
 class uv_MLP(nn.Module):
     def __init__(self, input_features, layers=[256, 256, 256, 2]):
@@ -84,11 +94,7 @@ class BINN(nn.Module):
         ub_tensor = torch.cat([torch.full((dimensions,), x_max), torch.tensor([t_max])])
         self.register_buffer('lb', lb_tensor.view(1, -1)) 
         self.register_buffer('ub', ub_tensor.view(1, -1))
-        
-        # Ranges for Chain Rule
-        self.register_buffer('x_range', x_max - x_min)
-        self.register_buffer('t_range', t_max - t_min)
-                
+                        
         # Concentration Scales (Physical -> Dimensionless)
         s_u_max = torch.quantile(train_data[:, -2].abs(), 0.99)
         s_v_max = torch.quantile(train_data[:, -1].abs(), 0.99)
@@ -221,46 +227,45 @@ class BINN(nn.Module):
 
         return w_loss + k_loss + d_loss
         
-    def loss(self, pred, true, epoch, gls_weight, pde_weight, l0_weight, lux_tax):       
-        # GLS Loss
-        self.gls_loss_val = gls_weight * self.gls_loss(pred, true)
+    def loss(self, pred, true, epoch, lux_tax):       
+        # 1. GLS Loss (RAW)
+        raw_gls = self.gls_loss(pred, true)
         
-        # PDE Sampling
+        # 2. PDE Sampling
         x = torch.empty(self.num_samples, self.dimensions, device=pred.device).uniform_(self.lb[0,0], self.ub[0,0])
         t = torch.empty(self.num_samples, 1, device=pred.device).uniform_(self.lb[0,-1], self.ub[0,-1])
         inputs_rand = torch.cat([x, t], dim=1).requires_grad_()
         inputs_rand_norm = self.normalize(inputs_rand)
         outputs_rand = self.surface_fitter(inputs_rand_norm)
              
-        # PDE Loss
-        self.pde_loss_val = pde_weight * self.pde_loss(inputs_rand, outputs_rand, epoch)
+        # 3. PDE Loss (RAW)
+        raw_pde = self.pde_loss(inputs_rand, outputs_rand, epoch)
               
-        # Reg Loss (L0 + Soft Wall)           
-        l0_loss = self.reg_loss(lux_tax, epoch)
-        soft_wall_loss = self.soft_wall_loss()
-        self.reg_loss_val = l0_weight * l0_loss + soft_wall_loss
+        # 4. Reg Loss (RAW L0)          
+        raw_l0 = self.reg_loss(lux_tax, epoch)
+        
+        # 5. Soft Wall (RAW - Always Enforced)
+        raw_softwall = self.soft_wall_loss()
                       
-        return (self.gls_loss_val + self.pde_loss_val + self.reg_loss_val), self.gls_loss_val, self.pde_loss_val, self.reg_loss_val
-
+        # Return all 4 separated, unweighted tensors
+        return raw_gls, raw_pde, raw_l0, raw_softwall
+    
     # -----------------------
     # Parameter Extraction (Unscaling)
     # -----------------------
     def generate_terms(self):
-        poly_terms = []
+        # 1. Dynamically grab the exact powers used by the layer!
+        # Returns tuples like (3, 0) for u^3, or (1, 2) for u*v^2
+        poly_terms = self.reaction.eql_layer.poly.powers
+        
         hill_terms = []
-        # Linear
-        for i in range(self.species): poly_terms.append((i,))
-        # Squared
-        for i in range(self.species): poly_terms.append((i, i))
-        # Cross  
-        for i in range(self.species):
-            for j in range(i+1, self.species): poly_terms.append((i, j))
         # Raw Hill
         for i in range(self.species): hill_terms.append((i,))
         # Cross Hill
         for i in range(self.species):
             for j in range(self.species):
                 if i != j: hill_terms.append((i, j))
+                
         return poly_terms, hill_terms
     
     def extract_params(self, full=True):
@@ -603,8 +608,12 @@ class BINN(nn.Module):
         for term, coeff in zip(poly_terms * dup, poly_coeffs):
             if abs(coeff) > eps:
                 s = f"{float(coeff):.3f}"
-                for ind in term:
-                    s += f" * {species[ind]}"
+                # 'term' is now a tuple of powers, e.g., (2, 1) for u^2 * v
+                for i, power in enumerate(term):
+                    if power == 1:
+                        s += f" * {species[i]}"
+                    elif power > 1:
+                        s += f" * {species[i]}^{power}"
                 terms.append(s)
 
         # increasing hills (use unscaled coefficients and Ks and ns)

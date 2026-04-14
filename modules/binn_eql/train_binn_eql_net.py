@@ -28,6 +28,7 @@ with open(config_path, 'r') as f:
 
 # 2. Load variable from JSON
 training_data_path = config['training_data_path']
+batch_size = config['batch_size']
 species = config['species']           
 dimensions = config['dimensions']     
 epsilon = config['epsilon']           
@@ -39,7 +40,7 @@ duplicates = config['duplicates']
 degree = config['degree']
 pde_weight = config['pde_weight']
 l0_weight = config['l0_weight']
-warm_up = config['warm_up']
+# warm_up = config['warm_up']
 lux_tax = config['lux_tax']
 param_bounds = config['param_bounds']
 
@@ -50,10 +51,6 @@ reaction_map = {
     'custom_equation': custom_equation
 }
 reaction = reaction_map[config['reaction']]
-
-# Set training hyperparameters
-# epochs = 10
-epochs = 100_000
 
 # Get GPU
 # device = 'cpu'
@@ -73,9 +70,20 @@ u_array, x_array, t_array = format_training_data_to_u_array(training_data)
 animate_u_array(u_array, t_array, f'{dir_name}/training_data.gif')
     
 # Split training data
-batch_size=int(0.1*len(training_data))
+# batch_size=int(0.1*len(training_data))
 # train_loader, val_loader = training_test_split(training_data, batch_size, species)
 train_data, val_data = training_test_split(training_data, device)
+
+# Determine number of epochs from batch size (step-dependent)
+total_data_points = len(training_data) # e.g., 4,040,000
+target_total_steps = 1_000_000
+steps_per_epoch = max(1, total_data_points // batch_size)
+epochs = int(target_total_steps // steps_per_epoch)
+
+# Determine early stopping (5% of total epochs)
+early_stopping = int(epochs * 0.05)
+
+print(batch_size, total_data_points, epochs, early_stopping)
 
 # initialize model and compile
 binn = BINN(
@@ -88,9 +96,6 @@ binn = BINN(
     param_bounds=param_bounds)
 
 binn.to(device)
-
-# Compile for speed
-# binn = torch.compile(binn)
 
 # Initialize optimizer
 param_groups = [
@@ -118,7 +123,7 @@ scheduler = torch.optim.lr_scheduler.OneCycleLR(
     opt,
     # Provide a list of max_lrs matching the order of param_groups
     max_lr=[group['lr'] for group in param_groups],
-    total_steps=int(warm_up),  
+    total_steps=int(0.2*epochs),  
     pct_start=0.3,        
     div_factor=25,               
     final_div_factor=1e4)
@@ -135,13 +140,10 @@ model = model_wrapper(
 param_history, train_loss_dict, val_loss_dict = model.fit(
     train_data=train_data,
     val_data=val_data,
-    pde_weight=pde_weight,
-    l0_weight=l0_weight,
-    warm_up=warm_up,
+    epochs = epochs,
     lux_tax=lux_tax,
     batch_size=batch_size,
-    epochs=epochs,
-    early_stopping=5000)
+    early_stopping=early_stopping)
 
 generate_loss_curves(train_loss_dict, val_loss_dict, dir_name, 20, 'training_loss_curves.png')
 

@@ -9,28 +9,28 @@ from pathlib import Path
 # "combinations": Tests every possible combination of the lists below.
 # "lockstep": Pairs parameters directly (index 0 with index 0, etc.).
 #             *Note: In lockstep mode, ALL lists must be the exact same length!
-ITERATION_MODE = "combinations" 
+ITERATION_MODE = "lockstep" 
 # ==========================================
 
-# # 1. Define parameter space
-# save_path = "/work/users/s/m/smyersn/elston/projects/kinetics_binns/data/custom_equation"
-
-# reactions = ["custom_equation", "custom_equation", "custom_equation", "custom_equation"]
-# dus = [0.01, 0.01, 0.01, 0.01]
-# dvs = [1, 1, 1, 1]
-# a_params = [1, 4, 8, 8] 
-# b_params = [1, 4, 1, 4]
-# k_params = [0.1, 0.05, 0.5, 0.05]
-
 # 1. Define parameter space
-save_path = "/hpc/home/nsmyers1/projects/kinetic_binns/data/wave_pinning/diff_coeffs_du_sweep"
+save_path = "/hpc/home/nsmyers1/projects/kinetic_binns/data/custom_equation"
 
-reactions = ["wave_pinning"]
-dus = [0.01, 0.025, 0.05, 0.1]
-dvs = [0.1, 1, 10]
-a_params = [1] 
-b_params = [1]
-k_params = [0.01]
+reactions = ["custom_equation", "custom_equation", "custom_equation", "custom_equation"]
+dus = [0.01, 0.01, 0.01, 0.01]
+dvs = [1, 1, 1, 1]
+a_params = [1, 4, 8, 8] 
+b_params = [1, 4, 1, 4]
+k_params = [0.1, 0.05, 0.5, 0.05]
+
+# # 1. Define parameter space
+# save_path = "/hpc/home/nsmyers1/projects/kinetic_binns/data/wave_pinning/diff_coeffs_du_sweep"
+
+# reactions = ["wave_pinning"]
+# dus = [0.01, 0.025, 0.05, 0.1]
+# dvs = [0.1, 1, 10]
+# a_params = [1] 
+# b_params = [1]
+# k_params = [0.01]
 
 # Make sure the target data directory exists
 os.makedirs(save_path, exist_ok=True)
@@ -81,10 +81,12 @@ for combo in combo_generator:
         json.dump(config_dict, f, indent=4)
     
     # --- Construct and run Slurm submission ---
-    python_script = "/work/users/s/m/smyersn/elston/projects/kinetics_binns/modules/simulation/simulation.py"
+    python_script = "/hpc/home/nsmyers1/projects/kinetic_binns/modules/simulation/simulation.py"
     
-    wrap_command = f"source ~/.bashrc && conda activate binns && python {python_script} {config_filepath}"
-    
+    conda_setup = "source /hpc/home/nsmyers1/miniforge3/etc/profile.d/conda.sh"
+    cmd_string = f"{conda_setup} && conda activate binns && python {python_script} {config_filepath}"
+    wrap_command = f"bash -c '{cmd_string}'"
+
     out_filename = f"{reaction}_du_{du}_dv_{dv}_a_{a}_b_{b}_k_{k}.out"
     out_file = os.path.join(save_path, out_filename)
     
