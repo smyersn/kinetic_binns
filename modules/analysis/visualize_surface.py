@@ -77,7 +77,8 @@ def plot_surfaces(model_dir, u_triangle_mesh, v_triangle_mesh, F_true,
         fig.write_image(f'{model_dir}/{filename}.png')
 
 def compare_surfaces_over_training_domain(training_data, model, device, 
-                                          reaction, params, dir_name):
+                                          reaction, params, dir_name, 
+                                          filename='feql_surface'):
     # Create triangle mesh from min and max uv vals seen in training data
     u_triangle_mesh, v_triangle_mesh = lltriangle(training_data[:, -2:].cpu().detach().numpy(),
                                                 training_data[:, -1:].cpu().detach().numpy())
@@ -99,4 +100,4 @@ def compare_surfaces_over_training_domain(training_data, model, device,
 
     # Visualize surfaces
     plot_surfaces(dir_name, u_triangle_mesh, v_triangle_mesh,
-                  F_true, F_mlp, 'feql_surface')
+                  F_true, F_mlp, filename)

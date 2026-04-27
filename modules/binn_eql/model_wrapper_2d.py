@@ -79,6 +79,11 @@ class model_wrapper():
         phase_1_end = (0.2 * epochs)
         phase_2_end = (0.3 * epochs)
         phase_3_end = (0.4 * epochs)
+
+        # phase_1_end = (0.3 * epochs)
+        # phase_2_end = (0.4 * epochs)
+        # phase_3_end = (0.5 * epochs)
+
       
         for epoch in range(initial_epoch, initial_epoch + epochs):
             # -----------------------------
@@ -92,9 +97,7 @@ class model_wrapper():
                 phase = 3
             else:
                 phase = 4
-                
-            self.set_training_phase(phase)
-            
+                            
             # -----------------------------
             # 2. Determine Weights and learning rates
             # -----------------------------
@@ -107,10 +110,16 @@ class model_wrapper():
                 # Phase 1: Data Only
                 base_weights = torch.tensor([1.0, 0.0, 0.0], device=train_data.device)
 
+                # Let scheduler handle LR, add decay for smooth surface
                 for pg in self.optimizer.param_groups:
                     if pg.get('name') == 'surface':
-                        pg['lr'] = 1e-3 * scale
-                                             
+                        pg['weight_decay'] = 1e-5
+
+                for p in self.model.surface_fitter.parameters(): p.requires_grad = True
+                for p in self.model.reaction.parameters(): p.requires_grad = False
+                if self.model.diffusion_fitter:
+                    for p in self.model.diffusion_fitter.parameters(): p.requires_grad = False
+                  
             elif phase == 2:
                 # Phase 2: Physics On, No Reg
                 base_weights = torch.tensor([0.0, 1.0, 0.0], device=train_data.device)      
@@ -123,6 +132,11 @@ class model_wrapper():
                     elif pg.get('name') == 'diffusion':
                         # pg['lr'] = 0
                         pg['lr'] = 1e-4 * scale
+
+                for p in self.model.surface_fitter.parameters(): p.requires_grad = False
+                for p in self.model.reaction.parameters(): p.requires_grad = True
+                if self.model.diffusion_fitter:
+                    for p in self.model.diffusion_fitter.parameters(): p.requires_grad = True
 
             elif phase == 3:
                 # Phase 3: Physics On, Ramp Reg
@@ -137,6 +151,11 @@ class model_wrapper():
                         pg['lr'] = 1e-3 * scale
                     elif pg.get('name') == 'diffusion':
                         pg['lr'] = 1e-4 * scale
+                
+                for p in self.model.surface_fitter.parameters(): p.requires_grad = False
+                for p in self.model.reaction.parameters(): p.requires_grad = True
+                if self.model.diffusion_fitter:
+                    for p in self.model.diffusion_fitter.parameters(): p.requires_grad = True
 
             elif phase == 4:
                 # Phase 4: Max Reg
@@ -144,12 +163,17 @@ class model_wrapper():
                               
                 for pg in self.optimizer.param_groups:
                     if pg.get('name') == 'surface':
-                        pg['lr'] = 0.0 * scale
+                        pg['lr'] = 1e-4 * scale
                     elif pg.get('name') == 'reaction':
                         pg['lr'] = 1e-3 * scale
                     elif pg.get('name') == 'diffusion':
                         pg['lr'] = 1e-4 * scale
-                        
+
+                for p in self.model.surface_fitter.parameters(): p.requires_grad = False
+                for p in self.model.reaction.parameters(): p.requires_grad = True
+                if self.model.diffusion_fitter:
+                    for p in self.model.diffusion_fitter.parameters(): p.requires_grad = True
+
             # -----------------------------
             # 3. Train Step
             # -----------------------------
@@ -363,25 +387,6 @@ class model_wrapper():
             
         return self.param_history, self.train_loss_dict, self.val_loss_dict
                                         
-    def set_training_phase(self, phase):
-        if phase == 1:
-            for p in self.model.surface_fitter.parameters(): p.requires_grad = True
-            for p in self.model.reaction.parameters(): p.requires_grad = False
-            if self.model.diffusion_fitter:
-                for p in self.model.diffusion_fitter.parameters(): p.requires_grad = False
-                
-        elif phase == 2 or phase == 3:
-            for p in self.model.surface_fitter.parameters(): p.requires_grad = False
-            for p in self.model.reaction.parameters(): p.requires_grad = True
-            if self.model.diffusion_fitter:
-                for p in self.model.diffusion_fitter.parameters(): p.requires_grad = True
-                
-        elif phase == 4:
-            for p in self.model.surface_fitter.parameters(): p.requires_grad = True
-            for p in self.model.reaction.parameters(): p.requires_grad = True
-            if self.model.diffusion_fitter:
-                for p in self.model.diffusion_fitter.parameters(): p.requires_grad = True
-
     def predict(self, inputs):
         self.model.eval()
         return self.model(inputs)

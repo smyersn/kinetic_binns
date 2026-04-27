@@ -54,10 +54,19 @@ def plot_param_history(binn_model,
     # --- polynomial groups (base term -> list of indices across duplicates)
     poly_base_names = []
     for t in poly_terms:
-        if len(t) == 1:
-            poly_base_names.append(f"{species[t[0]]}")
+        term_parts = []
+        for i, power in enumerate(t):
+            if power == 1:
+                term_parts.append(f"{species[i]}")
+            elif power > 1:
+                term_parts.append(f"{species[i]}^{power}")
+                
+        # If the term is a constant (all powers are 0), call it '1'
+        if not term_parts:
+            poly_base_names.append("1")
         else:
-            poly_base_names.append("*".join([species[i] for i in t]))
+            poly_base_names.append("*".join(term_parts))
+
     groups_poly = {}
     for d in range(dup):
         for i, name in enumerate(poly_base_names):

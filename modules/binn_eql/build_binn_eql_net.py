@@ -11,21 +11,6 @@ from modules.binn_eql.build_eql_layer import EQLLayer
 # ---------------------------------------------------------
 # 1. SUB-NETWORKS
 # ---------------------------------------------------------
-# class D_PARAMS(nn.Module):
-#     def __init__(self, input_features=2, min_val=0.01, max_val=10.0):
-#         super().__init__()
-#         self.min_val = min_val
-#         self.max_val = max_val
-        
-#         # Initialize at 0.0. 
-#         # sigmoid(0) = 0.5, which puts the initial D exactly 
-#         # halfway between min and max in log space (e.g., D = 0.1)
-#         self.raw_D = nn.Parameter(torch.zeros(input_features))
-        
-#     def forward(self):     
-#         s = torch.sigmoid(self.raw_D)
-#         return self.min_val * (self.max_val / self.min_val) ** s
-    
 class D_PARAMS(nn.Module):
     def __init__(self, input_features=2, base_val=0.5, noise_std=1):
         super().__init__()
@@ -36,24 +21,71 @@ class D_PARAMS(nn.Module):
     def forward(self):     
         return torch.exp(self.raw_D)
     
-class uv_MLP(nn.Module):
-    def __init__(self, input_features, layers=[256, 256, 256, 2]):
+class FourierFeatureEncoding(nn.Module):
+    def __init__(self, in_features, mapping_size, scale=1.0):
         super().__init__()
-        # 1. Pass GELU directly (build_mlp accepts an activation arg)
+        # Create a static, non-trainable random Gaussian matrix
+        self.B = nn.Parameter(torch.randn(in_features, mapping_size) * scale, requires_grad=False)
+        
+    def forward(self, x):
+        # Project inputs into high frequencies
+        x_proj = (2.0 * np.pi * x) @ self.B
+        # Return both sine and cosine projections
+        return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
+
+class uv_MLP(nn.Module):
+    def __init__(self, input_features, mapping_size=64, scale=1.0, layers=[256, 256, 256, 2]):
+    # def __init__(self, input_features, mapping_size=128, scale=10.0, layers=[256, 256, 256, 2]):
+        super().__init__()
+        
+        # 1. Initialize the Fourier Encoder
+        self.encoder = FourierFeatureEncoding(
+            in_features=input_features, 
+            mapping_size=mapping_size, 
+            scale=scale
+        )
+        
+        # The encoder outputs BOTH sin and cos for each mapping dimension
+        encoded_features = mapping_size * 2
+        
+        # 2. Build the MLP, passing the NEW encoded feature size
         self.mlp = build_mlp(
-            input_features=input_features, 
+            input_features=encoded_features, # <-- CRITICAL CHANGE
             layers=layers,
             activation=nn.GELU(),
             linear_output=False,
-            output_activation=nn.Softplus())
+            output_activation=nn.Softplus()
+        )
 
-        # 2. Apply Weight Norm "Post-Hoc"
+        # 3. Apply Weight Norm "Post-Hoc"
         for module in self.mlp.MLP:
             if isinstance(module, nn.Linear):
                 utils.parametrizations.weight_norm(module)
                 
     def forward(self, inputs):
-        return self.mlp(inputs)
+        # Pass raw inputs through the encoder first
+        encoded_x = self.encoder(inputs)
+        # Pass the high-frequency features into the MLP
+        return self.mlp(encoded_x)
+     
+# class uv_MLP(nn.Module):
+#     def __init__(self, input_features, layers=[256, 256, 256, 2]):
+#         super().__init__()
+#         # 1. Pass GELU directly (build_mlp accepts an activation arg)
+#         self.mlp = build_mlp(
+#             input_features=input_features, 
+#             layers=layers,
+#             activation=nn.GELU(),
+#             linear_output=False,
+#             output_activation=nn.Softplus())
+
+#         # 2. Apply Weight Norm "Post-Hoc"
+#         for module in self.mlp.MLP:
+#             if isinstance(module, nn.Linear):
+#                 utils.parametrizations.weight_norm(module)
+                
+#     def forward(self, inputs):
+#         return self.mlp(inputs)
 
 class F_EQL(nn.Module):
     def __init__(self, species, duplicates, param_bounds, max_scale, degree):
@@ -65,7 +97,7 @@ class F_EQL(nn.Module):
         return self.eql_layer(x)
             
 # ---------------------------------------------------------
-# 2. THE GOLD STANDARD BINN
+# 2. BINN
 # ---------------------------------------------------------
 class BINN(nn.Module):
     def __init__(self, dimensions, species, train_data, duplicates=1,
@@ -127,6 +159,46 @@ class BINN(nn.Module):
         # Sampling config
         self.num_samples = 10000
         self.name = 'Dumlp_Dvmlp_Fmlp'
+
+        # # ---------------------------------------------------------
+        # # C. STATIC PDE NORMALIZATION SCALES (Direct from Data)
+        # # ---------------------------------------------------------
+        # # Columns: x=0, y=1, t=2, u=3, v=4
+        # x_col = train_data[:, 0]
+        # y_col = train_data[:, 1]
+        # t_col = train_data[:, 2]
+
+        # # 1. Create a spatial hash to group points by their exact (x, y) location
+        # # (Rounding to 4 decimals prevents tiny floating-point errors from breaking groups)
+        # spatial_hash = torch.round(x_col * 1e4) * 1e5 + torch.round(y_col * 1e4)
+        
+        # # 2. Sort by Space, then by Time
+        # sort_keys = spatial_hash * 1e5 + t_col
+        # sorted_indices = torch.argsort(sort_keys)
+        # sorted_data = train_data[sorted_indices]
+
+        # # 3. Calculate differences between consecutive rows
+        # dt = sorted_data[1:, 2] - sorted_data[:-1, 2]
+        # du = sorted_data[1:, 3] - sorted_data[:-1, 3]
+        # dv = sorted_data[1:, 4] - sorted_data[:-1, 4]
+
+        # # 4. Filter for valid temporal steps 
+        # # (Must be the exact same spatial point, and time must have advanced)
+        # valid_mask = (torch.abs(sorted_data[1:, 0] - sorted_data[:-1, 0]) < 1e-5) & \
+        #              (torch.abs(sorted_data[1:, 1] - sorted_data[:-1, 1]) < 1e-5) & \
+        #              (dt > 1e-8)
+
+        # # 5. Compute the discrete time derivatives
+        # ut_discrete = du[valid_mask] / dt[valid_mask]
+        # vt_discrete = dv[valid_mask] / dt[valid_mask]
+
+        # # 6. Calculate variance (with a safeguard if data is purely random scattered points)
+        # if len(ut_discrete) > 100:
+        #     pde_scale_u = torch.var(ut_discrete) + 1e-6
+        #     pde_scale_v = torch.var(vt_discrete) + 1e-6
+
+        # self.register_buffer('pde_scale_u', pde_scale_u.view(1))
+        # self.register_buffer('pde_scale_v', pde_scale_v.view(1))
         
     def normalize(self, inputs):
         """ Maps Physical [lb, ub] -> Dimensionless [-1, 1] """
@@ -184,8 +256,20 @@ class BINN(nn.Module):
         RHS_u = lap_u + F
         LHS_v = ut_array[:, 1][:,None]
         RHS_v = lap_v - F
-        pde_loss = (LHS_u - RHS_u)**2 + (LHS_v - RHS_v)**2
-        
+
+        # Normalize the squared error by the static physical variance
+        # pde_loss_u = ((LHS_u - RHS_u)**2) / self.pde_scale_u
+        # pde_loss_v = ((LHS_v - RHS_v)**2) / self.pde_scale_v
+        # pde_loss = pde_loss_u + pde_loss_v  
+
+        # pde_loss = ((LHS_u - RHS_u)**2)  + ((LHS_v - RHS_v)**2)  
+
+        # Use Smooth L1 (Huber) to prevent noise spikes from exploding to 10^15
+        pde_loss_u = nn.functional.smooth_l1_loss(LHS_u, RHS_u, beta=1.0)
+        pde_loss_v = nn.functional.smooth_l1_loss(LHS_v, RHS_v, beta=1.0)
+
+        pde_loss = pde_loss_u + pde_loss_v
+
         return torch.mean(pde_loss)
                         
     def reg_loss(self, lux_tax, epoch):
@@ -217,15 +301,7 @@ class BINN(nn.Module):
         k_violation = torch.relu(k_phys - k_ceilings)
         k_loss = torch.sum(k_violation) * 100
 
-        # C. Diffusion L2 Anchor (The Anti-Scaling Fix)
-        d_loss = 0.0
-        # if not self.diff_coeffs: # Only apply if we are actively learning D
-        #     D_phys = self.diffusion_fitter()
-        #     # Penalize the square of the physical magnitude. 
-        #     # A multiplier of 1.0 or 0.1 provides a gentle but firm downward pressure.
-        #     d_loss = torch.sum(D_phys ** 2) * 1.0 
-
-        return w_loss + k_loss + d_loss
+        return w_loss + k_loss
         
     def loss(self, pred, true, epoch, lux_tax):       
         # 1. GLS Loss (RAW)
@@ -472,7 +548,8 @@ class BINN(nn.Module):
         # --- TASK 3A: MERGE DUPLICATE HILLS (Same Form Only) ---
         for i in range(num_hill):
             h_idx = num_poly + i
-            if torch.abs(eql.fc.weight.data[0, h_idx]) < 1e-8: continue
+            weight_primary = eql.fc.weight.data[0, h_idx]
+            if torch.abs(weight_primary) < 1e-8: continue
             
             # 1. Identify Form: 0 for Inc, 1 for Dec (for example)
             form_id_i = (h_idx - num_poly) % n_hill_single
@@ -483,7 +560,8 @@ class BINN(nn.Module):
             norm_hill_c = torch.norm(f_hill_c) + 1e-9
             
             for next_h_idx in range(h_idx + 1, num_poly + num_hill):
-                if torch.abs(eql.fc.weight.data[0, next_h_idx]) < 1e-8: continue
+                weight_duplicate = eql.fc.weight.data[0, next_h_idx]
+                if torch.abs(weight_duplicate) < 1e-8: continue
                 
                 # 2. Strict Form Check
                 form_id_next = (next_h_idx - num_poly) % n_hill_single
@@ -503,17 +581,23 @@ class BINN(nn.Module):
                 if dist < epsilon:
                     print(f"Merging Duplicate Hills: {h_idx} and {next_h_idx} (Dist: {dist:.4f})")
                     
-                    # Merge
+                    # Merge internal parameters using a weighted average!
+                    self._average_hill_params(h_idx - num_poly, next_h_idx - num_poly, 
+                                              weight_primary, weight_duplicate)
+                    
+                    # Consolidate the linear coefficient weights
                     eql.fc.weight.data[0, h_idx] += eql.fc.weight.data[0, next_h_idx]
                     eql.fc.weight.data[0, next_h_idx] = 0.0
                     
-                    self._average_hill_params(h_idx - num_poly, next_h_idx - num_poly)
-                    
+                    # Keep the strongest gate open
                     eql.l0_gate.log_alpha.data[h_idx] = torch.max(
                         eql.l0_gate.log_alpha.data[h_idx], 
                         eql.l0_gate.log_alpha.data[next_h_idx]
                     )
                     eql.l0_gate.log_alpha.data[next_h_idx] = -10.0
+                    
+                    # Update primary weight for any subsequent merges in the loop
+                    weight_primary = eql.fc.weight.data[0, h_idx]
 
         # --- TASK 3B: SIMPLIFY HILLS TO POLYNOMIALS (1-to-1 Best Fit) ---
         hills_to_remove = []
@@ -569,10 +653,10 @@ class BINN(nn.Module):
         _ = self.extract_params(full=True)
         print(f"Fine-tuning committed.")
                 
-    def _average_hill_params(self, idx1, idx2):
+    def _average_hill_params(self, idx1, idx2, weight1, weight2):
         """
-        Helper to average n and raw_K for two Hill modules.
-        Ensures 'Consolidated Hills' maintain correct physical shapes.
+        Helper to average n and raw_K for two Hill modules using a weighted average
+        based on the magnitude of their linear coefficients.
         """
         eql = self.reaction.eql_layer
         
@@ -585,15 +669,27 @@ class BINN(nn.Module):
         hf1 = all_hf[idx1]
         hf2 = all_hf[idx2]
         
+        # Calculate the proportional weight of each term
+        abs_w1 = torch.abs(weight1)
+        abs_w2 = torch.abs(weight2)
+        total_w = abs_w1 + abs_w2
+        
+        # Prevent division by zero (though handled by the 1e-8 check in the main loop)
+        if total_w < 1e-8:
+            prop1, prop2 = 0.5, 0.5
+        else:
+            prop1 = abs_w1 / total_w
+            prop2 = abs_w2 / total_w
+        
         with torch.no_grad():
-            # Update primary module with average parameters
-            hf1.raw_n.data = (hf1.raw_n.data + hf2.raw_n.data) / 2.0
-            hf1.raw_K.data = (hf1.raw_K.data + hf2.raw_K.data) / 2.0
+            # Update primary module with WEIGHTED average parameters
+            hf1.raw_n.data = (hf1.raw_n.data * prop1) + (hf2.raw_n.data * prop2)
+            hf1.raw_K.data = (hf1.raw_K.data * prop1) + (hf2.raw_K.data * prop2)
             
             # Prune parameters of merged module
             hf2.raw_n.data.fill_(0.0)
             hf2.raw_K.data.fill_(0.0)
-        
+
     def generate_equation(self, eps=1e-12):
         p = self.extract_params(full=True)
         poly_terms = p['poly_terms']

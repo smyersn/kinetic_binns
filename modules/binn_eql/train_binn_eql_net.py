@@ -83,7 +83,7 @@ epochs = int(target_total_steps // steps_per_epoch)
 # Determine early stopping (5% of total epochs)
 early_stopping = int(epochs * 0.05)
 
-print(batch_size, total_data_points, epochs, early_stopping)
+# print(batch_size, total_data_points, epochs, early_stopping)
 
 # initialize model and compile
 binn = BINN(
@@ -166,6 +166,10 @@ if not diff_coeffs:
         
 file.close()
 
+compare_surfaces_over_training_domain(training_data, model, device, 
+                                          reaction, params, dir_name,
+                                          'feql_surface_untuned')
+
 # Prune equation
 model.model.fine_tune_eql(threshold=0.01, epsilon=0.1)
 
@@ -180,7 +184,8 @@ for term in model.model.generate_equation():
 file.close()
 
 compare_surfaces_over_training_domain(training_data, model, device, 
-                                          reaction, params, dir_name)
+                                          reaction, params, dir_name,
+                                          'feql_surface_tuned')
 
 # Simulate uvmlp
 uvmlp_u_array, uvmlp_x_array, uvmlp_times = simulate_uvmlp(training_data, model)
