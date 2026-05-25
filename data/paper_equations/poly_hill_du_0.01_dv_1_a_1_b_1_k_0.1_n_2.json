@@ -1,0 +1,14 @@
+{
+    "save_path": "/work/users/s/m/smyersn/elston/projects/kinetics_binns/data/paper_functions",
+    "reaction": "poly_hill",
+    "du": 0.01,
+    "dv": 1,
+    "a": 1,
+    "b": 1,
+    "k": 0.1,
+    "n": 2,
+    "k1": 0,
+    "k2": 0,
+    "n1": 0,
+    "n2": 0
+}

@@ -168,15 +168,10 @@ class EQLLayer(nn.Module):
         # 2. Get Weights and Gate
         w = self.fc.weight
         z = self.l0_gate() 
-
-        # 3. Apply Scaling (CRITICAL FIX)
-        # We multiply by scales here so 'w' can stay small (physical magnitude)
-        # while the output matches the large physical derivatives.
-        scales = self._generate_scales_fast().view(1, -1)
         
         out = (features * (w * z)).sum(dim=1, keepdim=True)
         return out
-    
+
     def get_physical_parameters(self, epsilon=0.2):
         """
         Calculates Physical Weights, K, and a Dynamic K-Ceiling.
@@ -223,42 +218,6 @@ class EQLLayer(nn.Module):
         k_ceilings = torch.cat(k_ceiling_list)
         return w_phys, k_phys, k_ceilings
     
-    def _generate_scales_fast(self):
-        s = self.max_scale[0]
-        scales_list = []
-
-        # --- Dynamic Poly Scales ---
-        poly_block = []
-        for p in self.poly.powers:
-            val = 1.0
-            for i, power in enumerate(p):
-                if power > 0:
-                    val *= (s[i] ** power)
-            poly_block.append(val)
-        
-        scales_list.extend(poly_block * self.duplicates)
-        # --- Hill Scales ---
-        ptr = 0
-        N = self.species
-        
-        def get_s(hf, scale_val):
-            n = torch.sigmoid(hf.raw_n.view(())) * 3 + 1
-            return (scale_val ** n)
-
-        for _ in range(self.duplicates):
-            for i in range(N): # Inc Raw
-                scales_list.append(get_s(self.all_hill_funcs[ptr], s[i])); ptr+=1
-            for i in range(N): # Inc Cross
-                for j in range(N):
-                    if i!=j: scales_list.append(get_s(self.all_hill_funcs[ptr], s[i]) * s[j]); ptr+=1
-            for i in range(N): # Dec Raw
-                scales_list.append(get_s(self.all_hill_funcs[ptr], s[i])); ptr+=1
-            for i in range(N): # Dec Cross
-                for j in range(N):
-                    if i!=j: scales_list.append(get_s(self.all_hill_funcs[ptr], s[i]) * s[j]); ptr+=1
-
-        return torch.stack(scales_list).view(1, -1)
-
     def _smart_initialize_K(self):
         """
         Initializes raw_K so that the physical K is strictly below the dynamic ceiling.
@@ -309,6 +268,5 @@ class EQLLayer(nn.Module):
         poly_feats = self.poly(x)
         hill_feats = self.hill(x)
         features = torch.cat([poly_feats, hill_feats], dim=1)
-        scales = self._generate_scales_fast().view(1, -1)
         
-        return features * scales
+        return features

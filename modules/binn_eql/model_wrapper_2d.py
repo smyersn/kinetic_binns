@@ -1,10 +1,9 @@
-import torch, time, sys, os
+import torch, time
 import numpy as np
-import random
-import torch.nn.functional as F
 
 from modules.utils.time_remaining import *
 from modules.binn_eql.gated_relobralo import GatedReLoBRaLo
+from modules.utils.gradient import gradient
 
 # --- ENFORCE TRUE FP32 PRECISION ---
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -76,13 +75,13 @@ class model_wrapper():
         # Initialize ReLoBRaLo for [GLS, PDE, REG]
         self.relobralo = GatedReLoBRaLo(num_losses=3, temperature=0.1, alpha=0.99, device=train_data.device)
         
-        phase_1_end = (0.2 * epochs)
-        phase_2_end = (0.3 * epochs)
-        phase_3_end = (0.4 * epochs)
+        # phase_1_end = (0.2 * epochs)
+        # phase_2_end = (0.3 * epochs)
+        # phase_3_end = (0.4 * epochs)
 
-        # phase_1_end = (0.3 * epochs)
-        # phase_2_end = (0.4 * epochs)
-        # phase_3_end = (0.5 * epochs)
+        phase_1_end = (0.2 * epochs)
+        phase_2_end = (0.4 * epochs)
+        phase_3_end = (0.6 * epochs)
 
       
         for epoch in range(initial_epoch, initial_epoch + epochs):
@@ -101,11 +100,6 @@ class model_wrapper():
             # -----------------------------
             # 2. Determine Weights and learning rates
             # -----------------------------
-
-            # Base batch size: 100k
-            # Base LRs: Surface (1e-3), Reaction (1e-3), Diffusion (1e-4)
-            scale = (batch_size / 50_000.0) ** 0.5
-
             if phase == 1:
                 # Phase 1: Data Only
                 base_weights = torch.tensor([1.0, 0.0, 0.0], device=train_data.device)
@@ -126,31 +120,74 @@ class model_wrapper():
                           
                 for pg in self.optimizer.param_groups:
                     if pg.get('name') == 'surface':
-                        pg['lr'] = 0.0 * scale
+                        pg['lr'] = 0.0
                     elif pg.get('name') == 'reaction':
-                        pg['lr'] = 1e-3 * scale
+                        pg['lr'] = 1e-3
                     elif pg.get('name') == 'diffusion':
                         # pg['lr'] = 0
-                        pg['lr'] = 1e-4 * scale
+                        pg['lr'] = 1e-4
 
                 for p in self.model.surface_fitter.parameters(): p.requires_grad = False
                 for p in self.model.reaction.parameters(): p.requires_grad = True
                 if self.model.diffusion_fitter:
                     for p in self.model.diffusion_fitter.parameters(): p.requires_grad = True
 
+                # ---------------------------------------------------------
+                # ONE-TIME PDE NORMALIZATION (Robust Top 5% Scaling)
+                # ---------------------------------------------------------
+                if not hasattr(self.model, 'pde_scales_locked'):
+                    print("\n--- Phase 2 Start: Calculating Robust PDE Scales (Top 1%) ---")
+                    
+                    self.model.surface_fitter.eval() 
+                    
+                    all_u_sq = []
+                    all_v_sq = []
+                    total_points = len(train_data)
+                    chunk_size = 50_000 
+                    
+                    for chunk_start in range(0, total_points, chunk_size):
+                        chunk = train_data[chunk_start:chunk_start+chunk_size].clone().requires_grad_(True)
+                        outputs = self.model.surface_fitter(self.model.normalize(chunk[:, :self.model.dimensions+1]))
+                        
+                        u_t = gradient(outputs[:, 0], chunk, order=1)[:, self.model.dimensions] 
+                        v_t = gradient(outputs[:, 1], chunk, order=1)[:, self.model.dimensions]
+                        
+                        all_u_sq.append((u_t**2).detach().cpu())
+                        all_v_sq.append((v_t**2).detach().cpu())
+                        
+                        del chunk, outputs, u_t, v_t
+                        
+                    self.model.surface_fitter.train() 
+                    
+                    global_u_sq = torch.cat(all_u_sq)
+                    global_v_sq = torch.cat(all_v_sq)
+                    
+                    k_percent = 0.01
+                    k_points = int(k_percent * total_points)
+                    
+                    robust_max_u = torch.topk(global_u_sq, k_points).values.mean().item()
+                    robust_max_v = torch.topk(global_v_sq, k_points).values.mean().item()
+                    
+                    # <-- FIXED: Attach scales directly to the BINN model -->
+                    self.model.pde_scale_u = robust_max_u + 1e-6
+                    self.model.pde_scale_v = robust_max_v + 1e-6
+                    self.model.pde_scales_locked = True 
+                    
+                    print(f"Locked Top {k_percent*100}% Scales -> u: {self.model.pde_scale_u:.4e}, v: {self.model.pde_scale_v:.4e}\n")
+
             elif phase == 3:
                 # Phase 3: Physics On, Ramp Reg
                 phase_duration = phase_3_end - phase_2_end
-                progress = (epoch - phase_2_end) / phase_duration
-                base_weights = torch.tensor([0.0, 1.0, progress], device=train_data.device)    
+                progress = ((epoch - phase_2_end) / phase_duration)
+                base_weights = torch.tensor([0.0, 1.0, 2.0*progress], device=train_data.device)    
                             
                 for pg in self.optimizer.param_groups:
                     if pg.get('name') == 'surface':
-                        pg['lr'] = 0.0 * scale
+                        pg['lr'] = 0.0
                     elif pg.get('name') == 'reaction':
-                        pg['lr'] = 1e-3 * scale
+                        pg['lr'] = 1e-3
                     elif pg.get('name') == 'diffusion':
-                        pg['lr'] = 1e-4 * scale
+                        pg['lr'] = 1e-4
                 
                 for p in self.model.surface_fitter.parameters(): p.requires_grad = False
                 for p in self.model.reaction.parameters(): p.requires_grad = True
@@ -159,15 +196,15 @@ class model_wrapper():
 
             elif phase == 4:
                 # Phase 4: Max Reg
-                base_weights = torch.tensor([0.0, 1.0, 1.0], device=train_data.device)  
+                base_weights = torch.tensor([0.0, 1.0, 2.0], device=train_data.device)  
                               
                 for pg in self.optimizer.param_groups:
                     if pg.get('name') == 'surface':
-                        pg['lr'] = 1e-4 * scale
+                        pg['lr'] = 0.0
                     elif pg.get('name') == 'reaction':
-                        pg['lr'] = 1e-3 * scale
+                        pg['lr'] = 1e-3
                     elif pg.get('name') == 'diffusion':
-                        pg['lr'] = 1e-4 * scale
+                        pg['lr'] = 1e-4
 
                 for p in self.model.surface_fitter.parameters(): p.requires_grad = False
                 for p in self.model.reaction.parameters(): p.requires_grad = True
@@ -229,7 +266,8 @@ class model_wrapper():
                 raw_relo_losses = torch.stack([raw_gls, raw_pde, raw_l0])
                 
                 # 3. Compute dynamic lambdas (In Val step, use current_lambdas instead)
-                dynamic_lambdas = self.relobralo.compute_weights(raw_relo_losses, base_weights)
+                # dynamic_lambdas = self.relobralo.compute_weights(raw_relo_losses, base_weights)
+                dynamic_lambdas = 1
                 
                 # 4. Multiply and sum the balanced losses
                 weighted_losses = raw_relo_losses * base_weights * dynamic_lambdas
@@ -300,7 +338,8 @@ class model_wrapper():
                 raw_relo_losses = torch.stack([raw_gls, raw_pde, raw_l0])
                 
                 # 4. Read the current lambdas (DO NOT call compute_weights here!)
-                current_lambdas = self.relobralo.lambdas.to(x_true.device)
+                # current_lambdas = self.relobralo.lambdas.to(x_true.device)
+                current_lambdas = 1
                 
                 # 5. Multiply and sum the balanced losses
                 weighted_losses = raw_relo_losses * base_weights * current_lambdas

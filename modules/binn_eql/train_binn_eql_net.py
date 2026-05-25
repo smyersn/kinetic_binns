@@ -17,6 +17,9 @@ from modules.simulation.animation import (animate_u_array, animate_residuals)
 from modules.simulation.simulation import (simulate_uvmlp, simulate_feql)
 from modules.simulation.reaction_functions import (wave_pinning, turing_type,
                                                    custom_equation) 
+from modules.simulation.paper_reaction_functions import (hill_poly, poly_poly,
+                                                   hill_hill, poly_hill) 
+
 
 # Load params from configuration file
 dir_name = sys.argv[1]
@@ -48,7 +51,11 @@ param_bounds = config['param_bounds']
 reaction_map = {
     'wave_pinning': wave_pinning,
     'turing_type': turing_type,
-    'custom_equation': custom_equation
+    'custom_equation': custom_equation,
+    'hill_poly': hill_poly,
+    'poly_poly': poly_poly,
+    'hill_hill': hill_hill,
+    'poly_hill': poly_hill
 }
 reaction = reaction_map[config['reaction']]
 

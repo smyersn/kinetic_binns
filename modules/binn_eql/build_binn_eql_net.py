@@ -25,7 +25,7 @@ class FourierFeatureEncoding(nn.Module):
     def __init__(self, in_features, mapping_size, scale=1.0):
         super().__init__()
         # Create a static, non-trainable random Gaussian matrix
-        self.B = nn.Parameter(torch.randn(in_features, mapping_size) * scale, requires_grad=False)
+        self.B = nn.Parameter(torch.randn(in_features, mapping_size) * scale, requires_grad=True)
         
     def forward(self, x):
         # Project inputs into high frequencies
@@ -33,6 +33,34 @@ class FourierFeatureEncoding(nn.Module):
         # Return both sine and cosine projections
         return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
 
+# class uv_MLP(nn.Module):
+#     def __init__(self, input_features, mapping_size=64, scale=1.0, layers=[256, 256, 256, 2]):
+#         super().__init__()
+        
+#         self.encoder = FourierFeatureEncoding(in_features=input_features, mapping_size=mapping_size, scale=scale)
+        
+#         # ADD the raw input features to the encoded feature count
+#         encoded_features = (mapping_size * 2) + input_features 
+        
+#         self.mlp = build_mlp(
+#             input_features=encoded_features, 
+#             layers=layers,
+#             activation=nn.GELU(),
+#             linear_output=False,
+#             output_activation=nn.Softplus(beta=10.0) # See Point 2 below!
+#         )
+
+#         # Apply Weight Norm "Post-Hoc"
+#         for module in self.mlp.MLP:
+#             if isinstance(module, nn.Linear):
+#                 utils.parametrizations.weight_norm(module)
+
+#     def forward(self, inputs):
+#         encoded_x = self.encoder(inputs)
+#         # Concatenate the raw inputs with the high-frequency features
+#         full_features = torch.cat([inputs, encoded_x], dim=-1) 
+#         return self.mlp(full_features)
+    
 class uv_MLP(nn.Module):
     def __init__(self, input_features, mapping_size=64, scale=1.0, layers=[256, 256, 256, 2]):
     # def __init__(self, input_features, mapping_size=128, scale=10.0, layers=[256, 256, 256, 2]):
@@ -159,62 +187,37 @@ class BINN(nn.Module):
         # Sampling config
         self.num_samples = 10000
         self.name = 'Dumlp_Dvmlp_Fmlp'
-
-        # # ---------------------------------------------------------
-        # # C. STATIC PDE NORMALIZATION SCALES (Direct from Data)
-        # # ---------------------------------------------------------
-        # # Columns: x=0, y=1, t=2, u=3, v=4
-        # x_col = train_data[:, 0]
-        # y_col = train_data[:, 1]
-        # t_col = train_data[:, 2]
-
-        # # 1. Create a spatial hash to group points by their exact (x, y) location
-        # # (Rounding to 4 decimals prevents tiny floating-point errors from breaking groups)
-        # spatial_hash = torch.round(x_col * 1e4) * 1e5 + torch.round(y_col * 1e4)
-        
-        # # 2. Sort by Space, then by Time
-        # sort_keys = spatial_hash * 1e5 + t_col
-        # sorted_indices = torch.argsort(sort_keys)
-        # sorted_data = train_data[sorted_indices]
-
-        # # 3. Calculate differences between consecutive rows
-        # dt = sorted_data[1:, 2] - sorted_data[:-1, 2]
-        # du = sorted_data[1:, 3] - sorted_data[:-1, 3]
-        # dv = sorted_data[1:, 4] - sorted_data[:-1, 4]
-
-        # # 4. Filter for valid temporal steps 
-        # # (Must be the exact same spatial point, and time must have advanced)
-        # valid_mask = (torch.abs(sorted_data[1:, 0] - sorted_data[:-1, 0]) < 1e-5) & \
-        #              (torch.abs(sorted_data[1:, 1] - sorted_data[:-1, 1]) < 1e-5) & \
-        #              (dt > 1e-8)
-
-        # # 5. Compute the discrete time derivatives
-        # ut_discrete = du[valid_mask] / dt[valid_mask]
-        # vt_discrete = dv[valid_mask] / dt[valid_mask]
-
-        # # 6. Calculate variance (with a safeguard if data is purely random scattered points)
-        # if len(ut_discrete) > 100:
-        #     pde_scale_u = torch.var(ut_discrete) + 1e-6
-        #     pde_scale_v = torch.var(vt_discrete) + 1e-6
-
-        # self.register_buffer('pde_scale_u', pde_scale_u.view(1))
-        # self.register_buffer('pde_scale_v', pde_scale_v.view(1))
         
     def normalize(self, inputs):
         """ Maps Physical [lb, ub] -> Dimensionless [-1, 1] """
         return 2.0 * (inputs - self.lb) / (self.ub - self.lb) - 1.0
 
     def forward(self, inputs):
-        """ Returns PREDICTED u (Scaled [0,1]) from Physical Inputs """       
+        """ Returns PREDICTED u (Scaled [0,1]) from Physical Inputs """    
+        # Cache inputs for GLS loss 
+        self.inputs = inputs  
         inputs_hat = self.normalize(inputs)
         return self.surface_fitter(inputs_hat)
 
     # -----------------------
     # Loss Functions
     # -----------------------
+    # def gls_loss(self, pred, true):
+    #     residual = ((pred - true) / self.mean_scale)**2
+    #     return torch.mean(residual)
+
     def gls_loss(self, pred, true):
+        # Calculate raw squared residuals
         residual = ((pred - true) / self.mean_scale)**2
-        return torch.mean(residual)
+
+        # Create mask for inputs at t = 0
+        ic_mask = self.inputs[:, -1:] == 0
+                
+        # Weight the residuals before taking the mean
+        weights = torch.where(ic_mask, 10.0, 1.0)
+        weighted_residual = residual * weights
+        
+        return torch.mean(weighted_residual)    
     
     def pde_loss(self, inputs, outputs, epoch):
         # unpack outputs
@@ -257,21 +260,30 @@ class BINN(nn.Module):
         LHS_v = ut_array[:, 1][:,None]
         RHS_v = lap_v - F
 
-        # Normalize the squared error by the static physical variance
-        # pde_loss_u = ((LHS_u - RHS_u)**2) / self.pde_scale_u
-        # pde_loss_v = ((LHS_v - RHS_v)**2) / self.pde_scale_v
-        # pde_loss = pde_loss_u + pde_loss_v  
+        # 1. Convert squared max variance back to standard deviation
+        # (Fallback to 1.0 for Phase 1 before the wrapper calculates the true scales)
+        scale_u = torch.sqrt(torch.tensor(getattr(self, 'pde_scale_u', 1.0), device=inputs.device))
+        scale_v = torch.sqrt(torch.tensor(getattr(self, 'pde_scale_v', 1.0), device=inputs.device))
 
-        # pde_loss = ((LHS_u - RHS_u)**2)  + ((LHS_v - RHS_v)**2)  
+        # 2. Normalize differences FIRST to create a dimensionless residual
+        res_u = (LHS_u - RHS_u) / scale_u
+        res_v = (LHS_v - RHS_v) / scale_v
 
-        # Use Smooth L1 (Huber) to prevent noise spikes from exploding to 10^15
-        pde_loss_u = nn.functional.smooth_l1_loss(LHS_u, RHS_u, beta=1.0)
-        pde_loss_v = nn.functional.smooth_l1_loss(LHS_v, RHS_v, beta=1.0)
+        # 3. Apply Huber Loss to the normalized residuals to buffer high-frequency noise spikes
+        target_zero = torch.zeros_like(res_u)
+        pde_loss_u = torch.nn.functional.smooth_l1_loss(res_u, target_zero, beta=1.0)
+        pde_loss_v = torch.nn.functional.smooth_l1_loss(res_v, target_zero, beta=1.0)
 
-        pde_loss = pde_loss_u + pde_loss_v
+        pde_loss = pde_loss_u + pde_loss_v  
+
+        # # Use Smooth L1 (Huber) to prevent noise spikes from exploding to 10^15
+        # pde_loss_u = nn.functional.smooth_l1_loss(LHS_u, RHS_u, beta=1.0)
+        # pde_loss_v = nn.functional.smooth_l1_loss(LHS_v, RHS_v, beta=1.0)
+
+        # pde_loss = pde_loss_u + pde_loss_v
 
         return torch.mean(pde_loss)
-                        
+                            
     def reg_loss(self, lux_tax, epoch):
         """
         Soft Wall Regularization:
@@ -482,7 +494,7 @@ class BINN(nn.Module):
         }
                                     
     @torch.no_grad()    
-    def fine_tune_eql(self, threshold=0.01, epsilon=0.05):
+    def fine_tune_eql(self, threshold=0.01, epsilon=0.1):
         """
         Fine-tunes the discovered EQL equation.
         Sequence: Zeroing -> Poly Merging -> Hill Merging -> Poly Simplification.
@@ -498,8 +510,9 @@ class BINN(nn.Module):
         # --- TASK 0: SYNTHETIC GRID GENERATION ---
         # Robust 100x100 mesh to capture all feature behaviors
         steps = 100 
-        u_space = torch.linspace(0, 1, steps, device=device)
-        v_space = torch.linspace(0, 1, steps, device=device)
+        s_u, s_v = self.max_scale[0, 0].item(), self.max_scale[0, 1].item()
+        u_space = torch.linspace(0, s_u, steps, device=device)
+        v_space = torch.linspace(0, s_v, steps, device=device)
         grid_u, grid_v = torch.meshgrid(u_space, v_space, indexing='ij')
         
         # Shape (10000, 2)
@@ -599,60 +612,87 @@ class BINN(nn.Module):
                     # Update primary weight for any subsequent merges in the loop
                     weight_primary = eql.fc.weight.data[0, h_idx]
 
-        # --- TASK 3B: SIMPLIFY HILLS TO POLYNOMIALS (1-to-1 Best Fit) ---
-        hills_to_remove = []
-        
+        # --- TASK 3B: HEURISTIC SIMPLIFICATION (Strict Rule-Based Mapping) ---
         for i in range(num_hill):
             h_idx = num_poly + i
-            current_hill_weight = eql.fc.weight.data[0, h_idx]
-            if torch.abs(current_hill_weight) < 1e-8: continue
-            
-            f_hill = features[:, h_idx]
-            norm_hill = torch.norm(f_hill) + 1e-9
-            
-            best_fit = {"p_idx": -1, "error": float('inf'), "m": 0.0}
-            
-            for p_idx in range(num_poly):
-                f_poly = features[:, p_idx]
-                norm_poly_sq = torch.sum(f_poly ** 2) + 1e-9
-                
-                # Optimal Multiplier
-                m = torch.sum(f_hill * f_poly) / norm_poly_sq
-                
-                # Relative Residual Error
-                residual = f_hill - (m * f_poly)
-                rel_error = torch.norm(residual) / norm_hill
-                
-                if rel_error < best_fit["error"]:
-                    best_fit["error"] = rel_error.item()
-                    best_fit["p_idx"] = p_idx
-                    best_fit["m"] = m.item()
+            hill_weight = eql.fc.weight.data[0, h_idx].item()
+            if abs(hill_weight) < 1e-8: continue
 
-            if best_fit["error"] < epsilon:
-                p_idx = best_fit["p_idx"]
-                m = best_fit["m"]
-                
-                print(f"Simplifying Hill {h_idx} -> Poly {p_idx}")
-                print(f"  Error: {best_fit['error']:.4f}, Multiplier: {m:.4f}")
-                
-                eql.fc.weight.data[0, p_idx] += current_hill_weight * m
-                
-                eql.l0_gate.log_alpha.data[p_idx] = torch.max(
-                    eql.l0_gate.log_alpha.data[p_idx],
-                    eql.l0_gate.log_alpha.data[h_idx]
-                )
-                
-                hills_to_remove.append(h_idx)
-
-        # --- FINAL CLEANUP ---
-        if hills_to_remove:
-            indices = torch.tensor(hills_to_remove, device=device)
-            eql.fc.weight.data[0, indices] = 0.0
-            eql.l0_gate.log_alpha.data[indices] = -10.0
+            # Grab the specific HillFunction object
+            hf = eql.all_hill_funcs[i]
             
+            # 1. Extract physical k and n
+            n_val = (torch.sigmoid(hf.raw_n) * 3 + 1).item()
+            k_val = F.softplus(hf.raw_K).item()
+            
+            # 2. Calculate heuristics
+            n_rounded = round(n_val)
+            max_u = s_u
+            max_denom = 1.0 + k_val * (max_u ** n_val)
+            
+            # 3. YOUR LOGIC GATES
+            is_flat_denom = max_denom < 2.0
+            is_integer_exp = abs(n_val - n_rounded) < epsilon
+            
+            if is_flat_denom and is_integer_exp:               
+                # --- FIND THE CORRESPONDING POLYNOMIAL ---                
+                backup_K = hf.raw_K.data.clone()
+                backup_n = hf.raw_n.data.clone()
+                
+                # Force k = 0
+                hf.raw_K.data.fill_(-20.0) 
+                
+                # Force n = n_rounded
+                target_sigmoid = max(min((n_rounded - 1.0) / 3.0, 0.999), 0.001) 
+                hf.raw_n.data.fill_(torch.logit(torch.tensor(target_sigmoid)).item())
+                
+                # Generate the perfect polynomial shape
+                perfect_shape = eql.get_features(uv_synthetic)[:, h_idx]
+                perfect_norm = torch.norm(perfect_shape) + 1e-9
+                
+                # Search the polynomial basis for the exact match
+                best_p_idx = -1
+                best_corr = -1.0
+                
+                for p_idx in range(num_poly):
+                    f_poly = features[:, p_idx]
+                    poly_norm = torch.norm(f_poly) + 1e-9
+                    
+                    # Cosine similarity (1.0 = identical shape)
+                    corr = torch.sum(perfect_shape * f_poly) / (perfect_norm * poly_norm)
+                    
+                    if corr > best_corr:
+                        best_corr = corr.item()
+                        best_p_idx = p_idx
+                
+                # 4. EXECUTE THE TRANSFER
+                # If we found a perfect structural match (correlation > 0.99)
+                if best_corr > 0.99:
+                    print(f"Moving weight {hill_weight:.4f} directly to Poly {best_p_idx}, max_denom={max_denom:.2f}, n={n_val:.3f}")
+                    
+                    # Move the exact coefficient
+                    eql.fc.weight.data[0, best_p_idx] += hill_weight
+                    
+                    # Transfer Gate L0 Importance
+                    eql.l0_gate.log_alpha.data[best_p_idx] = torch.max(
+                        eql.l0_gate.log_alpha.data[best_p_idx],
+                        eql.l0_gate.log_alpha.data[h_idx]
+                    )
+                    
+                    # Kill the Hill term
+                    eql.fc.weight.data[0, h_idx] = 0.0
+                    eql.l0_gate.log_alpha.data[h_idx] = -10.0
+                    
+                else:
+                    # Failsafe: The required polynomial doesn't exist in your basis 
+                    # (e.g., Hill became u^3, but poly basis stops at degree 2).
+                    print(f"Target polynomial not in basis. Restoring Hill term.")
+                    hf.raw_K.data = backup_K
+                    hf.raw_n.data = backup_n
+
         _ = self.extract_params(full=True)
         print(f"Fine-tuning committed.")
-                
+
     def _average_hill_params(self, idx1, idx2, weight1, weight2):
         """
         Helper to average n and raw_K for two Hill modules using a weighted average
