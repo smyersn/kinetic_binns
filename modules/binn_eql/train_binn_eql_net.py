@@ -44,7 +44,6 @@ degree = config['degree']
 pde_weight = config['pde_weight']
 l0_weight = config['l0_weight']
 # warm_up = config['warm_up']
-lux_tax = config['lux_tax']
 param_bounds = config['param_bounds']
 
 # 3. Map reaction function
@@ -143,14 +142,23 @@ model = model_wrapper(
     dir_name=dir_name,
     save_name=f'{dir_name}/binn')
 
+# Checkpoint resume logic
+checkpoint_path = os.path.join(dir_name, 'latest_checkpoint.pt')
+initial_epoch = 0
+
+if os.path.exists(checkpoint_path):
+    print(f"\nFound existing checkpoint. Resuming from {checkpoint_path}...", flush=True)
+    initial_epoch = model.load_checkpoint(checkpoint_path, device=device)
+
 # train jointly
 param_history, train_loss_dict, val_loss_dict = model.fit(
     train_data=train_data,
     val_data=val_data,
     epochs = epochs,
-    lux_tax=lux_tax,
     batch_size=batch_size,
-    early_stopping=early_stopping)
+    l0_weight=l0_weight,
+    early_stopping=early_stopping,
+    initial_epoch=initial_epoch)
 
 generate_loss_curves(train_loss_dict, val_loss_dict, dir_name, 20, 'training_loss_curves.png')
 

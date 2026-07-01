@@ -12,14 +12,15 @@ from modules.binn_eql.build_eql_layer import EQLLayer
 # 1. SUB-NETWORKS
 # ---------------------------------------------------------
 class D_PARAMS(nn.Module):
-    def __init__(self, input_features=2, base_val=0.5, noise_std=1):
+    def __init__(self, input_features=2, base_val=0.1, noise_std=0.5):
         super().__init__()
         base_log = torch.log(torch.tensor(base_val))         
         noise = torch.randn(input_features) * noise_std
         self.raw_D = nn.Parameter(base_log + noise)
         
     def forward(self):     
-        return torch.exp(self.raw_D)
+        # return torch.exp(self.raw_D)
+        return torch.clamp(torch.exp(self.raw_D), min=1e-2, max=10.0)
     
 class FourierFeatureEncoding(nn.Module):
     def __init__(self, in_features, mapping_size, scale=1.0):
@@ -284,7 +285,7 @@ class BINN(nn.Module):
 
         return torch.mean(pde_loss)
                             
-    def reg_loss(self, lux_tax, epoch):
+    def reg_loss(self, epoch):
         """
         Soft Wall Regularization:
         1. L0 Sparsity
@@ -292,13 +293,8 @@ class BINN(nn.Module):
         """
         # 1. L0 Sparsity
         gate_probs = self.reaction.eql_layer.l0_gate.expected_l0()
-        num_poly = self.reaction.eql_layer.num_poly_features
-        
-        l0_poly = gate_probs[:num_poly].sum()
-        l0_hill = gate_probs[num_poly:].sum() * lux_tax
-        total_l0 = l0_poly + l0_hill
 
-        return total_l0
+        return gate_probs.sum()
     
     def soft_wall_loss(self):
         # We pass epsilon=0.15 to ensure the curve doesn't saturate 
@@ -315,7 +311,7 @@ class BINN(nn.Module):
 
         return w_loss + k_loss
         
-    def loss(self, pred, true, epoch, lux_tax):       
+    def loss(self, pred, true, epoch):       
         # 1. GLS Loss (RAW)
         raw_gls = self.gls_loss(pred, true)
         
@@ -330,7 +326,7 @@ class BINN(nn.Module):
         raw_pde = self.pde_loss(inputs_rand, outputs_rand, epoch)
               
         # 4. Reg Loss (RAW L0)          
-        raw_l0 = self.reg_loss(lux_tax, epoch)
+        raw_l0 = self.reg_loss(epoch)
         
         # 5. Soft Wall (RAW - Always Enforced)
         raw_softwall = self.soft_wall_loss()

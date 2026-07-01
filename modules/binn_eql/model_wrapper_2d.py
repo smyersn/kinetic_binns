@@ -46,45 +46,37 @@ class model_wrapper():
             self.save_opt = False
             self.save_reg = False
         
-    def fit(self,
-            train_data,
-            val_data,
-            epochs,      
-            lux_tax,      
-            batch_size,
-            initial_epoch=0,
-            early_stopping=None,
-            best_train_loss=None,
-            best_val_loss=None,
-            lr_dec_epoch=None,
-            lr_dec_prop=1.0,
-            rel_save_thresh=0.0):
+    def fit(self, train_data, val_data, epochs, batch_size, l0_weight=0,
+            initial_epoch=0, early_stopping=None, best_train_loss=None,
+            best_val_loss=None, lr_dec_epoch=None, lr_dec_prop=1.0, rel_save_thresh=0.0):
                 
         start_time = time.time()
-        best_train_loss = 1e12 if best_train_loss is None else best_train_loss
-        best_val_loss = 1e12 if best_val_loss is None else best_val_loss  
         
-        self.param_history = {'raw_w_unscaled': [], 'effective_unscaled': [],'epoch': []}
-        self.param_history = {
-
-            'raw_w_unscaled': [], 
-            'effective_unscaled': [],
-            'diffusion_coeffs': [], 
-            'epoch': []}
+        # Protect histories from being overwritten if we are resuming
+        if initial_epoch == 0:
+            self.param_history = {
+                'raw_w_unscaled': [], 
+                'effective_unscaled': [],
+                'diffusion_coeffs': [], 
+                'epoch': []
+            }
+            best_train_loss = 1e12 if best_train_loss is None else best_train_loss
+            best_val_loss = 1e12 if best_val_loss is None else best_val_loss  
+        else:
+            # Recover the best losses from the loaded history
+            best_train_loss = min(self.train_loss_dict['loss']) if self.train_loss_dict['loss'] else 1e12
+            best_val_loss = min(self.val_loss_dict['loss']) if self.val_loss_dict['loss'] else 1e12
         
-        # Initialize ReLoBRaLo for [GLS, PDE, REG]
         self.relobralo = GatedReLoBRaLo(num_losses=3, temperature=0.1, alpha=0.99, device=train_data.device)
         
-        # phase_1_end = (0.2 * epochs)
-        # phase_2_end = (0.3 * epochs)
-        # phase_3_end = (0.4 * epochs)
+        phase_1_end = int(0.2 * epochs)
+        phase_2_end = int(0.4 * epochs)
+        phase_3_end = int(0.6 * epochs)
 
-        phase_1_end = (0.2 * epochs)
-        phase_2_end = (0.4 * epochs)
-        phase_3_end = (0.6 * epochs)
-
-      
-        for epoch in range(initial_epoch, initial_epoch + epochs):
+        # Initialize early stopping tracker before the loop starts
+        last_improved = initial_epoch
+        
+        for epoch in range(initial_epoch, epochs): 
             # -----------------------------
             # 1. Determine Phase
             # -----------------------------
@@ -125,7 +117,7 @@ class model_wrapper():
                         pg['lr'] = 1e-3
                     elif pg.get('name') == 'diffusion':
                         # pg['lr'] = 0
-                        pg['lr'] = 1e-4
+                        pg['lr'] = 1e-3
 
                 for p in self.model.surface_fitter.parameters(): p.requires_grad = False
                 for p in self.model.reaction.parameters(): p.requires_grad = True
@@ -167,7 +159,9 @@ class model_wrapper():
                     
                     robust_max_u = torch.topk(global_u_sq, k_points).values.mean().item()
                     robust_max_v = torch.topk(global_v_sq, k_points).values.mean().item()
-                    
+                    # robust_max_u = torch.quantile(global_u_sq, 0.90).item()
+                    # robust_max_v = torch.quantile(global_v_sq, 0.90).item()    
+
                     # <-- FIXED: Attach scales directly to the BINN model -->
                     self.model.pde_scale_u = robust_max_u + 1e-6
                     self.model.pde_scale_v = robust_max_v + 1e-6
@@ -179,7 +173,7 @@ class model_wrapper():
                 # Phase 3: Physics On, Ramp Reg
                 phase_duration = phase_3_end - phase_2_end
                 progress = ((epoch - phase_2_end) / phase_duration)
-                base_weights = torch.tensor([0.0, 1.0, 2.0*progress], device=train_data.device)    
+                base_weights = torch.tensor([0.0, 1.0, l0_weight*progress], device=train_data.device)    
                             
                 for pg in self.optimizer.param_groups:
                     if pg.get('name') == 'surface':
@@ -187,7 +181,7 @@ class model_wrapper():
                     elif pg.get('name') == 'reaction':
                         pg['lr'] = 1e-3
                     elif pg.get('name') == 'diffusion':
-                        pg['lr'] = 1e-4
+                        pg['lr'] = 1e-3
                 
                 for p in self.model.surface_fitter.parameters(): p.requires_grad = False
                 for p in self.model.reaction.parameters(): p.requires_grad = True
@@ -196,7 +190,7 @@ class model_wrapper():
 
             elif phase == 4:
                 # Phase 4: Max Reg
-                base_weights = torch.tensor([0.0, 1.0, 2.0], device=train_data.device)  
+                base_weights = torch.tensor([0.0, 1.0, l0_weight], device=train_data.device)  
                               
                 for pg in self.optimizer.param_groups:
                     if pg.get('name') == 'surface':
@@ -204,7 +198,7 @@ class model_wrapper():
                     elif pg.get('name') == 'reaction':
                         pg['lr'] = 1e-3
                     elif pg.get('name') == 'diffusion':
-                        pg['lr'] = 1e-4
+                        pg['lr'] = 1e-3
 
                 for p in self.model.surface_fitter.parameters(): p.requires_grad = False
                 for p in self.model.reaction.parameters(): p.requires_grad = True
@@ -260,7 +254,7 @@ class model_wrapper():
                                     
                 # --- RELOBRALO INTEGRATION ---                   
                 # 1. Capture the 4 RAW unweighted tensors
-                raw_gls, raw_pde, raw_l0, raw_softwall = self.loss(y_pred, y_true, epoch, lux_tax)
+                raw_gls, raw_pde, raw_l0, raw_softwall = self.loss(y_pred, y_true, epoch)
                 
                 # 2. Stack only the 3 competing losses for ReLoBRaLo
                 raw_relo_losses = torch.stack([raw_gls, raw_pde, raw_l0])
@@ -332,7 +326,7 @@ class model_wrapper():
                 
                 # --- RELOBRALO VALIDATION ---                   
                 # 2. Capture the 4 RAW unweighted tensors
-                raw_gls, raw_pde, raw_l0, raw_softwall = self.loss(y_pred, y_true, epoch, lux_tax)
+                raw_gls, raw_pde, raw_l0, raw_softwall = self.loss(y_pred, y_true, epoch)
                 
                 # 3. Stack only the 3 competing losses
                 raw_relo_losses = torch.stack([raw_gls, raw_pde, raw_l0])
@@ -399,7 +393,22 @@ class model_wrapper():
                 if np.mod(epoch, lr_dec_epoch) == 0 and epoch != 0:
                     for param_group in self.optimizer.param_groups:
                         param_group['lr'] *= lr_dec_prop
-                        
+
+            # -----------------------------
+            # 5. Checkpoint Saving (ADD THIS TO THE VERY END OF THE EPOCH LOOP)
+            # -----------------------------
+            if epoch % 50 == 0 or epoch == epochs - 1:
+                checkpoint = {
+                    'epoch': epoch,
+                    'model_state': self.model.state_dict(),
+                    'optimizer_state': self.optimizer.state_dict(),
+                    'scheduler_state': self.scheduler.state_dict() if self.scheduler else None,
+                    'train_loss_dict': self.train_loss_dict,
+                    'val_loss_dict': self.val_loss_dict,
+                    'param_history': self.param_history
+                }
+                torch.save(checkpoint, f'{self.dir_name}/latest_checkpoint.pt')
+                            
         elapsed, remaining, ms = time_remaining(
             current_iter=epoch+1,
             total_iter=initial_epoch+epochs,
@@ -425,6 +434,27 @@ class model_wrapper():
         print(p, flush=True)
             
         return self.param_history, self.train_loss_dict, self.val_loss_dict
+    
+    def load_checkpoint(self, path, device='cuda'):
+        checkpoint = torch.load(path, map_location=device, weights_only=False)
+        
+        self.model.load_state_dict(checkpoint['model_state'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state'])
+        
+        # --- THE FIX ---
+        # Get the true epoch from the checkpoint dictionary
+        resume_epoch = checkpoint['epoch'] + 1
+        
+        if self.scheduler is not None and checkpoint.get('scheduler_state'):
+            self.scheduler.load_state_dict(checkpoint['scheduler_state'])
+            # Manually sync the scheduler's internal clock to the true resume epoch
+            self.scheduler.last_epoch = resume_epoch
+            
+        self.train_loss_dict = checkpoint['train_loss_dict']
+        self.val_loss_dict = checkpoint['val_loss_dict']
+        self.param_history = checkpoint['param_history']
+        
+        return resume_epoch
                                         
     def predict(self, inputs):
         self.model.eval()
