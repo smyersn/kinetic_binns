@@ -154,7 +154,7 @@ if os.path.exists(checkpoint_path):
 param_history, train_loss_dict, val_loss_dict = model.fit(
     train_data=train_data,
     val_data=val_data,
-    epochs = epochs,
+    epochs=epochs,
     batch_size=batch_size,
     l0_weight=l0_weight,
     early_stopping=early_stopping,

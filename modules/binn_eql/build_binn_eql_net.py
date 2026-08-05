@@ -19,8 +19,8 @@ class D_PARAMS(nn.Module):
         self.raw_D = nn.Parameter(base_log + noise)
         
     def forward(self):     
-        # return torch.exp(self.raw_D)
-        return torch.clamp(torch.exp(self.raw_D), min=1e-2, max=10.0)
+        return torch.exp(self.raw_D)
+        # return torch.clamp(torch.exp(self.raw_D), min=1e-2, max=10.0)
     
 class FourierFeatureEncoding(nn.Module):
     def __init__(self, in_features, mapping_size, scale=1.0):
@@ -63,7 +63,7 @@ class FourierFeatureEncoding(nn.Module):
 #         return self.mlp(full_features)
     
 class uv_MLP(nn.Module):
-    def __init__(self, input_features, mapping_size=64, scale=1.0, layers=[256, 256, 256, 2]):
+    def __init__(self, input_features, mapping_size=256, scale=1.0, layers=[256, 256, 256, 2]):
     # def __init__(self, input_features, mapping_size=128, scale=10.0, layers=[256, 256, 256, 2]):
         super().__init__()
         
@@ -130,8 +130,9 @@ class F_EQL(nn.Module):
 # ---------------------------------------------------------
 class BINN(nn.Module):
     def __init__(self, dimensions, species, train_data, duplicates=1,
-                 diff_coeffs=None, uv_layers=None, degree=2, param_bounds=10):
-        
+                diff_coeffs=None, uv_layers=None, degree=2, param_bounds=10,
+                fourier_scale=1.0, fourier_mapping_size=64): 
+ 
         super().__init__()
         self.dimensions = dimensions        
         self.species = species
@@ -177,9 +178,11 @@ class BINN(nn.Module):
                 
         # Surface Fitter (Dimensionless)
         if uv_layers:
-            self.surface_fitter = uv_MLP(input_features=dimensions+1, layers=uv_layers)
+            self.surface_fitter = uv_MLP(input_features=dimensions+1, layers=uv_layers,
+                                          scale=fourier_scale, mapping_size=fourier_mapping_size)
         else:
-            self.surface_fitter = uv_MLP(input_features=dimensions+1)
+            self.surface_fitter = uv_MLP(input_features=dimensions+1,
+                                          scale=fourier_scale, mapping_size=fourier_mapping_size)
         
         # Reaction (Input: Normalized -> Output: Unscaled Rate)
         # We pass max_scale so EQLLayer can calculate physical values for the Loss
@@ -219,6 +222,92 @@ class BINN(nn.Module):
         weighted_residual = residual * weights
         
         return torch.mean(weighted_residual)    
+
+    def gls_loss_time_weighted(self, pred, true, time_scale=5.0, max_weight=50.0):
+        """
+        Generalizes the existing ic_mask weighting (which only boosts
+        exact t=0 rows) into a smooth decay over early time. The t=0.5
+        transient carries the hardest curvature in the trajectory AND
+        is one of the rarest timesteps in the dataset under uniform
+        sampling - this compensates on the loss side without touching
+        how batches are sampled.
+
+        weight(t) = 1 + (max_weight - 1) * exp(-(t - t_min) / time_scale)
+        At t = t_min: weight = max_weight
+        As t grows:   weight decays smoothly back to 1
+        """
+        residual = ((pred - true) / self.mean_scale) ** 2
+
+        t = self.inputs[:, -1:]
+        t_min = self.lb[0, -1]
+        weights = 1.0 + (max_weight - 1.0) * torch.exp(-(t - t_min) / time_scale)
+
+        weighted_residual = residual * weights
+        return torch.mean(weighted_residual)
+
+    @torch.no_grad()
+    def _pde_scale_forward_pass(self, chunk):
+        """Helper: not used directly (kept for clarity of what needs grad)."""
+        pass
+
+    def register_pde_scale(self, train_data, quantile_percent=0.01, chunk_size=50_000):
+        """
+        Locks robust PDE normalization scales (pde_scale_u, pde_scale_v),
+        analogous to register_curvature_scale. Computes the top-quantile
+        mean of u_t^2 / v_t^2 from the CURRENT surface_fitter, so this must
+        be called once the surface has been fit (start of Phase 2), not
+        at __init__ time when the surface is still random.
+        """
+        if getattr(self, 'pde_scales_locked', False):
+            return  # already locked, don't recompute mid-training
+
+        # print("\n--- Calculating Robust PDE Scales (Top {}%) ---".format(quantile_percent * 100))
+        print("\n--- Calculating Robust PDE Scales (90th percentile) ---")
+
+        was_training = self.surface_fitter.training
+        self.surface_fitter.eval()
+
+        all_u_sq = []
+        all_v_sq = []
+        total_points = len(train_data)
+
+        for chunk_start in range(0, total_points, chunk_size):
+            chunk = train_data[chunk_start:chunk_start + chunk_size].clone().requires_grad_(True)
+            outputs = self.surface_fitter(self.normalize(chunk[:, :self.dimensions + 1]))
+
+            u_t = gradient(outputs[:, 0], chunk, order=1)[:, self.dimensions]
+            v_t = gradient(outputs[:, 1], chunk, order=1)[:, self.dimensions]
+
+            all_u_sq.append((u_t ** 2).detach().cpu())
+            all_v_sq.append((v_t ** 2).detach().cpu())
+
+            del chunk, outputs, u_t, v_t
+
+        if was_training:
+            self.surface_fitter.train()
+
+        global_u_sq = torch.cat(all_u_sq)
+        global_v_sq = torch.cat(all_v_sq)
+
+        # k_points = int(quantile_percent * total_points)
+        # robust_max_u = torch.topk(global_u_sq, k_points).values.mean().item()
+        # robust_max_v = torch.topk(global_v_sq, k_points).values.mean().item()
+
+        # self.pde_scale_u = robust_max_u + 1e-6
+        # self.pde_scale_v = robust_max_v + 1e-6
+        # self.pde_scales_locked = True
+
+        # print(f"Locked Top {quantile_percent*100}% Scales -> u: {self.pde_scale_u:.4e}, v: {self.pde_scale_v:.4e}\n")
+
+        robust_max_u = torch.quantile(global_u_sq, 0.90).item()
+        robust_max_v = torch.quantile(global_v_sq, 0.90).item()
+        
+        self.pde_scale_u = robust_max_u + 1e-6
+        self.pde_scale_v = robust_max_v + 1e-6
+        self.pde_scales_locked = True 
+        
+        print(f"Locked 90th Percentile Scales -> u: {self.pde_scale_u:.4e}, v: {self.pde_scale_v:.4e}\n")
+
     
     def pde_loss(self, inputs, outputs, epoch):
         # unpack outputs
@@ -246,12 +335,18 @@ class BINN(nn.Module):
         F = self.reaction(u)
         
         # diffusion
+        # if self.diff_coeffs:
+        #     Du, Dv = torch.tensor(self.diff_coeffs[0]), torch.tensor(self.diff_coeffs[1])
+        # else:
+        #     D = self.diffusion_fitter()
+        #     Du, Dv = D[0], D[1]
+
         if self.diff_coeffs:
             Du, Dv = torch.tensor(self.diff_coeffs[0]), torch.tensor(self.diff_coeffs[1])
         else:
             D = self.diffusion_fitter()
-            Du, Dv = D[0], D[1]
-                    
+            Du, Dv = D[0].detach(), D[1].detach()   # NEW: only mass_loss trains diffusion now
+      
         lap_u = Du * torch.sum(uxx_array[0, :, :], dim=1, keepdim=True)
         lap_v = Dv * torch.sum(uxx_array[1, :, :], dim=1, keepdim=True)
                     
@@ -283,8 +378,57 @@ class BINN(nn.Module):
 
         # pde_loss = pde_loss_u + pde_loss_v
 
-        return torch.mean(pde_loss)
-                            
+        return torch.mean(pde_loss)    
+    
+    def mass_loss(self, inputs, outputs):
+        """
+        Fits Du, Dv against the reaction-free mass equation:
+            (u+v)_t = Du·lap_u + Dv·lap_v
+        F cancels exactly here (u_t = Du·lap_u + F, v_t = Dv·lap_v - F,
+        sum eliminates F), so this isolates diffusion scale independent
+        of the reaction term.
+
+        At steady state (u_t, v_t -> 0) this equation only constrains
+        the RATIO Du/Dv - scaling both by any constant c leaves 0 = 0
+        unchanged. Absolute scale is only identifiable where w_t != 0,
+        i.e. in the transient. Points are weighted by |w_t| so the
+        transient dominates the fit rather than being drowned out by
+        the much more numerous near-steady-state points.
+
+        Caller must supply inputs/outputs sampled with t >= mass_t_cutoff.
+        The first ~1-2 saved frames are the raw relaxing IC, where both
+        the surface fit and the FD ground truth used to validate it are
+        unreliable (lap_rel_err 95-154% there vs. ~8% for t>=3.5).
+        Including them would fit Du/Dv against noise.
+        """
+        if not self.diff_coeffs:
+            D = self.diffusion_fitter()
+            Du, Dv = D[0], D[1]
+        else:
+            return torch.tensor(0.0, device=inputs.device)
+
+        u = outputs[:, 0]
+        v = outputs[:, 1]
+
+        du_grad = gradient(u, inputs, order=1)
+        dv_grad = gradient(v, inputs, order=1)
+        u_t = du_grad[:, -1]
+        v_t = dv_grad[:, -1]
+        w_t = u_t + v_t
+
+        lap_u = torch.zeros_like(u_t)
+        lap_v = torch.zeros_like(v_t)
+        for j in range(self.dimensions):
+            lap_u = lap_u + gradient(du_grad[:, j], inputs, order=1)[:, j]
+            lap_v = lap_v + gradient(dv_grad[:, j], inputs, order=1)[:, j]
+
+        residual = w_t - (Du * lap_u + Dv * lap_v)
+
+        weights = torch.abs(w_t).detach()
+        weights = weights / (weights.mean() + 1e-8)
+
+        return torch.mean(weights * residual ** 2)
+    
     def reg_loss(self, epoch):
         """
         Soft Wall Regularization:
@@ -310,30 +454,42 @@ class BINN(nn.Module):
         k_loss = torch.sum(k_violation) * 100
 
         return w_loss + k_loss
-        
-    def loss(self, pred, true, epoch):       
+
+    def loss(self, pred, true, epoch):
         # 1. GLS Loss (RAW)
-        raw_gls = self.gls_loss(pred, true)
-        
+        # raw_gls = self.gls_loss(pred, true)
+        raw_gls = self.gls_loss_time_weighted(pred, true)
+
         # 2. PDE Sampling
         x = torch.empty(self.num_samples, self.dimensions, device=pred.device).uniform_(self.lb[0,0], self.ub[0,0])
         t = torch.empty(self.num_samples, 1, device=pred.device).uniform_(self.lb[0,-1], self.ub[0,-1])
         inputs_rand = torch.cat([x, t], dim=1).requires_grad_()
         inputs_rand_norm = self.normalize(inputs_rand)
         outputs_rand = self.surface_fitter(inputs_rand_norm)
-             
+
         # 3. PDE Loss (RAW)
         raw_pde = self.pde_loss(inputs_rand, outputs_rand, epoch)
-              
-        # 4. Reg Loss (RAW L0)          
+
+        # 4. Reg Loss (RAW L0)
         raw_l0 = self.reg_loss(epoch)
-        
+
         # 5. Soft Wall (RAW - Always Enforced)
         raw_softwall = self.soft_wall_loss()
-                      
-        # Return all 4 separated, unweighted tensors
-        return raw_gls, raw_pde, raw_l0, raw_softwall
-    
+
+        # 6. Mass-equation Loss (RAW) - separate collocation sample,
+        # excluding the unreliable early-transient frames via mass_t_cutoff.
+        # Only meaningful once diffusion_fitter is active (Phase 2+); the
+        # mass_loss method itself returns 0 if diff_coeffs is fixed.
+        t_cutoff = getattr(self, 'mass_t_cutoff', 2.0)
+        x_mass = torch.empty(self.num_samples, self.dimensions, device=pred.device).uniform_(self.lb[0,0], self.ub[0,0])
+        t_mass = torch.empty(self.num_samples, 1, device=pred.device).uniform_(t_cutoff, self.ub[0,-1])
+        inputs_mass = torch.cat([x_mass, t_mass], dim=1).requires_grad_()
+        inputs_mass_norm = self.normalize(inputs_mass)
+        outputs_mass = self.surface_fitter(inputs_mass_norm)
+        raw_mass = self.mass_loss(inputs_mass, outputs_mass)
+
+        return raw_gls, raw_pde, raw_l0, raw_softwall, raw_mass
+        
     # -----------------------
     # Parameter Extraction (Unscaling)
     # -----------------------
