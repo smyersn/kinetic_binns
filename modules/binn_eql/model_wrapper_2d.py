@@ -121,6 +121,11 @@ class model_wrapper():
                 # PDE normalization - computed once, locked inside BINN itself.
                 self.model.register_pde_scale(train_data)
 
+                self.model.register_pde_scale(train_data)
+                self.model.register_mass_scale(train_data)
+                if not hasattr(self.model, '_collocation_cache'):
+                    self.model.refresh_collocation_cache()
+
             elif phase == 3:
                 # Phase 3: Physics On, Ramp Reg
                 phase_duration = phase_3_end - phase_2_end
@@ -207,7 +212,7 @@ class model_wrapper():
                                     
                 y_pred = self.model(x_true)
 
-                raw_gls, raw_pde, raw_l0, raw_softwall, raw_mass = self.loss(y_pred, y_true, epoch)   # NEW: raw_mass
+                raw_gls, raw_pde, raw_l0, raw_softwall, raw_mass = self.loss(y_pred, y_true, epoch, phase)
                 
                 weighted_losses = torch.stack([raw_gls, raw_pde, raw_l0]) * base_weights
 
@@ -271,7 +276,7 @@ class model_wrapper():
                                                 
                 y_pred = self.model(x_true)
                 
-                raw_gls, raw_pde, raw_l0, raw_softwall, raw_mass = self.loss(y_pred, y_true, epoch)   # NEW: raw_mass
+                raw_gls, raw_pde, raw_l0, raw_softwall, raw_mass = self.loss(y_pred, y_true, epoch, phase)
                 
                 weighted_losses = torch.stack([raw_gls, raw_pde, raw_l0]) * base_weights
 

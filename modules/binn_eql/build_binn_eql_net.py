@@ -206,45 +206,6 @@ class BINN(nn.Module):
     # -----------------------
     # Loss Functions
     # -----------------------
-    # def gls_loss(self, pred, true):
-    #     residual = ((pred - true) / self.mean_scale)**2
-    #     return torch.mean(residual)
-
-    def gls_loss(self, pred, true):
-        # Calculate raw squared residuals
-        residual = ((pred - true) / self.mean_scale)**2
-
-        # Create mask for inputs at t = 0
-        ic_mask = self.inputs[:, -1:] == 0
-                
-        # Weight the residuals before taking the mean
-        weights = torch.where(ic_mask, 10.0, 1.0)
-        weighted_residual = residual * weights
-        
-        return torch.mean(weighted_residual)    
-
-    def gls_loss_time_weighted(self, pred, true, time_scale=5.0, max_weight=50.0):
-        """
-        Generalizes the existing ic_mask weighting (which only boosts
-        exact t=0 rows) into a smooth decay over early time. The t=0.5
-        transient carries the hardest curvature in the trajectory AND
-        is one of the rarest timesteps in the dataset under uniform
-        sampling - this compensates on the loss side without touching
-        how batches are sampled.
-
-        weight(t) = 1 + (max_weight - 1) * exp(-(t - t_min) / time_scale)
-        At t = t_min: weight = max_weight
-        As t grows:   weight decays smoothly back to 1
-        """
-        residual = ((pred - true) / self.mean_scale) ** 2
-
-        t = self.inputs[:, -1:]
-        t_min = self.lb[0, -1]
-        weights = 1.0 + (max_weight - 1.0) * torch.exp(-(t - t_min) / time_scale)
-
-        weighted_residual = residual * weights
-        return torch.mean(weighted_residual)
-
     @torch.no_grad()
     def _pde_scale_forward_pass(self, chunk):
         """Helper: not used directly (kept for clarity of what needs grad)."""
@@ -289,16 +250,6 @@ class BINN(nn.Module):
         global_u_sq = torch.cat(all_u_sq)
         global_v_sq = torch.cat(all_v_sq)
 
-        # k_points = int(quantile_percent * total_points)
-        # robust_max_u = torch.topk(global_u_sq, k_points).values.mean().item()
-        # robust_max_v = torch.topk(global_v_sq, k_points).values.mean().item()
-
-        # self.pde_scale_u = robust_max_u + 1e-6
-        # self.pde_scale_v = robust_max_v + 1e-6
-        # self.pde_scales_locked = True
-
-        # print(f"Locked Top {quantile_percent*100}% Scales -> u: {self.pde_scale_u:.4e}, v: {self.pde_scale_v:.4e}\n")
-
         robust_max_u = torch.quantile(global_u_sq, 0.90).item()
         robust_max_v = torch.quantile(global_v_sq, 0.90).item()
         
@@ -308,125 +259,190 @@ class BINN(nn.Module):
         
         print(f"Locked 90th Percentile Scales -> u: {self.pde_scale_u:.4e}, v: {self.pde_scale_v:.4e}\n")
 
+    def register_mass_scale(self, train_data, t_cutoff=None, chunk_size=50_000):
+        """
+        Locks a robust normalization scale for mass_loss, analogous to
+        register_pde_scale. Computes the 90th-percentile w_t^2 = (u_t+v_t)^2
+        from the CURRENT surface_fitter, restricted to t >= mass_t_cutoff (the
+        same region mass_loss samples from). Must be called once the surface
+        has converged (start of Phase 2), same timing as register_pde_scale.
+        """
+        if getattr(self, 'mass_scale_locked', False):
+            return
+
+        t_cutoff = t_cutoff if t_cutoff is not None else getattr(self, 'mass_t_cutoff', 2.0)
+        print(f"\n--- Calculating Robust Mass Scale (90th percentile, t>={t_cutoff}) ---")
+
+        was_training = self.surface_fitter.training
+        self.surface_fitter.eval()
+
+        mask = train_data[:, self.dimensions] >= t_cutoff
+        subset = train_data[mask]
+
+        all_wt_sq = []
+        for chunk_start in range(0, len(subset), chunk_size):
+            chunk = subset[chunk_start:chunk_start + chunk_size].clone().requires_grad_(True)
+            outputs = self.surface_fitter(self.normalize(chunk[:, :self.dimensions + 1]))
+
+            u_t = gradient(outputs[:, 0], chunk, order=1)[:, self.dimensions]
+            v_t = gradient(outputs[:, 1], chunk, order=1)[:, self.dimensions]
+            w_t = u_t + v_t
+
+            all_wt_sq.append((w_t ** 2).detach().cpu())
+            del chunk, outputs, u_t, v_t, w_t
+
+        if was_training:
+            self.surface_fitter.train()
+
+        global_wt_sq = torch.cat(all_wt_sq)
+        robust_max_wt = torch.quantile(global_wt_sq, 0.90).item()
+
+        self.mass_scale = robust_max_wt + 1e-8
+        self.mass_scale_locked = True
+
+        print(f"Locked 90th Percentile Mass Scale -> {self.mass_scale:.4e}\n")
+
+    def refresh_collocation_cache(self, cache_size=200_000, mass_t_cutoff=None, chunk_size=20_000):
+        """
+        Precomputes ut_array/uxx_array for a large fixed pool of collocation
+        points using the CURRENT surface_fitter, then detaches. Chunked because
+        the double-backward derivative graph (create_graph=True, twice) is much
+        more memory-hungry per point than a plain forward pass -- building it for
+        cache_size points in one shot OOMs even on an H200, let alone a shared one.
+        """
+        t_cutoff = mass_t_cutoff if mass_t_cutoff is not None else getattr(self, 'mass_t_cutoff', 2.0)
+
+        was_training = self.surface_fitter.training
+        self.surface_fitter.eval()
+
+        outputs_list, ut_list, uxx_list, mask_list = [], [], [], []
+
+        for chunk_start in range(0, cache_size, chunk_size):
+            n = min(chunk_size, cache_size - chunk_start)
+            x = torch.empty(n, self.dimensions, device=self.lb.device).uniform_(
+                self.lb[0, 0].item(), self.ub[0, 0].item())
+            t = torch.empty(n, 1, device=self.lb.device).uniform_(
+                self.lb[0, -1].item(), self.ub[0, -1].item())
+            inputs = torch.cat([x, t], dim=1).requires_grad_(True)
+            outputs = self.surface_fitter(self.normalize(inputs))
+            ut_array, uxx_array = self.compute_field_derivatives(inputs, outputs)
+
+            outputs_list.append(outputs.detach())
+            ut_list.append(ut_array.detach())
+            uxx_list.append(uxx_array.detach())
+            mask_list.append((inputs[:, -1] >= t_cutoff).detach())
+
+            del x, t, inputs, outputs, ut_array, uxx_array
+            torch.cuda.empty_cache()
+
+        if was_training:
+            self.surface_fitter.train()
+
+        self._collocation_cache = {
+            'outputs': torch.cat(outputs_list, dim=0),
+            'ut_array': torch.cat(ut_list, dim=0),
+            'uxx_array': torch.cat(uxx_list, dim=1),   # species dim is axis 0, points is axis 1
+            'mass_mask': torch.cat(mask_list, dim=0),
+        }
+        print(f"Refreshed collocation cache: {cache_size} points ({chunk_size}/chunk), "
+            f"{self._collocation_cache['mass_mask'].sum().item()} pass mass cutoff")
     
-    def pde_loss(self, inputs, outputs, epoch):
-        # unpack outputs
-        u = outputs.clone()
-        # u_scaled = u / self.max_scale # Normalize inputs for EQL
-
-        # create arrays to store partial derivatives
+    def compute_field_derivatives(self, inputs, outputs):
         points = len(inputs)
-        uxx_array = torch.zeros((self.species, points, self.dimensions)).to(inputs.device)
-        ut_array = torch.zeros((points, self.species)).to(inputs.device)
-
-        # partial derivative computations
+        uxx_array = torch.zeros((self.species, points, self.dimensions), device=inputs.device)
+        ut_array = torch.zeros((points, self.species), device=inputs.device)
         for i in range(self.species):
-            d1 = gradient(u[:, i], inputs, order=1)
-            ut = d1[:, -1]
-            ut_array[:, i] = ut
-
+            d1 = gradient(outputs[:, i], inputs, order=1)
+            ut_array[:, i] = d1[:, -1]
             for j in range(self.dimensions):
-                d2 = gradient(d1[:, j], inputs, order=1)
-                uxx = d2[:, j]
-                uxx_array[i, :, j] = uxx
-                                    
-        # reaction
-        # F = self.reaction(u_scaled)
-        F = self.reaction(u)
+                uxx_array[i, :, j] = gradient(d1[:, j], inputs, order=1)[:, j]
+        return ut_array, uxx_array
+  
+    # def gls_loss(self, pred, true):
+    #     residual = ((pred - true) / self.mean_scale)**2
+    #     return torch.mean(residual)
+
+    def gls_loss(self, pred, true):
+        # Calculate raw squared residuals
+        residual = ((pred - true) / self.mean_scale)**2
+
+        # Create mask for inputs at t = 0
+        ic_mask = self.inputs[:, -1:] == 0
+                
+        # Weight the residuals before taking the mean
+        weights = torch.where(ic_mask, 10.0, 1.0)
+        weighted_residual = residual * weights
         
-        # diffusion
-        # if self.diff_coeffs:
-        #     Du, Dv = torch.tensor(self.diff_coeffs[0]), torch.tensor(self.diff_coeffs[1])
-        # else:
-        #     D = self.diffusion_fitter()
-        #     Du, Dv = D[0], D[1]
+        return torch.mean(weighted_residual)    
+
+    def gls_loss_time_weighted(self, pred, true, time_scale=5.0, max_weight=50.0):
+        """
+        Generalizes the existing ic_mask weighting (which only boosts
+        exact t=0 rows) into a smooth decay over early time. The t=0.5
+        transient carries the hardest curvature in the trajectory AND
+        is one of the rarest timesteps in the dataset under uniform
+        sampling - this compensates on the loss side without touching
+        how batches are sampled.
+
+        weight(t) = 1 + (max_weight - 1) * exp(-(t - t_min) / time_scale)
+        At t = t_min: weight = max_weight
+        As t grows:   weight decays smoothly back to 1
+        """
+        residual = ((pred - true) / self.mean_scale) ** 2
+
+        t = self.inputs[:, -1:]
+        t_min = self.lb[0, -1]
+        weights = 1.0 + (max_weight - 1.0) * torch.exp(-(t - t_min) / time_scale)
+
+        weighted_residual = residual * weights
+        return torch.mean(weighted_residual)
+
+    def pde_loss_from_derivatives(self, outputs, ut_array, uxx_array, epoch):
+        u = outputs
+        F = self.reaction(u)
 
         if self.diff_coeffs:
             Du, Dv = torch.tensor(self.diff_coeffs[0]), torch.tensor(self.diff_coeffs[1])
         else:
             D = self.diffusion_fitter()
-            Du, Dv = D[0].detach(), D[1].detach()   # NEW: only mass_loss trains diffusion now
-      
+            Du, Dv = D[0], D[1]
+
         lap_u = Du * torch.sum(uxx_array[0, :, :], dim=1, keepdim=True)
         lap_v = Dv * torch.sum(uxx_array[1, :, :], dim=1, keepdim=True)
-                    
-        # Reaction-diffusion equation       
-        LHS_u = ut_array[:, 0][:,None]
-        RHS_u = lap_u + F
-        LHS_v = ut_array[:, 1][:,None]
-        RHS_v = lap_v - F
 
-        # 1. Convert squared max variance back to standard deviation
-        # (Fallback to 1.0 for Phase 1 before the wrapper calculates the true scales)
-        scale_u = torch.sqrt(torch.tensor(getattr(self, 'pde_scale_u', 1.0), device=inputs.device))
-        scale_v = torch.sqrt(torch.tensor(getattr(self, 'pde_scale_v', 1.0), device=inputs.device))
+        LHS_u, RHS_u = ut_array[:, 0][:, None], lap_u + F
+        LHS_v, RHS_v = ut_array[:, 1][:, None], lap_v - F
 
-        # 2. Normalize differences FIRST to create a dimensionless residual
+        scale_u = torch.sqrt(torch.tensor(getattr(self, 'pde_scale_u', 1.0), device=outputs.device))
+        scale_v = torch.sqrt(torch.tensor(getattr(self, 'pde_scale_v', 1.0), device=outputs.device))
+
         res_u = (LHS_u - RHS_u) / scale_u
         res_v = (LHS_v - RHS_v) / scale_v
-
-        # 3. Apply Huber Loss to the normalized residuals to buffer high-frequency noise spikes
         target_zero = torch.zeros_like(res_u)
+
         pde_loss_u = torch.nn.functional.smooth_l1_loss(res_u, target_zero, beta=1.0)
         pde_loss_v = torch.nn.functional.smooth_l1_loss(res_v, target_zero, beta=1.0)
 
-        pde_loss = pde_loss_u + pde_loss_v  
-
-        # # Use Smooth L1 (Huber) to prevent noise spikes from exploding to 10^15
-        # pde_loss_u = nn.functional.smooth_l1_loss(LHS_u, RHS_u, beta=1.0)
-        # pde_loss_v = nn.functional.smooth_l1_loss(LHS_v, RHS_v, beta=1.0)
-
-        # pde_loss = pde_loss_u + pde_loss_v
-
-        return torch.mean(pde_loss)    
+        return torch.mean(pde_loss_u + pde_loss_v)
     
-    def mass_loss(self, inputs, outputs):
-        """
-        Fits Du, Dv against the reaction-free mass equation:
-            (u+v)_t = Du·lap_u + Dv·lap_v
-        F cancels exactly here (u_t = Du·lap_u + F, v_t = Dv·lap_v - F,
-        sum eliminates F), so this isolates diffusion scale independent
-        of the reaction term.
+    def mass_loss_from_derivatives(self, ut_array, uxx_array, mask):
+        if self.diff_coeffs:
+            return torch.tensor(0.0, device=ut_array.device)
+        D = self.diffusion_fitter()
+        Du, Dv = D[0], D[1]
 
-        At steady state (u_t, v_t -> 0) this equation only constrains
-        the RATIO Du/Dv - scaling both by any constant c leaves 0 = 0
-        unchanged. Absolute scale is only identifiable where w_t != 0,
-        i.e. in the transient. Points are weighted by |w_t| so the
-        transient dominates the fit rather than being drowned out by
-        the much more numerous near-steady-state points.
-
-        Caller must supply inputs/outputs sampled with t >= mass_t_cutoff.
-        The first ~1-2 saved frames are the raw relaxing IC, where both
-        the surface fit and the FD ground truth used to validate it are
-        unreliable (lap_rel_err 95-154% there vs. ~8% for t>=3.5).
-        Including them would fit Du/Dv against noise.
-        """
-        if not self.diff_coeffs:
-            D = self.diffusion_fitter()
-            Du, Dv = D[0], D[1]
-        else:
-            return torch.tensor(0.0, device=inputs.device)
-
-        u = outputs[:, 0]
-        v = outputs[:, 1]
-
-        du_grad = gradient(u, inputs, order=1)
-        dv_grad = gradient(v, inputs, order=1)
-        u_t = du_grad[:, -1]
-        v_t = dv_grad[:, -1]
+        u_t = ut_array[mask, 0]
+        v_t = ut_array[mask, 1]
         w_t = u_t + v_t
 
-        lap_u = torch.zeros_like(u_t)
-        lap_v = torch.zeros_like(v_t)
-        for j in range(self.dimensions):
-            lap_u = lap_u + gradient(du_grad[:, j], inputs, order=1)[:, j]
-            lap_v = lap_v + gradient(dv_grad[:, j], inputs, order=1)[:, j]
+        lap_u = torch.sum(uxx_array[0, mask, :], dim=1)
+        lap_v = torch.sum(uxx_array[1, mask, :], dim=1)
 
-        residual = w_t - (Du * lap_u + Dv * lap_v)
+        scale = torch.sqrt(torch.tensor(getattr(self, 'mass_scale', 1.0), device=ut_array.device))
+        residual = (w_t - (Du * lap_u + Dv * lap_v)) / scale
 
         weights = torch.abs(w_t).detach()
         weights = weights / (weights.mean() + 1e-8)
-
         return torch.mean(weights * residual ** 2)
     
     def reg_loss(self, epoch):
@@ -455,38 +471,46 @@ class BINN(nn.Module):
 
         return w_loss + k_loss
 
-    def loss(self, pred, true, epoch):
-        # 1. GLS Loss (RAW)
-        # raw_gls = self.gls_loss(pred, true)
+    def loss(self, pred, true, epoch, phase=None):
         raw_gls = self.gls_loss_time_weighted(pred, true)
 
-        # 2. PDE Sampling
-        x = torch.empty(self.num_samples, self.dimensions, device=pred.device).uniform_(self.lb[0,0], self.ub[0,0])
-        t = torch.empty(self.num_samples, 1, device=pred.device).uniform_(self.lb[0,-1], self.ub[0,-1])
-        inputs_rand = torch.cat([x, t], dim=1).requires_grad_()
-        inputs_rand_norm = self.normalize(inputs_rand)
-        outputs_rand = self.surface_fitter(inputs_rand_norm)
+        raw_softwall = self.soft_wall_loss()   # always enforced, cheap regardless of phase
+        raw_l0 = self.reg_loss(epoch)          # cheap, gate probs only
 
-        # 3. PDE Loss (RAW)
-        raw_pde = self.pde_loss(inputs_rand, outputs_rand, epoch)
+        if phase == 1:
+            # Surface-only phase: reaction/diffusion are frozen (requires_grad=False),
+            # so pde_loss/mass_loss contribute zero gradient here regardless -- but
+            # without this check we'd still pay for collocation sampling + a full
+            # double-backward derivative pass through surface_fitter just to throw
+            # the result away via base_weights=0. Skip the computation entirely.
+            zero = torch.tensor(0.0, device=pred.device)
+            return raw_gls, zero, raw_l0, raw_softwall, zero
 
-        # 4. Reg Loss (RAW L0)
-        raw_l0 = self.reg_loss(epoch)
+        cache = getattr(self, '_collocation_cache', None)
+        if cache is not None:
+            idx = torch.randint(0, cache['outputs'].shape[0], (self.num_samples,), device=pred.device)
+            outputs_b = cache['outputs'][idx]
+            ut_b = cache['ut_array'][idx]
+            uxx_b = cache['uxx_array'][:, idx, :]      # FIX: points is axis 1 here, not axis 0
+            mask_b = cache['mass_mask'][idx]
+        
+        else:
+            # phase > 1 but cache not built yet -- shouldn't normally happen once
+            # refresh_collocation_cache() is wired into Phase 2 entry, but fall
+            # back to the uncached path rather than crashing.
+            x = torch.empty(self.num_samples, self.dimensions, device=pred.device).uniform_(
+                self.lb[0, 0], self.ub[0, 0])
+            t = torch.empty(self.num_samples, 1, device=pred.device).uniform_(
+                self.lb[0, -1], self.ub[0, -1])
+            inputs_rand = torch.cat([x, t], dim=1).requires_grad_()
+            outputs_b = self.surface_fitter(self.normalize(inputs_rand))
+            ut_b, uxx_b = self.compute_field_derivatives(inputs_rand, outputs_b)
+            t_cutoff = getattr(self, 'mass_t_cutoff', 2.0)
+            mask_b = inputs_rand[:, -1] >= t_cutoff
 
-        # 5. Soft Wall (RAW - Always Enforced)
-        raw_softwall = self.soft_wall_loss()
-
-        # 6. Mass-equation Loss (RAW) - separate collocation sample,
-        # excluding the unreliable early-transient frames via mass_t_cutoff.
-        # Only meaningful once diffusion_fitter is active (Phase 2+); the
-        # mass_loss method itself returns 0 if diff_coeffs is fixed.
-        t_cutoff = getattr(self, 'mass_t_cutoff', 2.0)
-        x_mass = torch.empty(self.num_samples, self.dimensions, device=pred.device).uniform_(self.lb[0,0], self.ub[0,0])
-        t_mass = torch.empty(self.num_samples, 1, device=pred.device).uniform_(t_cutoff, self.ub[0,-1])
-        inputs_mass = torch.cat([x_mass, t_mass], dim=1).requires_grad_()
-        inputs_mass_norm = self.normalize(inputs_mass)
-        outputs_mass = self.surface_fitter(inputs_mass_norm)
-        raw_mass = self.mass_loss(inputs_mass, outputs_mass)
+        raw_pde = self.pde_loss_from_derivatives(outputs_b, ut_b, uxx_b, epoch)
+        raw_mass = (self.mass_loss_from_derivatives(ut_b, uxx_b, mask_b)
+                    if mask_b.any() else torch.tensor(0.0, device=pred.device))
 
         return raw_gls, raw_pde, raw_l0, raw_softwall, raw_mass
         
