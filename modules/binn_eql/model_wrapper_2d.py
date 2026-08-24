@@ -62,14 +62,30 @@ class model_wrapper():
             }
             best_train_loss = 1e12 if best_train_loss is None else best_train_loss
             best_val_loss = 1e12 if best_val_loss is None else best_val_loss  
+            best_train_idx = 0
+            best_val_idx = 0
+            last_improved = 0
         else:
-            best_train_loss = min(self.train_loss_dict['loss']) if self.train_loss_dict['loss'] else 1e12
-            best_val_loss = min(self.val_loss_dict['loss']) if self.val_loss_dict['loss'] else 1e12
-        
+            # Recover indices when resuming from a checkpoint!
+            if self.train_loss_dict['loss']:
+                best_train_loss = min(self.train_loss_dict['loss'])
+                best_train_idx = self.train_loss_dict['loss'].index(best_train_loss)
+            else:
+                best_train_loss = 1e12
+                best_train_idx = initial_epoch
+                
+            if self.val_loss_dict['loss']:
+                best_val_loss = min(self.val_loss_dict['loss'])
+                best_val_idx = self.val_loss_dict['loss'].index(best_val_loss)
+                last_improved = best_val_idx
+            else:
+                best_val_loss = 1e12
+                best_val_idx = initial_epoch
+                last_improved = initial_epoch
+
         phase_1_end = int(0.2 * epochs)
         phase_2_end = int(0.4 * epochs)
         phase_3_end = int(0.6 * epochs)
-
         last_improved = initial_epoch
         
         for epoch in range(initial_epoch, epochs): 
@@ -127,10 +143,13 @@ class model_wrapper():
                     self.model.refresh_collocation_cache()
 
             elif phase == 3:
-                # Phase 3: Physics On, Ramp Reg
+                if not getattr(self.model, 'l0_scale_locked', False):
+                    self.model.register_l0_scale(self.train_loss_dict['pde'])
+                l0_eff = l0_weight * getattr(self.model, 'l0_scale', 1.0)
+
                 phase_duration = phase_3_end - phase_2_end
                 progress = ((epoch - phase_2_end) / phase_duration)
-                base_weights = torch.tensor([0.0, 1.0, l0_weight*progress], device=train_data.device)    
+                base_weights = torch.tensor([0.0, 1.0, l0_eff * progress], device=train_data.device)
                             
                 for pg in self.optimizer.param_groups:
                     if pg.get('name') == 'surface':
@@ -146,9 +165,9 @@ class model_wrapper():
                     for p in self.model.diffusion_fitter.parameters(): p.requires_grad = True
 
             elif phase == 4:
-                # Phase 4: Max Reg
-                base_weights = torch.tensor([0.0, 1.0, l0_weight], device=train_data.device)  
-                              
+                l0_eff = l0_weight * getattr(self.model, 'l0_scale', 1.0)
+                base_weights = torch.tensor([0.0, 1.0, l0_eff], device=train_data.device)
+
                 for pg in self.optimizer.param_groups:
                     if pg.get('name') == 'surface':
                         pg['lr'] = 0.0
@@ -164,6 +183,15 @@ class model_wrapper():
 
             # NEW: mass loss only meaningful once diffusion is being fit (Phase 2+)
             mass_active = (phase != 1)
+
+            # --- The Clean Slate ---
+            # Wipe the memory of Phase 1-3 losses the moment the Regularization Phase (Phase 4) begins
+            if epoch == phase_3_end:
+                best_train_loss = 1e12
+                best_val_loss = 1e12
+                best_train_idx = epoch  # Protects against UnboundLocalError
+                best_val_idx = epoch    # Protects against UnboundLocalError
+                last_improved = epoch
 
             # -----------------------------
             # 3. Train Step
@@ -378,7 +406,15 @@ class model_wrapper():
 
         p += ' | Elapsed = ' + elapsed + '           '
         print(p, flush=True)
-            
+
+        # Gate check
+        gates = self.model.reaction.eql_layer.l0_gate.get_gates().detach().cpu()
+        w = self.model.reaction.eql_layer.fc.weight[0].detach().cpu()
+        print("gates near 0 (<0.05):", (gates < 0.05).sum().item())
+        print("gates near 1 (>0.95):", (gates > 0.95).sum().item())
+        print("gates intermediate:   ", ((gates >= 0.05) & (gates <= 0.95)).sum().item())
+        print("|w| mean/max:", w.abs().mean().item(), w.abs().max().item())
+
         return self.param_history, self.train_loss_dict, self.val_loss_dict
     
     def load_checkpoint(self, path, device='cuda'):

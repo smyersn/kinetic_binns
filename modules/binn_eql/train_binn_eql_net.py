@@ -160,7 +160,8 @@ param_history, train_loss_dict, val_loss_dict = model.fit(
     early_stopping=early_stopping,
     initial_epoch=initial_epoch)
 
-generate_loss_curves(train_loss_dict, val_loss_dict, dir_name, 20, 'training_loss_curves.png')
+# generate_loss_curves(train_loss_dict, val_loss_dict, dir_name, 20, 'training_loss_curves.png')
+generate_loss_curves(train_loss_dict, val_loss_dict, dir_name, 40, 'training_loss_curves.png')
 
 plot_param_history(binn, param_history, f"{dir_name}/param_history.png")
 

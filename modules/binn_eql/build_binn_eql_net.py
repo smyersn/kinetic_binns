@@ -302,6 +302,30 @@ class BINN(nn.Module):
 
         print(f"Locked 90th Percentile Mass Scale -> {self.mass_scale:.4e}\n")
 
+    def register_l0_scale(self, pde_history, window_frac=0.2, phase_1_end=None, phase_2_end=None):
+        """
+        Locks a data-derived scale for the L0 weight, analogous to
+        register_pde_scale / register_mass_scale. Gate decisions compare
+        d(pde)/d(gate_i) against l0_weight, so the effective pruning pressure
+        depends on the magnitude of the PDE loss -- a dataset whose PDE loss
+        plateaus 7x higher gets ~7x weaker pruning from the same l0_weight.
+        Normalizing by the achievable Phase-2 floor (all terms active, no
+        regularization yet) makes l0_weight dimensionless and comparable
+        across datasets.
+        """
+        if getattr(self, 'l0_scale_locked', False):
+            return
+
+        recent = [p for p in pde_history if p > 0]
+        if not recent:
+            self.l0_scale = 1.0
+        else:
+            tail = recent[-max(1, int(window_frac * len(recent))):]
+            self.l0_scale = float(np.median(tail))
+
+        self.l0_scale_locked = True
+        print(f"\n--- Locked L0 scale (median Phase-2 PDE floor) -> {self.l0_scale:.4e} ---\n")
+
     def refresh_collocation_cache(self, cache_size=200_000, mass_t_cutoff=None, chunk_size=20_000):
         """
         Precomputes ut_array/uxx_array for a large fixed pool of collocation
@@ -865,6 +889,20 @@ class BINN(nn.Module):
                     print(f"Target polynomial not in basis. Restoring Hill term.")
                     hf.raw_K.data = backup_K
                     hf.raw_n.data = backup_n
+
+        # --- TASK 4: FINAL ZEROING (Pruning Noise) ---
+        params = self.extract_params(full=True)
+        eff_unscaled = torch.tensor(params['effective_unscaled'], device=device)
+        
+        # Identify weak terms
+        small_mask = torch.abs(eff_unscaled) < threshold
+        eql.fc.weight.data[0, small_mask] = 0.0
+        eql.l0_gate.log_alpha.data[small_mask] = -10.0 # Lock gate
+
+        # Refresh params/counts
+        params = self.extract_params(full=True)
+        num_poly = eql.num_poly_features
+        num_hill = eql.num_hill_features
 
         _ = self.extract_params(full=True)
         print(f"Fine-tuning committed.")
