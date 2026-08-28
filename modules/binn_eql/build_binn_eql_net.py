@@ -692,7 +692,11 @@ class BINN(nn.Module):
             'Ks_inc_unscaled': Ks_inc_unscaled, 
             'Ks_dec_unscaled': Ks_dec_unscaled 
         }
-                                    
+
+
+
+
+    ### OG ###                                    
     @torch.no_grad()    
     def fine_tune_eql(self, threshold=0.01, epsilon=0.1):
         """
@@ -906,6 +910,461 @@ class BINN(nn.Module):
 
         _ = self.extract_params(full=True)
         print(f"Fine-tuning committed.")
+
+
+
+
+    ### GEMINI ###
+    # @torch.no_grad()
+    # def _validate_swap(self, h_idx, p_idx, poly_coeff, cache):
+    #     """Helper to validate a proposed Hill -> Poly swap against actual PDE loss."""
+    #     eql = self.reaction.eql_layer
+        
+    #     # 1. Snapshot original state
+    #     orig_hill_w = eql.fc.weight.data[0, h_idx].item()
+    #     orig_poly_w = eql.fc.weight.data[0, p_idx].item()
+    #     orig_hill_gate = eql.l0_gate.log_alpha.data[h_idx].item()
+    #     orig_poly_gate = eql.l0_gate.log_alpha.data[p_idx].item()
+        
+    #     # 2. Compute BEFORE loss using cache
+    #     outputs_b = cache['outputs']
+    #     ut_b = cache['ut_array']
+    #     uxx_b = cache['uxx_array']
+        
+    #     before_loss = self.pde_loss_from_derivatives(outputs_b, ut_b, uxx_b, epoch=0).item()
+        
+    #     # 3. Apply proposed swap
+    #     eql.fc.weight.data[0, p_idx] += poly_coeff
+    #     eql.fc.weight.data[0, h_idx] = 0.0
+        
+    #     eql.l0_gate.log_alpha.data[p_idx] = max(orig_poly_gate, orig_hill_gate)
+    #     eql.l0_gate.log_alpha.data[h_idx] = -10.0
+        
+    #     # 4. Compute AFTER loss
+    #     after_loss = self.pde_loss_from_derivatives(outputs_b, ut_b, uxx_b, epoch=0).item()
+        
+    #     # 5. Evaluate (allow 1% tolerance for numerical noise)
+    #     if after_loss <= before_loss * 1.01:
+    #         print(f"      -> VALIDATED! PDE Loss: {before_loss:.4e} -> {after_loss:.4e}")
+    #         return True
+    #     else:
+    #         print(f"      -> REJECTED! PDE Loss spiked: {before_loss:.4e} -> {after_loss:.4e}")
+    #         # Revert
+    #         eql.fc.weight.data[0, h_idx] = orig_hill_w
+    #         eql.fc.weight.data[0, p_idx] = orig_poly_w
+    #         eql.l0_gate.log_alpha.data[h_idx] = orig_hill_gate
+    #         eql.l0_gate.log_alpha.data[p_idx] = orig_poly_gate
+    #         return False
+
+    # @torch.no_grad()    
+    # def fine_tune_eql(self, threshold=0.01, epsilon=0.1, r2_threshold=0.99):
+    #     """
+    #     Data-driven, loss-validated fine-tuning.
+    #     Strictly enforces 1-to-1 Hill-to-Polynomial mapping.
+    #     """
+    #     eql = self.reaction.eql_layer
+    #     device = eql.fc.weight.device
+        
+    #     # --- THE FIX: Notebook-Proof Cache Generation ---
+    #     if not hasattr(self, '_collocation_cache'):
+    #         # print("No collocation cache found (likely running post-training). Building a temporary one...")
+    #         # We must explicitly re-enable gradients here so the PDE derivatives can be computed!
+    #         with torch.enable_grad():
+    #             self.refresh_collocation_cache(cache_size=50_000) 
+                
+    #     cache = self._collocation_cache
+        
+    #     # --- TASK 1: ZEROING (Pruning Noise) ---
+    #     # ... [Rest of the code remains exactly the same] ...        
+    #     # --- TASK 1: ZEROING (Pruning Noise) ---
+    #     params = self.extract_params(full=True)
+    #     eff_unscaled = torch.tensor(params['effective_unscaled'], device=device)
+        
+    #     small_mask = torch.abs(eff_unscaled) < threshold
+    #     eql.fc.weight.data[0, small_mask] = 0.0
+    #     eql.l0_gate.log_alpha.data[small_mask] = -10.0 
+
+    #     params = self.extract_params(full=True)
+    #     num_poly = eql.num_poly_features
+    #     num_hill = eql.num_hill_features
+    #     n_poly_single = num_poly // self.duplicates
+    #     n_hill_single = len(params['hill_terms']) 
+
+    #     # --- TASK 2: COMBINE DUPLICATE POLYNOMIALS ---
+    #     for i in range(n_poly_single):
+    #         indices = [i + j * n_poly_single for j in range(self.duplicates)]
+    #         primary = indices[0]
+    #         for other in indices[1:]:
+    #             if torch.abs(eql.fc.weight.data[0, other]) < 1e-8: continue
+                
+    #             eql.fc.weight.data[0, primary] += eql.fc.weight.data[0, other]
+    #             eql.fc.weight.data[0, other] = 0.0
+                
+    #             eql.l0_gate.log_alpha.data[primary] = torch.max(
+    #                 eql.l0_gate.log_alpha.data[primary], 
+    #                 eql.l0_gate.log_alpha.data[other]
+    #             )
+    #             eql.l0_gate.log_alpha.data[other] = -10.0
+
+    #     # Extract data-driven features using the cache
+    #     features = eql.get_features(cache['outputs'])
+
+    #     # --- TASK 3A: MERGE DUPLICATE HILLS ---
+    #     for i in range(num_hill):
+    #         h_idx = num_poly + i
+    #         weight_primary = eql.fc.weight.data[0, h_idx]
+    #         if torch.abs(weight_primary) < 1e-8: continue
+            
+    #         form_id_i = (h_idx - num_poly) % n_hill_single
+    #         f_hill = features[:, h_idx]
+    #         f_hill_c = f_hill - torch.mean(f_hill)
+    #         norm_hill_c = torch.norm(f_hill_c) + 1e-9
+            
+    #         for next_h_idx in range(h_idx + 1, num_poly + num_hill):
+    #             weight_duplicate = eql.fc.weight.data[0, next_h_idx]
+    #             if torch.abs(weight_duplicate) < 1e-8: continue
+                
+    #             form_id_next = (next_h_idx - num_poly) % n_hill_single
+    #             if form_id_i != form_id_next: continue
+                
+    #             f_other = features[:, next_h_idx]
+    #             f_other_c = f_other - torch.mean(f_other)
+    #             norm_other_c = torch.norm(f_other_c) + 1e-9
+                
+    #             dist = 1.0 - torch.abs(torch.sum(f_hill_c * f_other_c) / (norm_hill_c * norm_other_c))
+                
+    #             if dist < epsilon:
+    #                 print(f"Merging Duplicate Hills: {h_idx} and {next_h_idx} (Dist: {dist:.4f})")
+    #                 self._average_hill_params(h_idx - num_poly, next_h_idx - num_poly, 
+    #                                           weight_primary, weight_duplicate)
+                    
+    #                 eql.fc.weight.data[0, h_idx] += eql.fc.weight.data[0, next_h_idx]
+    #                 eql.fc.weight.data[0, next_h_idx] = 0.0
+                    
+    #                 eql.l0_gate.log_alpha.data[h_idx] = torch.max(
+    #                     eql.l0_gate.log_alpha.data[h_idx], 
+    #                     eql.l0_gate.log_alpha.data[next_h_idx]
+    #                 )
+    #                 eql.l0_gate.log_alpha.data[next_h_idx] = -10.0
+    #                 weight_primary = eql.fc.weight.data[0, h_idx]
+
+    #     # --- TASK 3B: DATA-WEIGHTED, STRICT 1-TO-1 SIMPLIFICATION ---
+    #     for i in range(num_hill):
+    #         h_idx = num_poly + i
+    #         hill_weight = eql.fc.weight.data[0, h_idx].item()
+    #         if abs(hill_weight) < 1e-8: continue
+
+    #         hf = eql.all_hill_funcs[i]
+    #         n_val = (torch.sigmoid(hf.raw_n) * 3 + 1).item()
+    #         k_val = F.softplus(hf.raw_K).item()
+            
+    #         # 1. Exact Match Shortcut (Increasing Only)
+    #         is_increasing = hf.increasing
+    #         is_flat_denom = k_val < 0.05 
+    #         is_integer_exp = abs(n_val - round(n_val)) < epsilon
+            
+    #         proposed_p_idx = -1
+    #         proposed_coeff = hill_weight
+            
+    #         if is_increasing and is_flat_denom and is_integer_exp:
+    #             # Build target tuple
+    #             term = params['hill_terms'][i % n_hill_single]
+    #             target = [0] * self.species
+    #             if len(term) == 1:
+    #                 target[term[0]] = round(n_val)
+    #             else:
+    #                 target[term[0]] = round(n_val)
+    #                 target[term[1]] += 1
+    #             target = tuple(target)
+                
+    #             if sum(target) <= self.degree and target in eql.poly.powers:
+    #                 proposed_p_idx = eql.poly.powers.index(target)
+    #                 print(f"Proposed Exact Match: Hill {h_idx} -> Poly {proposed_p_idx} (Tuple: {target})")
+            
+    #         # 2. Data-Weighted 1D Regression Fallback
+    #         if proposed_p_idx == -1:
+    #             y = features[:, h_idx]
+    #             ss_tot = torch.sum((y - y.mean()) ** 2) + 1e-12
+                
+    #             best_r2 = -1.0
+                
+    #             for p_idx in range(num_poly):
+    #                 x = features[:, p_idx]
+    #                 # 1D Least Squares: beta = (x * y) / (x^2)
+    #                 beta = torch.sum(x * y) / (torch.sum(x ** 2) + 1e-12)
+    #                 y_hat = beta * x
+                    
+    #                 ss_res = torch.sum((y - y_hat) ** 2)
+    #                 r2 = (1 - ss_res / ss_tot).item()
+                    
+    #                 if r2 > best_r2:
+    #                     best_r2 = r2
+    #                     proposed_p_idx = p_idx
+    #                     proposed_coeff = hill_weight * beta.item()
+                        
+    #             if best_r2 >= r2_threshold:
+    #                 print(f"Proposed Regression Match: Hill {h_idx} -> Poly {proposed_p_idx} (R2: {best_r2:.4f})")
+    #             else:
+    #                 proposed_p_idx = -1 # Reject, R2 too low
+
+    #         # 3. Loss Validation Gate
+    #         if proposed_p_idx != -1:
+    #             self._validate_swap(h_idx, proposed_p_idx, proposed_coeff, cache)
+    #             # # Grab the gates
+    #             # orig_hill_gate = eql.l0_gate.log_alpha.data[h_idx].item()
+    #             # orig_poly_gate = eql.l0_gate.log_alpha.data[proposed_p_idx].item()
+                
+    #             # # Move the weight unconditionally
+    #             # eql.fc.weight.data[0, proposed_p_idx] += proposed_coeff
+    #             # eql.fc.weight.data[0, h_idx] = 0.0
+                
+    #             # # Transfer the L0 gate importance
+    #             # eql.l0_gate.log_alpha.data[proposed_p_idx] = max(orig_poly_gate, orig_hill_gate)
+    #             # eql.l0_gate.log_alpha.data[h_idx] = -10.0
+    #             # print(f"      -> FORCED SWAP EXECUTED.")
+
+    #     # --- TASK 4: FINAL ZEROING ---
+    #     params = self.extract_params(full=True)
+    #     eff_unscaled = torch.tensor(params['effective_unscaled'], device=device)
+    #     small_mask = torch.abs(eff_unscaled) < threshold
+    #     eql.fc.weight.data[0, small_mask] = 0.0
+    #     eql.l0_gate.log_alpha.data[small_mask] = -10.0 
+
+    #     print(f"Fine-tuning committed.")
+
+
+
+
+    ### CLAUDE ###
+    # def fine_tune_eql(self, threshold=0.01, epsilon=0.1, swap_to_poly=True,
+    #                 denom_threshold=1.1, num_points=20000):
+    #     """
+    #     ...
+    #     num_points: max number of (u, v) points sampled from the actual training
+    #         data to use for TASK 3A's duplicate-merging correlation check. Replaces
+    #         the old uniform 100x100 synthetic grid -- sampling directly from
+    #         train_data means dense/frequently-visited regions of concentration
+    #         space get proportionally more influence on the correlation, and empty
+    #         regions get none, instead of every cell in [0, s_u] x [0, s_v] counting
+    #         equally regardless of whether the trajectory ever goes there.
+    #     """
+    #     eql = self.reaction.eql_layer
+    #     device = eql.fc.weight.device
+
+    #     # --- TASK 0: SAMPLE FROM THE TRAINING DATA DISTRIBUTION ---
+    #     s_u, s_v = self.max_scale[0, 0].item(), self.max_scale[0, 1].item()
+
+    #     uv_data = self.train_data[:, -2:].to(device)   # actual (u, v) pairs seen during training
+    #     print(uv_data.shape[0], flush=True)
+    #     if uv_data.shape[0] > num_points:
+    #         idx = torch.randperm(uv_data.shape[0], device=device)[:num_points]
+    #         uv_synthetic = uv_data[idx]
+    #     else:
+    #         uv_synthetic = uv_data
+
+    #     # Calculate ALL features at these data-distributed points
+    #     features = eql.get_features(uv_synthetic)
+
+    #     # --- TASK 1: ZEROING (Pruning Noise) ---
+    #     params = self.extract_params(full=True)
+    #     eff_unscaled = torch.tensor(params['effective_unscaled'], device=device)
+        
+    #     # Identify weak terms
+    #     small_mask = torch.abs(eff_unscaled) < threshold
+    #     eql.fc.weight.data[0, small_mask] = 0.0
+    #     eql.l0_gate.log_alpha.data[small_mask] = -10.0 # Lock gate
+
+    #     # Refresh params/counts
+    #     params = self.extract_params(full=True)
+    #     num_poly = eql.num_poly_features
+    #     num_hill = eql.num_hill_features
+        
+    #     # Determine the "Species" of each Hill term
+    #     # e.g. If you have [Inc, Dec] repeated 5 times, n_hill_single = 2.
+    #     # Term 0 is Inc, Term 1 is Dec, Term 2 is Inc...
+    #     n_poly_single = num_poly // self.duplicates
+    #     n_hill_single = len(params['hill_terms']) 
+
+    #     # --- TASK 2: COMBINE DUPLICATE POLYNOMIALS ---
+    #     for i in range(n_poly_single):
+    #         indices = [i + j * n_poly_single for j in range(self.duplicates)]
+    #         primary = indices[0]
+            
+    #         for other in indices[1:]:
+    #             if torch.abs(eql.fc.weight.data[0, other]) < 1e-8: continue
+                
+    #             eql.fc.weight.data[0, primary] += eql.fc.weight.data[0, other]
+    #             eql.fc.weight.data[0, other] = 0.0
+                
+    #             eql.l0_gate.log_alpha.data[primary] = torch.max(
+    #                 eql.l0_gate.log_alpha.data[primary], 
+    #                 eql.l0_gate.log_alpha.data[other]
+    #             )
+    #             eql.l0_gate.log_alpha.data[other] = -10.0
+
+    #     # --- TASK 3A: MERGE DUPLICATE HILLS (Same Form Only) ---
+    #     for i in range(num_hill):
+    #         h_idx = num_poly + i
+    #         weight_primary = eql.fc.weight.data[0, h_idx]
+    #         if torch.abs(weight_primary) < 1e-8: continue
+            
+    #         # 1. Identify Form: 0 for Inc, 1 for Dec (for example)
+    #         form_id_i = (h_idx - num_poly) % n_hill_single
+            
+    #         f_hill = features[:, h_idx]
+    #         # Center for Pearson Correlation
+    #         f_hill_c = f_hill - torch.mean(f_hill)
+    #         norm_hill_c = torch.norm(f_hill_c) + 1e-9
+            
+    #         for next_h_idx in range(h_idx + 1, num_poly + num_hill):
+    #             weight_duplicate = eql.fc.weight.data[0, next_h_idx]
+    #             if torch.abs(weight_duplicate) < 1e-8: continue
+                
+    #             # 2. Strict Form Check
+    #             form_id_next = (next_h_idx - num_poly) % n_hill_single
+                
+    #             # If they are different forms, skip immediately.
+    #             if form_id_i != form_id_next:
+    #                 continue
+                
+    #             # 3. Correlation Check
+    #             f_other = features[:, next_h_idx]
+    #             f_other_c = f_other - torch.mean(f_other)
+    #             norm_other_c = torch.norm(f_other_c) + 1e-9
+                
+    #             correlation = torch.sum(f_hill_c * f_other_c) / (norm_hill_c * norm_other_c)
+    #             dist = 1.0 - torch.abs(correlation)
+                
+    #             if dist < epsilon:
+    #                 print(f"Merging Duplicate Hills: {h_idx} and {next_h_idx} (Dist: {dist:.4f})")
+                    
+    #                 # Merge internal parameters using a weighted average!
+    #                 self._average_hill_params(h_idx - num_poly, next_h_idx - num_poly, 
+    #                                           weight_primary, weight_duplicate)
+                    
+    #                 # Consolidate the linear coefficient weights
+    #                 eql.fc.weight.data[0, h_idx] += eql.fc.weight.data[0, next_h_idx]
+    #                 eql.fc.weight.data[0, next_h_idx] = 0.0
+                    
+    #                 # Keep the strongest gate open
+    #                 eql.l0_gate.log_alpha.data[h_idx] = torch.max(
+    #                     eql.l0_gate.log_alpha.data[h_idx], 
+    #                     eql.l0_gate.log_alpha.data[next_h_idx]
+    #                 )
+    #                 eql.l0_gate.log_alpha.data[next_h_idx] = -10.0
+                    
+    #                 # Update primary weight for any subsequent merges in the loop
+    #                 weight_primary = eql.fc.weight.data[0, h_idx]
+
+    #     # --- TASK 3B: EXACT MONOMIAL COLLAPSE (Increasing) + DEGENERACY PRUNE (Decreasing) ---
+    #     # Increasing Hills: as K -> 0, x^n/(1+Kx^n) collapses EXACTLY to the monomial
+    #     # x^n (or x^n * x_j for cross terms) -- an algebraic identity, not a curve fit.
+    #     # We just check K is negligible over the observed domain and n is ~integer,
+    #     # then look up the matching power-tuple directly in the polynomial basis.
+    #     #
+    #     # Decreasing Hills: 1/(K+eps) - x^n/(1+Kx^n) = 1/(K*(1+Kx^n)) has NO degenerate
+    #     # limit that matches a monomial -- it diverges as K->0 and vanishes as K->infinity.
+    #     # There's nothing to "convert" it to. What we CAN do is catch the vanishing case
+    #     # directly: if the term's peak value (at x=0, where it's largest) is already below
+    #     # the zeroing threshold, it contributes nothing anywhere in the domain, so we
+    #     # prune it here explicitly. We also flag the opposite failure mode -- K collapsing
+    #     # toward 0, which turns the term into a near-constant offset with no bias feature
+    #     # in the polynomial basis to absorb it -- since that usually means the term is
+    #     # fighting the loss in a way substitution can't fix.
+    #     poly_terms, hill_terms = self.generate_terms()
+    #     terms_per_form = len(hill_terms)      # raw + cross terms, one form (inc or dec)
+    #     block_size = terms_per_form * 2       # inc block + dec block, per duplicate
+
+    #     for i in range(num_hill):
+    #         h_idx = num_poly + i
+    #         hill_weight = eql.fc.weight.data[0, h_idx].item()
+    #         if abs(hill_weight) < 1e-8:
+    #             continue
+
+    #         local_i = i % block_size
+    #         is_increasing = local_i < terms_per_form
+    #         term = hill_terms[local_i % terms_per_form]
+    #         hf = eql.all_hill_funcs[i]
+
+    #         n_val = (torch.sigmoid(hf.raw_n) * 3 + 1).item()
+    #         k_val = F.softplus(hf.raw_K).item()
+    #         species_idx = term[0]
+    #         max_u = s_u if species_idx == 0 else s_v
+
+    #         if is_increasing:
+    #             # --- Exact collapse check: K ~ 0 over the observed domain ---
+    #             n_rounded = round(n_val)
+    #             # max_denom = 1.0 + k_val * (max_u ** n_val)
+    #             # is_flat_denom = max_denom < denom_threshold
+    #             # is_integer_exp = abs(n_val - n_rounded) < epsilon
+    #             x_vals = uv_synthetic[:, species_idx].clamp(min=0)
+    #             denom_vals = 1.0 + k_val * (x_vals ** n_val)
+    #             max_denom = torch.quantile(denom_vals, 0.99).item()
+    #             is_flat_denom = max_denom < denom_threshold
+    #             is_integer_exp = abs(n_val - n_rounded) < epsilon
+
+    #             if not (is_flat_denom and is_integer_exp):
+    #                 continue
+
+    #             target = [0] * self.species
+    #             target[species_idx] = n_rounded
+    #             if len(term) == 2:
+    #                 target[term[1]] += 1
+    #             target = tuple(target)
+
+    #             if sum(target) > self.degree or target not in poly_terms:
+    #                 print(f"Hill {h_idx} (inc) -> {target} not in polynomial basis "
+    #                     f"(degree {self.degree}). Restoring.")
+    #                 continue
+
+    #             best_p_idx = poly_terms.index(target)  # primary duplicate slot (post TASK 2 merge)
+
+    #             print(f"Moving weight {hill_weight:.4f} from Hill {h_idx} (inc) to Poly "
+    #                 f"{best_p_idx} (term={target}, max_denom={max_denom:.2f}, n={n_val:.3f})")
+
+    #             eql.fc.weight.data[0, best_p_idx] += hill_weight
+    #             eql.l0_gate.log_alpha.data[best_p_idx] = torch.max(
+    #                 eql.l0_gate.log_alpha.data[best_p_idx],
+    #                 eql.l0_gate.log_alpha.data[h_idx]
+    #             )
+    #             eql.fc.weight.data[0, h_idx] = 0.0
+    #             eql.l0_gate.log_alpha.data[h_idx] = -10.0
+
+    #         else:
+    #             # --- Decreasing Hill: no polynomial collapse exists. Check degeneracy instead. ---
+    #             peak_val = 1.0 / (k_val + 1e-8)              # value at x=0, the term's maximum
+    #             peak_contribution = abs(hill_weight) * peak_val
+
+    #             if peak_contribution < threshold:
+    #                 print(f"Pruning Hill {h_idx} (dec): peak contribution "
+    #                     f"{peak_contribution:.4e} < threshold {threshold} everywhere in domain.")
+    #                 eql.fc.weight.data[0, h_idx] = 0.0
+    #                 eql.l0_gate.log_alpha.data[h_idx] = -10.0
+    #             elif k_val < 1e-4:
+    #                 print(f"Warning: Hill {h_idx} (dec) has K={k_val:.2e} -> collapsing toward "
+    #                     f"a near-constant offset (peak {peak_val:.2e}) with no bias term in the "
+    #                     f"polynomial basis to absorb it. Leaving as a Hill term; worth inspecting.")
+
+    #     # --- TASK 4: FINAL ZEROING (Pruning Noise) ---
+    #     params = self.extract_params(full=True)
+    #     eff_unscaled = torch.tensor(params['effective_unscaled'], device=device)
+        
+    #     # Identify weak terms
+    #     small_mask = torch.abs(eff_unscaled) < threshold
+    #     eql.fc.weight.data[0, small_mask] = 0.0
+    #     eql.l0_gate.log_alpha.data[small_mask] = -10.0 # Lock gate
+
+    #     # Refresh params/counts
+    #     params = self.extract_params(full=True)
+    #     num_poly = eql.num_poly_features
+    #     num_hill = eql.num_hill_features
+
+    #     _ = self.extract_params(full=True)
+    #     print(f"Fine-tuning committed.")
+
+
+
+
 
     def _average_hill_params(self, idx1, idx2, weight1, weight2):
         """

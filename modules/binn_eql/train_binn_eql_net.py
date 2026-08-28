@@ -84,7 +84,8 @@ train_data, val_data = training_test_split(training_data, device)
 total_data_points = len(training_data) # e.g., 4,040,000
 target_total_steps = 1_000_000
 steps_per_epoch = max(1, total_data_points // batch_size)
-epochs = int(target_total_steps // steps_per_epoch)
+# epochs = int(target_total_steps // steps_per_epoch)
+epochs = 50_000
 
 # Determine early stopping (5% of total epochs)
 early_stopping = int(epochs * 0.05)
