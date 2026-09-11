@@ -1,3 +1,4 @@
+import string
 import numpy as np
 import torch
 import torch.nn as nn
@@ -8,332 +9,470 @@ from modules.binn_eql.build_mlp import build_mlp
 from modules.utils.gradient import gradient
 from modules.binn_eql.build_eql_layer import EQLLayer
 
+
+def default_species_names(species):
+    """
+    Generic concentration names u, v, w, ... matching the original
+    2-species (u, v) convention. Skips t, x, y, z since those are reserved
+    for time/spatial coordinates elsewhere in this codebase. Wraps with a
+    numeric suffix if species > 22 (more species than available letters).
+    """
+    reserved = {'t', 'x', 'y', 'z'}
+    letters = [c for c in string.ascii_lowercase if c not in reserved]
+    start = letters.index('u')
+    ordered = letters[start:] + letters[:start]
+
+    names = []
+    for i in range(species):
+        if i < len(ordered):
+            names.append(ordered[i])
+        else:
+            names.append(f"{ordered[i % len(ordered)]}{i // len(ordered)}")
+    return names
+
+
 # ---------------------------------------------------------
 # 1. SUB-NETWORKS
 # ---------------------------------------------------------
 class D_PARAMS(nn.Module):
     def __init__(self, input_features=2, base_val=0.1, noise_std=0.5):
         super().__init__()
-        base_log = torch.log(torch.tensor(base_val))         
+        base_log = torch.log(torch.tensor(base_val))
         noise = torch.randn(input_features) * noise_std
         self.raw_D = nn.Parameter(base_log + noise)
-        
-    def forward(self):     
+
+    def forward(self):
         return torch.exp(self.raw_D)
-        # return torch.clamp(torch.exp(self.raw_D), min=1e-2, max=10.0)
-    
+
+
 class FourierFeatureEncoding(nn.Module):
     def __init__(self, in_features, mapping_size, scale=1.0):
         super().__init__()
-        # Create a static, non-trainable random Gaussian matrix
         self.B = nn.Parameter(torch.randn(in_features, mapping_size) * scale, requires_grad=True)
-        
+
     def forward(self, x):
-        # Project inputs into high frequencies
         x_proj = (2.0 * np.pi * x) @ self.B
-        # Return both sine and cosine projections
         return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
 
-# class uv_MLP(nn.Module):
-#     def __init__(self, input_features, mapping_size=64, scale=1.0, layers=[256, 256, 256, 2]):
-#         super().__init__()
-        
-#         self.encoder = FourierFeatureEncoding(in_features=input_features, mapping_size=mapping_size, scale=scale)
-        
-#         # ADD the raw input features to the encoded feature count
-#         encoded_features = (mapping_size * 2) + input_features 
-        
-#         self.mlp = build_mlp(
-#             input_features=encoded_features, 
-#             layers=layers,
-#             activation=nn.GELU(),
-#             linear_output=False,
-#             output_activation=nn.Softplus(beta=10.0) # See Point 2 below!
-#         )
 
-#         # Apply Weight Norm "Post-Hoc"
-#         for module in self.mlp.MLP:
-#             if isinstance(module, nn.Linear):
-#                 utils.parametrizations.weight_norm(module)
-
-#     def forward(self, inputs):
-#         encoded_x = self.encoder(inputs)
-#         # Concatenate the raw inputs with the high-frequency features
-#         full_features = torch.cat([inputs, encoded_x], dim=-1) 
-#         return self.mlp(full_features)
-    
 class uv_MLP(nn.Module):
-    def __init__(self, input_features, mapping_size=256, scale=1.0, layers=[256, 256, 256, 2]):
-    # def __init__(self, input_features, mapping_size=128, scale=10.0, layers=[256, 256, 256, 2]):
+    """Surface fitter. `layers` must end with an output width equal to
+    `species` -- defaults to [256, 256, 256, species] if not given."""
+    def __init__(self, input_features, species, mapping_size=256, scale=1.0, layers=None):
         super().__init__()
-        
-        # 1. Initialize the Fourier Encoder
-        self.encoder = FourierFeatureEncoding(
-            in_features=input_features, 
-            mapping_size=mapping_size, 
-            scale=scale
-        )
-        
-        # The encoder outputs BOTH sin and cos for each mapping dimension
+        if layers is None:
+            layers = [256, 256, 256, species]
+        assert layers[-1] == species, "uv_MLP's final layer width must equal `species`."
+
+        self.encoder = FourierFeatureEncoding(in_features=input_features, mapping_size=mapping_size, scale=scale)
         encoded_features = mapping_size * 2
-        
-        # 2. Build the MLP, passing the NEW encoded feature size
+
         self.mlp = build_mlp(
-            input_features=encoded_features, # <-- CRITICAL CHANGE
+            input_features=encoded_features,
             layers=layers,
             activation=nn.GELU(),
             linear_output=False,
-            output_activation=nn.Softplus()
-        )
+            output_activation=nn.Softplus())
 
-        # 3. Apply Weight Norm "Post-Hoc"
         for module in self.mlp.MLP:
             if isinstance(module, nn.Linear):
                 utils.parametrizations.weight_norm(module)
-                
-    def forward(self, inputs):
-        # Pass raw inputs through the encoder first
-        encoded_x = self.encoder(inputs)
-        # Pass the high-frequency features into the MLP
-        return self.mlp(encoded_x)
-     
-# class uv_MLP(nn.Module):
-#     def __init__(self, input_features, layers=[256, 256, 256, 2]):
-#         super().__init__()
-#         # 1. Pass GELU directly (build_mlp accepts an activation arg)
-#         self.mlp = build_mlp(
-#             input_features=input_features, 
-#             layers=layers,
-#             activation=nn.GELU(),
-#             linear_output=False,
-#             output_activation=nn.Softplus())
 
-#         # 2. Apply Weight Norm "Post-Hoc"
-#         for module in self.mlp.MLP:
-#             if isinstance(module, nn.Linear):
-#                 utils.parametrizations.weight_norm(module)
-                
-#     def forward(self, inputs):
-#         return self.mlp(inputs)
+    def forward(self, inputs):
+        encoded_x = self.encoder(inputs)
+        return self.mlp(encoded_x)
+
 
 class F_EQL(nn.Module):
-    def __init__(self, species, duplicates, param_bounds, max_scale, degree):
+    def __init__(self, species, duplicates, param_bounds, max_scale, degree,
+                 include_poly=True, include_increasing_hill=True, include_decreasing_hill=True,
+                 mcas=False):
         super(F_EQL, self).__init__()
-        # Pass max_scale down to EQLLayer for physical conversion
-        self.eql_layer = EQLLayer(species, duplicates, param_bounds, max_scale, degree)
+        self.eql_layer = EQLLayer(
+            species, duplicates, param_bounds, max_scale, degree,
+            include_poly=include_poly,
+            include_increasing_hill=include_increasing_hill,
+            include_decreasing_hill=include_decreasing_hill,
+            mcas=mcas)
 
     def forward(self, x):
         return self.eql_layer(x)
-            
+
+
 # ---------------------------------------------------------
 # 2. BINN
 # ---------------------------------------------------------
 class BINN(nn.Module):
     def __init__(self, dimensions, species, train_data, duplicates=1,
-                diff_coeffs=None, uv_layers=None, degree=2, param_bounds=10,
-                fourier_scale=1.0, fourier_mapping_size=64): 
- 
+                 diff_coeffs=None, uv_layers=None, degree=2, param_bounds=10,
+                 fourier_scale=1.0, fourier_mapping_size=64,
+                 mcas=False, species_names=None,
+                 include_poly=True, include_increasing_hill=True, include_decreasing_hill=True):
+        """
+        mcas: single flag replacing the old conservation_groups/
+            conservation_mode pair. False (default): every species gets
+            its own fully independent reaction equation -- what
+            non-conserving systems (Gray-Scott, Brusselator, FHN, ...)
+            need. True: assumes the classic active/inactive two-state
+            format (only valid for species==2) -- ONE shared reaction
+            F(u, v), with species 1's equation architecturally forced to
+            equal exactly -F on every forward pass (guaranteed by
+            construction, not trained toward it). Downstream reporting
+            changes to match: extract_params()/generate_equation() return
+            ONE equation instead of `species`, and surface-comparison
+            plots get one row instead of `species` rows. The soft
+            mass-conservation loss (BINN.mass_loss, a diagnostic on the
+            SURFACE fitter's own derivatives, separate from the reaction
+            architecture) is automatically enabled for the (0, 1) pair
+            when mcas=True and disabled when False -- no separate
+            conservation_groups list to configure anymore.
+        include_poly / include_increasing_hill / include_decreasing_hill:
+            toggle which term families populate the shared EQL library.
+        """
         super().__init__()
-        self.dimensions = dimensions        
+        self.dimensions = dimensions
         self.species = species
         self.train_data = train_data
         self.duplicates = duplicates
-        self.diff_coeffs = diff_coeffs
         self.param_bounds = param_bounds
         self.degree = degree
+        self.mcas = mcas
+        # n_equations: how many INDEPENDENT reaction equations exist, for
+        # every reporting/plotting purpose (extract_params, generate_equation,
+        # surface comparison). Distinct from `species` (concentration field
+        # count), which the physics (PDE residuals, diffusion) always needs
+        # in full regardless of mcas -- mcas collapses REPORTED equations,
+        # not the number of species/PDEs being solved.
+        self.n_equations = 1 if mcas else species
+        self.conservation_groups = [[0, 1]] if mcas else []
+        self.species_names = species_names if species_names is not None else default_species_names(species)
 
         # ---------------------------------------------------------
         # A. REGISTER BOUNDS & SCALES (Buffers)
         # ---------------------------------------------------------
-        # Spatial/Temporal Bounds
-        x_min = torch.min(train_data[:, :dimensions])
-        x_max = torch.max(train_data[:, :dimensions])
-        t_min = torch.min(train_data[:, dimensions])
-        t_max = torch.max(train_data[:, dimensions])
-        
-        # Register for Input Normalization [-1, 1]
+        # NOTE: .item()/.cpu() everywhere below is deliberate, not
+        # incidental. train_data may already be on GPU here (e.g. if the
+        # training script moves it to `device` inside training_test_split
+        # before constructing BINN) -- but every nn.Parameter created
+        # during __init__ (HillFunction's raw_n/raw_K, fc.weight, etc.) is
+        # CPU by default until the whole model is later moved via
+        # binn.to(device). If these buffers inherited train_data's device
+        # instead, EQLLayer._smart_initialize_K (which runs during this
+        # same __init__, before any .to(device) call) would mix a CUDA
+        # buffer with CPU parameters and crash with a device mismatch.
+        # Forcing everything here to build as plain CPU tensors keeps
+        # __init__ internally consistent regardless of train_data's
+        # device; the training script's later binn.to(device) call moves
+        # parameters and buffers together, correctly, after this point.
+        x_min = torch.min(train_data[:, :dimensions]).item()
+        x_max = torch.max(train_data[:, :dimensions]).item()
+        t_min = torch.min(train_data[:, dimensions]).item()
+        t_max = torch.max(train_data[:, dimensions]).item()
+
         lb_tensor = torch.cat([torch.full((dimensions,), x_min), torch.tensor([t_min])])
         ub_tensor = torch.cat([torch.full((dimensions,), x_max), torch.tensor([t_max])])
-        self.register_buffer('lb', lb_tensor.view(1, -1)) 
+        self.register_buffer('lb', lb_tensor.view(1, -1))
         self.register_buffer('ub', ub_tensor.view(1, -1))
-                        
-        # Concentration Scales (Physical -> Dimensionless)
-        s_u_max = torch.quantile(train_data[:, -2].abs(), 0.99)
-        s_v_max = torch.quantile(train_data[:, -1].abs(), 0.99)
-        self.register_buffer('max_scale', torch.tensor([s_u_max, s_v_max]).view(1, -1))
-        
-        # GLS Mean Scale
-        s_u_mean = train_data[:, -2].abs().mean()
-        s_v_mean = train_data[:, -1].abs().mean()
-        self.register_buffer('mean_scale', torch.tensor([s_u_mean, s_v_mean]).view(1, -1))
+
+        # Per-species concentration scales (Physical -> Dimensionless).
+        # train_data columns are [x*dimensions, t, species concentrations],
+        # so the last `species` columns are the concentrations.
+        conc = train_data[:, -species:]
+        s_max = torch.stack([torch.quantile(conc[:, i].abs(), 0.99) for i in range(species)]).cpu()
+        self.register_buffer('max_scale', s_max.view(1, -1))
+
+        s_mean = conc.abs().mean(dim=0).cpu()
+        self.register_buffer('mean_scale', s_mean.view(1, -1))
+
+        # Diffusion coefficients: fixed physical values (one per species)
+        # or None to learn them via self.diffusion_fitter.
+        self.diff_coeffs = diff_coeffs
+        if diff_coeffs:
+            self.register_buffer('diff_coeffs_tensor', torch.tensor(diff_coeffs, dtype=torch.float32))
+        else:
+            self.diff_coeffs_tensor = None
 
         # ---------------------------------------------------------
         # B. INITIALIZE SUB-NETWORKS
         # ---------------------------------------------------------
-        # Diffusion Fitter
-        if not self.diff_coeffs:
-            self.diffusion_fitter = D_PARAMS(self.species)
-        else:
-            self.diffusion_fitter = None
-                
-        # Surface Fitter (Dimensionless)
-        if uv_layers:
-            self.surface_fitter = uv_MLP(input_features=dimensions+1, layers=uv_layers,
-                                          scale=fourier_scale, mapping_size=fourier_mapping_size)
-        else:
-            self.surface_fitter = uv_MLP(input_features=dimensions+1,
-                                          scale=fourier_scale, mapping_size=fourier_mapping_size)
-        
-        # Reaction (Input: Normalized -> Output: Unscaled Rate)
-        # We pass max_scale so EQLLayer can calculate physical values for the Loss
-        self.reaction = F_EQL(species, duplicates, self.param_bounds, self.max_scale, self.degree)
-        
-        # Sampling config
+        self.diffusion_fitter = D_PARAMS(self.species) if not self.diff_coeffs else None
+
+        self.surface_fitter = uv_MLP(
+            input_features=dimensions + 1, species=species, layers=uv_layers,
+            scale=fourier_scale, mapping_size=fourier_mapping_size)
+
+        # Reaction: shared feature bank, one linear+gate head per FREE
+        # species (mirror species, when mcas=True, share the primary's
+        # head exactly -- see EQLLayer).
+        self.reaction = F_EQL(
+            species, duplicates, self.param_bounds, self.max_scale, self.degree,
+            include_poly=include_poly,
+            include_increasing_hill=include_increasing_hill,
+            include_decreasing_hill=include_decreasing_hill,
+            mcas=mcas)
+
         self.num_samples = 10000
-        self.name = 'Dumlp_Dvmlp_Fmlp'
-        
+        self.name = 'Dumlp_Fmlp_Nspecies'
+
     def normalize(self, inputs):
         """ Maps Physical [lb, ub] -> Dimensionless [-1, 1] """
         return 2.0 * (inputs - self.lb) / (self.ub - self.lb) - 1.0
 
     def forward(self, inputs):
-        """ Returns PREDICTED u (Scaled [0,1]) from Physical Inputs """    
-        # Cache inputs for GLS loss 
-        self.inputs = inputs  
+        """ Returns PREDICTED concentrations (batch, species) from Physical Inputs """
+        self.inputs = inputs
         inputs_hat = self.normalize(inputs)
         return self.surface_fitter(inputs_hat)
 
     # -----------------------
     # Loss Functions
     # -----------------------
-    @torch.no_grad()
-    def _pde_scale_forward_pass(self, chunk):
-        """Helper: not used directly (kept for clarity of what needs grad)."""
-        pass
-
     def register_pde_scale(self, train_data, quantile_percent=0.01, chunk_size=50_000):
         """
-        Locks robust PDE normalization scales (pde_scale_u, pde_scale_v),
-        analogous to register_curvature_scale. Computes the top-quantile
-        mean of u_t^2 / v_t^2 from the CURRENT surface_fitter, so this must
-        be called once the surface has been fit (start of Phase 2), not
-        at __init__ time when the surface is still random.
+        Locks robust per-species PDE normalization scales. Computes the
+        90th-percentile of u_t^2 for EACH species from the current
+        surface_fitter. Must be called once the surface has been fit
+        (start of Phase 2), not at __init__ time when it's still random.
         """
         if getattr(self, 'pde_scales_locked', False):
-            return  # already locked, don't recompute mid-training
+            return
 
-        # print("\n--- Calculating Robust PDE Scales (Top {}%) ---".format(quantile_percent * 100))
         print("\n--- Calculating Robust PDE Scales (90th percentile) ---")
-
         was_training = self.surface_fitter.training
         self.surface_fitter.eval()
 
-        all_u_sq = []
-        all_v_sq = []
+        all_sq = [[] for _ in range(self.species)]
         total_points = len(train_data)
 
         for chunk_start in range(0, total_points, chunk_size):
             chunk = train_data[chunk_start:chunk_start + chunk_size].clone().requires_grad_(True)
             outputs = self.surface_fitter(self.normalize(chunk[:, :self.dimensions + 1]))
 
-            u_t = gradient(outputs[:, 0], chunk, order=1)[:, self.dimensions]
-            v_t = gradient(outputs[:, 1], chunk, order=1)[:, self.dimensions]
+            for s_idx in range(self.species):
+                u_t = gradient(outputs[:, s_idx], chunk, order=1)[:, self.dimensions]
+                all_sq[s_idx].append((u_t ** 2).detach().cpu())
 
-            all_u_sq.append((u_t ** 2).detach().cpu())
-            all_v_sq.append((v_t ** 2).detach().cpu())
-
-            del chunk, outputs, u_t, v_t
+            del chunk, outputs
 
         if was_training:
             self.surface_fitter.train()
 
-        global_u_sq = torch.cat(all_u_sq)
-        global_v_sq = torch.cat(all_v_sq)
+        scales = []
+        for s_idx in range(self.species):
+            global_sq = torch.cat(all_sq[s_idx])
+            scales.append(torch.quantile(global_sq, 0.90).item() + 1e-6)
 
-        robust_max_u = torch.quantile(global_u_sq, 0.90).item()
-        robust_max_v = torch.quantile(global_v_sq, 0.90).item()
-        
-        self.pde_scale_u = robust_max_u + 1e-6
-        self.pde_scale_v = robust_max_v + 1e-6
-        self.pde_scales_locked = True 
-        
-        print(f"Locked 90th Percentile Scales -> u: {self.pde_scale_u:.4e}, v: {self.pde_scale_v:.4e}\n")
+        # This runs mid-training (Phase 2), AFTER binn.to(device) already
+        # moved the model to GPU -- register_buffer does NOT retroactively
+        # move a newly-registered buffer to match the module's existing
+        # device, so without an explicit device here this buffer would
+        # silently stay on CPU while everything else (outputs, ut_array in
+        # pde_loss_from_derivatives) is on GPU, crashing on the same class
+        # of device-mismatch as the __init__-time bug above. self.lb is a
+        # buffer that WAS moved by .to(device), so its device is the
+        # correct reference.
+        self.register_buffer('pde_scale', torch.tensor(scales, device=self.lb.device))
+        self.pde_scales_locked = True
+
+        print(f"Locked 90th Percentile Scales -> {[f'{s:.4e}' for s in scales]}\n")
 
     def register_mass_scale(self, train_data, t_cutoff=None, chunk_size=50_000):
         """
-        Locks a robust normalization scale for mass_loss, analogous to
-        register_pde_scale. Computes the 90th-percentile w_t^2 = (u_t+v_t)^2
-        from the CURRENT surface_fitter, restricted to t >= mass_t_cutoff (the
-        same region mass_loss samples from). Must be called once the surface
-        has converged (start of Phase 2), same timing as register_pde_scale.
+        Locks a robust normalization scale for the mass_loss term
+        (analogous to register_pde_scale). Only active when self.mcas is
+        True (self.conservation_groups == [[0, 1]] in that case, [] and
+        this is skipped entirely otherwise). For mcas=True, this measures
+        a residual that should already be ~0 from the reaction side (F1
+        = -F2 architecturally), but the surface fitter's own derivatives
+        don't know that, so this remains a useful, if largely redundant,
+        training signal.
         """
         if getattr(self, 'mass_scale_locked', False):
             return
 
+        if not self.conservation_groups:
+            self.mass_scales = []
+            self.mass_scale_locked = True
+            return
+
         t_cutoff = t_cutoff if t_cutoff is not None else getattr(self, 'mass_t_cutoff', 2.0)
-        print(f"\n--- Calculating Robust Mass Scale (90th percentile, t>={t_cutoff}) ---")
+        print(f"\n--- Calculating Robust Mass Scale(s) (90th percentile, t>={t_cutoff}) ---")
 
         was_training = self.surface_fitter.training
         self.surface_fitter.eval()
 
         mask = train_data[:, self.dimensions] >= t_cutoff
         subset = train_data[mask]
+        group_sq = [[] for _ in self.conservation_groups]
 
-        all_wt_sq = []
         for chunk_start in range(0, len(subset), chunk_size):
             chunk = subset[chunk_start:chunk_start + chunk_size].clone().requires_grad_(True)
             outputs = self.surface_fitter(self.normalize(chunk[:, :self.dimensions + 1]))
 
-            u_t = gradient(outputs[:, 0], chunk, order=1)[:, self.dimensions]
-            v_t = gradient(outputs[:, 1], chunk, order=1)[:, self.dimensions]
-            w_t = u_t + v_t
+            for g_idx, group in enumerate(self.conservation_groups):
+                w_t = sum(gradient(outputs[:, s_idx], chunk, order=1)[:, self.dimensions] for s_idx in group)
+                group_sq[g_idx].append((w_t ** 2).detach().cpu())
 
-            all_wt_sq.append((w_t ** 2).detach().cpu())
-            del chunk, outputs, u_t, v_t, w_t
+            del chunk, outputs
 
         if was_training:
             self.surface_fitter.train()
 
-        global_wt_sq = torch.cat(all_wt_sq)
-        robust_max_wt = torch.quantile(global_wt_sq, 0.90).item()
+        self.mass_scales = []
+        for sqs in group_sq:
+            global_wt_sq = torch.cat(sqs)
+            self.mass_scales.append(torch.quantile(global_wt_sq, 0.90).item() + 1e-8)
 
-        self.mass_scale = robust_max_wt + 1e-8
         self.mass_scale_locked = True
+        print(f"Locked Mass Scale(s) -> {[f'{s:.4e}' for s in self.mass_scales]}\n")
 
-        print(f"Locked 90th Percentile Mass Scale -> {self.mass_scale:.4e}\n")
+    @torch.no_grad()
+    def _pde_loss_null(self):
+        """PDE loss with every reaction term zeroed -- the residual no
+        reaction can fix. Uses the full collocation cache so it's directly
+        comparable to _pde_loss_current()."""
+        cache = getattr(self, '_collocation_cache', None)
+        if cache is None:
+            return None
+        eql = self.reaction.eql_layer
+        saved = eql.fc.weight.data.clone()
+        eql.fc.weight.data.zero_()
+        loss = self.pde_loss_from_derivatives(
+            cache['outputs'], cache['ut_array'], cache['uxx_array'], epoch=0).item()
+        eql.fc.weight.data.copy_(saved)
+        return loss
 
-    def register_l0_scale(self, pde_history, window_frac=0.2, phase_1_end=None, phase_2_end=None):
+    @torch.no_grad()
+    def _pde_loss_current(self):
+        """PDE loss with current weights, on the full cache -- the exact
+        counterpart to _pde_loss_null()."""
+        cache = getattr(self, '_collocation_cache', None)
+        if cache is None:
+            return None
+        return self.pde_loss_from_derivatives(
+            cache['outputs'], cache['ut_array'], cache['uxx_array'], epoch=0).item()
+
+    @torch.no_grad()
+    def track_best_pde(self, save_weights=True):
         """
-        Locks a data-derived scale for the L0 weight, analogous to
-        register_pde_scale / register_mass_scale. Gate decisions compare
-        d(pde)/d(gate_i) against l0_weight, so the effective pruning pressure
-        depends on the magnitude of the PDE loss -- a dataset whose PDE loss
-        plateaus 7x higher gets ~7x weaker pruning from the same l0_weight.
-        Normalizing by the achievable Phase-2 floor (all terms active, no
-        regularization yet) makes l0_weight dimensionless and comparable
-        across datasets.
+        Sample the current full-cache PDE loss and keep the best (lowest)
+        seen so far. Called periodically through Phase 2 by model_wrapper.
+
+        Why not just read val_loss_dict['pde']: that's a mean over random
+        10k-point subsamples of the cache, so it carries sampling noise on
+        top of the optimization oscillation -- and it isn't measured the
+        same way as _pde_loss_null(), which uses the full cache. Comparing
+        a noisy median against a clean instantaneous value is what made
+        the floor/null verdict a coin flip. Both numbers now come from the
+        same points via the same code path.
+
+        save_weights: also snapshot the reaction weights at the best point,
+            so Phase 3 can start from the best reaction Phase 2 actually
+            found instead of wherever the oscillation happened to end.
+        """
+        current = self._pde_loss_current()
+        if current is None:
+            return None
+
+        best = getattr(self, 'best_pde_floor', None)
+        if best is None or current < best:
+            self.best_pde_floor = current
+            self.best_pde_floor_epoch = getattr(self, '_current_epoch', -1)
+            if save_weights:
+                self._best_reaction_state = {
+                    k: v.detach().clone()
+                    for k, v in self.reaction.state_dict().items()
+                }
+        return current
+
+    @torch.no_grad()
+    def restore_best_reaction(self):
+        """Load the reaction weights that achieved best_pde_floor."""
+        state = getattr(self, '_best_reaction_state', None)
+        if state is None:
+            return False
+        self.reaction.load_state_dict(state)
+        print(f"Restored best Phase-2 reaction from epoch "
+              f"{getattr(self, 'best_pde_floor_epoch', '?')} "
+              f"(PDE = {self.best_pde_floor:.4e})", flush=True)
+        return True
+
+    def register_l0_scale(self):
+        """
+        Normalize by EXPLAINABLE RANGE (how much PDE loss the reaction
+        terms can actually remove), not by the PDE floor.
+
+        The floor is the residual with all terms ALREADY active -- mostly
+        irreducible surface-derivative error, which grows as the grid
+        coarsens. Pricing gates against it means the same l0_weight gets
+        harsher at lower resolution, which is exactly the 100x100-works /
+        25x25-over-prunes behavior. Explainable range is the budget the
+        terms are actually competing for, so l0_weight ~ 1 means "a term
+        must claim its equal share of the achievable improvement" -- a
+        resolution-independent statement.
+
+        Uses the BEST floor seen across Phase 2 rather than the value at
+        Phase 3 entry: the reaction weights oscillate by more than the
+        explainable gap itself, so an instantaneous reading is decided by
+        whether the measurement lands in a trough or a peak.
+
+        pde_history / window_frac are accepted but unused -- kept so
+        existing call sites don't break.
         """
         if getattr(self, 'l0_scale_locked', False):
             return
 
-        recent = [p for p in pde_history if p > 0]
-        if not recent:
+        current = self._pde_loss_current()
+        best = getattr(self, 'best_pde_floor', None)
+        floor = current if best is None else (min(best, current) if current is not None else best)
+        null = self._pde_loss_null()
+
+        n_features = self.reaction.eql_layer.total_features
+
+        if null is None or floor is None:
             self.l0_scale = 1.0
-        else:
-            tail = recent[-max(1, int(window_frac * len(recent))):]
-            self.l0_scale = float(np.median(tail))
+            print(f"\n--- L0 scale: no collocation cache, defaulting to 1.0 ---\n")
+            self.l0_scale_locked = True
+            return
+
+        explainable = null - floor
+        print(f"\n--- L0 scale diagnostics ---")
+        print(f"  PDE floor (best in Phase 2)  : {floor:.4e}"
+              f"  (at epoch {getattr(self, 'best_pde_floor_epoch', '?')};"
+              f" current = {current:.4e})")
+        print(f"  PDE null  (all terms zeroed) : {null:.4e}")
+
+        if explainable <= 0:
+            # Distinct from "small but positive": the terms are making the
+            # residual WORSE than F=0, which means Phase 2 never converged.
+            # Silently clamping this to 1e-12 (as an earlier version did)
+            # produced an l0_scale that disabled pruning entirely and
+            # looked like a resolution verdict rather than a convergence
+            # failure.
+            self.l0_scale = 1.0
+            print(f"  Explainable range:            NEGATIVE ({explainable:.4e})")
+            print(f"  WARNING: the reaction terms fit WORSE than F=0. Phase 2 did not "
+                  f"converge -- l0_scale is not meaningful here. Falling back to 1.0. "
+                  f"Extend Phase 2 or check the reaction LR before trusting any "
+                  f"pruning result from this run.")
+            print()
+            self.l0_scale_locked = True
+            return
+
+        self.l0_scale = explainable / n_features
+        frac = explainable / max(null, 1e-12)
+        print(f"  Explainable range:            {explainable:.4e}  ({100*frac:.1f}% of null)")
+        print(f"  l0_scale = explainable / {n_features} features = {self.l0_scale:.4e}")
+        if frac < 0.1:
+            print(f"  WARNING: terms reduce PDE loss by <10%. The residual is "
+                  f"dominated by surface-derivative error the reaction cannot fix "
+                  f"-- likely a resolution limit, not an L0 tuning problem.")
+        print()
 
         self.l0_scale_locked = True
-        print(f"\n--- Locked L0 scale (median Phase-2 PDE floor) -> {self.l0_scale:.4e} ---\n")
 
     def refresh_collocation_cache(self, cache_size=200_000, mass_t_cutoff=None, chunk_size=20_000):
-        """
-        Precomputes ut_array/uxx_array for a large fixed pool of collocation
-        points using the CURRENT surface_fitter, then detaches. Chunked because
-        the double-backward derivative graph (create_graph=True, twice) is much
-        more memory-hungry per point than a plain forward pass -- building it for
-        cache_size points in one shot OOMs even on an H200, let alone a shared one.
-        """
+        """Precomputes ut_array/uxx_array for a fixed pool of collocation points."""
         t_cutoff = mass_t_cutoff if mass_t_cutoff is not None else getattr(self, 'mass_t_cutoff', 2.0)
 
         was_training = self.surface_fitter.training
@@ -365,13 +504,14 @@ class BINN(nn.Module):
         self._collocation_cache = {
             'outputs': torch.cat(outputs_list, dim=0),
             'ut_array': torch.cat(ut_list, dim=0),
-            'uxx_array': torch.cat(uxx_list, dim=1),   # species dim is axis 0, points is axis 1
+            'uxx_array': torch.cat(uxx_list, dim=1),
             'mass_mask': torch.cat(mask_list, dim=0),
         }
         print(f"Refreshed collocation cache: {cache_size} points ({chunk_size}/chunk), "
-            f"{self._collocation_cache['mass_mask'].sum().item()} pass mass cutoff")
-    
+              f"{self._collocation_cache['mass_mask'].sum().item()} pass mass cutoff")
+
     def compute_field_derivatives(self, inputs, outputs):
+        """Already N-species general -- loops over self.species."""
         points = len(inputs)
         uxx_array = torch.zeros((self.species, points, self.dimensions), device=inputs.device)
         ut_array = torch.zeros((points, self.species), device=inputs.device)
@@ -381,132 +521,119 @@ class BINN(nn.Module):
             for j in range(self.dimensions):
                 uxx_array[i, :, j] = gradient(d1[:, j], inputs, order=1)[:, j]
         return ut_array, uxx_array
-  
-    # def gls_loss(self, pred, true):
-    #     residual = ((pred - true) / self.mean_scale)**2
-    #     return torch.mean(residual)
 
     def gls_loss(self, pred, true):
-        # Calculate raw squared residuals
-        residual = ((pred - true) / self.mean_scale)**2
-
-        # Create mask for inputs at t = 0
+        residual = ((pred - true) / self.mean_scale) ** 2
         ic_mask = self.inputs[:, -1:] == 0
-                
-        # Weight the residuals before taking the mean
         weights = torch.where(ic_mask, 10.0, 1.0)
-        weighted_residual = residual * weights
-        
-        return torch.mean(weighted_residual)    
+        return torch.mean(residual * weights)
 
     def gls_loss_time_weighted(self, pred, true, time_scale=5.0, max_weight=50.0):
-        """
-        Generalizes the existing ic_mask weighting (which only boosts
-        exact t=0 rows) into a smooth decay over early time. The t=0.5
-        transient carries the hardest curvature in the trajectory AND
-        is one of the rarest timesteps in the dataset under uniform
-        sampling - this compensates on the loss side without touching
-        how batches are sampled.
-
-        weight(t) = 1 + (max_weight - 1) * exp(-(t - t_min) / time_scale)
-        At t = t_min: weight = max_weight
-        As t grows:   weight decays smoothly back to 1
-        """
+        """Smooth decay-over-time generalization of the t=0 IC weighting."""
         residual = ((pred - true) / self.mean_scale) ** 2
-
         t = self.inputs[:, -1:]
         t_min = self.lb[0, -1]
         weights = 1.0 + (max_weight - 1.0) * torch.exp(-(t - t_min) / time_scale)
-
-        weighted_residual = residual * weights
-        return torch.mean(weighted_residual)
+        return torch.mean(residual * weights)
 
     def pde_loss_from_derivatives(self, outputs, ut_array, uxx_array, epoch):
-        u = outputs
-        F = self.reaction(u)
+        """
+        Each species' reaction term comes from its own column of
+        self.reaction(outputs) -- for hard-coupled mirror species, that
+        column is already exactly -1 * its primary's (guaranteed inside
+        EQLLayer.forward), so no special-casing is needed here.
+        """
+        F_reaction = self.reaction(outputs)
 
         if self.diff_coeffs:
-            Du, Dv = torch.tensor(self.diff_coeffs[0]), torch.tensor(self.diff_coeffs[1])
+            D = self.diff_coeffs_tensor.to(outputs.device)
         else:
             D = self.diffusion_fitter()
-            Du, Dv = D[0], D[1]
 
-        lap_u = Du * torch.sum(uxx_array[0, :, :], dim=1, keepdim=True)
-        lap_v = Dv * torch.sum(uxx_array[1, :, :], dim=1, keepdim=True)
+        total_pde_loss = torch.tensor(0.0, device=outputs.device)
+        for s_idx in range(self.species):
+            lap_s = D[s_idx] * torch.sum(uxx_array[s_idx, :, :], dim=1, keepdim=True)
+            LHS = ut_array[:, s_idx][:, None]
+            RHS = lap_s + F_reaction[:, s_idx][:, None]
 
-        LHS_u, RHS_u = ut_array[:, 0][:, None], lap_u + F
-        LHS_v, RHS_v = ut_array[:, 1][:, None], lap_v - F
+            if hasattr(self, 'pde_scale'):
+                scale = torch.sqrt(self.pde_scale[s_idx])
+            else:
+                scale = torch.tensor(1.0, device=outputs.device)
 
-        scale_u = torch.sqrt(torch.tensor(getattr(self, 'pde_scale_u', 1.0), device=outputs.device))
-        scale_v = torch.sqrt(torch.tensor(getattr(self, 'pde_scale_v', 1.0), device=outputs.device))
+            res = (LHS - RHS) / scale
+            total_pde_loss = total_pde_loss + F.smooth_l1_loss(res, torch.zeros_like(res), beta=1.0)
 
-        res_u = (LHS_u - RHS_u) / scale_u
-        res_v = (LHS_v - RHS_v) / scale_v
-        target_zero = torch.zeros_like(res_u)
+        return total_pde_loss
 
-        pde_loss_u = torch.nn.functional.smooth_l1_loss(res_u, target_zero, beta=1.0)
-        pde_loss_v = torch.nn.functional.smooth_l1_loss(res_v, target_zero, beta=1.0)
-
-        return torch.mean(pde_loss_u + pde_loss_v)
-    
     def mass_loss_from_derivatives(self, ut_array, uxx_array, mask):
+        """
+        Soft penalty on the SURFACE fitter's derivatives matching
+        conservation (only active when self.mcas is True).
+
+        Returns 0 when mcas=False (no conservation assumed), AND when
+        diff_coeffs are FIXED: in that case every input here -- the
+        cached derivatives, the buffered D, the locked scale -- is a
+        constant with respect to the reaction weights and gates, which
+        are the only things trained in Phase 2+. The term contributes
+        exactly zero gradient, so computing it only burns time, inflates
+        the total-loss curve, and adds sampling noise to the Phase 4
+        best-val comparison. It IS meaningful when diffusion is learned,
+        where D is a live parameter and this is what trains it.
+        """
+        if not self.conservation_groups:
+            return torch.tensor(0.0, device=ut_array.device)
+
         if self.diff_coeffs:
             return torch.tensor(0.0, device=ut_array.device)
+
         D = self.diffusion_fitter()
-        Du, Dv = D[0], D[1]
 
-        u_t = ut_array[mask, 0]
-        v_t = ut_array[mask, 1]
-        w_t = u_t + v_t
+        total_mass_loss = torch.tensor(0.0, device=ut_array.device)
+        for g_idx, group in enumerate(self.conservation_groups):
+            w_t = sum(ut_array[mask, s_idx] for s_idx in group)
+            lap_sum = sum(D[s_idx] * torch.sum(uxx_array[s_idx, mask, :], dim=1) for s_idx in group)
 
-        lap_u = torch.sum(uxx_array[0, mask, :], dim=1)
-        lap_v = torch.sum(uxx_array[1, mask, :], dim=1)
+            scale = torch.sqrt(torch.tensor(self.mass_scales[g_idx], device=ut_array.device)) \
+                if getattr(self, 'mass_scales', None) else torch.tensor(1.0, device=ut_array.device)
+            residual = (w_t - lap_sum) / scale
 
-        scale = torch.sqrt(torch.tensor(getattr(self, 'mass_scale', 1.0), device=ut_array.device))
-        residual = (w_t - (Du * lap_u + Dv * lap_v)) / scale
+            weights = torch.abs(w_t).detach()
+            weights = weights / (weights.mean() + 1e-8)
+            total_mass_loss = total_mass_loss + torch.mean(weights * residual ** 2)
 
-        weights = torch.abs(w_t).detach()
-        weights = weights / (weights.mean() + 1e-8)
-        return torch.mean(weights * residual ** 2)
-    
+        return total_mass_loss / len(self.conservation_groups)
+
     def reg_loss(self, epoch):
-        """
-        Soft Wall Regularization:
-        1. L0 Sparsity
-        2. Physical Bound Penalty (ReLU(|w_phys| - bound))
-        """
-        # 1. L0 Sparsity
-        gate_probs = self.reaction.eql_layer.l0_gate.expected_l0()
+        """L0 sparsity, summed once per FREE species' gate (mirror species
+        share their primary's gate exactly -- summing them again would
+        double-count the same penalty, not add new information)."""
+        eql = self.reaction.eql_layer
+        total = torch.tensor(0.0, device=eql.fc.weight.device)
+        for free_idx in range(eql.n_free):
+            total = total + eql.l0_gates[free_idx].expected_l0().sum()
+        return total
 
-        return gate_probs.sum()
-    
     def soft_wall_loss(self):
-        # We pass epsilon=0.15 to ensure the curve doesn't saturate 
-        # before 15% of the physical domain.
         w_phys, k_phys, k_ceilings = self.reaction.eql_layer.get_physical_parameters(epsilon=0.15)
-        
-        # A. Weight Penalty (Rates)
+
         w_violation = torch.relu(torch.abs(w_phys) - self.param_bounds)
-        w_loss = torch.sum(w_violation) * 100 
-        
-        # B. Dynamic K Penalty (Affinities)
-        k_violation = torch.relu(k_phys - k_ceilings)
-        k_loss = torch.sum(k_violation) * 100
+        w_loss = torch.sum(w_violation) * 100
+
+        if k_phys.numel() > 0:
+            k_violation = torch.relu(k_phys - k_ceilings)
+            k_loss = torch.sum(k_violation) * 100
+        else:
+            k_loss = torch.tensor(0.0, device=w_phys.device)
 
         return w_loss + k_loss
 
     def loss(self, pred, true, epoch, phase=None):
         raw_gls = self.gls_loss_time_weighted(pred, true)
-
-        raw_softwall = self.soft_wall_loss()   # always enforced, cheap regardless of phase
-        raw_l0 = self.reg_loss(epoch)          # cheap, gate probs only
+        raw_softwall = self.soft_wall_loss()
+        raw_l0 = self.reg_loss(epoch)
 
         if phase == 1:
-            # Surface-only phase: reaction/diffusion are frozen (requires_grad=False),
-            # so pde_loss/mass_loss contribute zero gradient here regardless -- but
-            # without this check we'd still pay for collocation sampling + a full
-            # double-backward derivative pass through surface_fitter just to throw
-            # the result away via base_weights=0. Skip the computation entirely.
             zero = torch.tensor(0.0, device=pred.device)
             return raw_gls, zero, raw_l0, raw_softwall, zero
 
@@ -515,13 +642,9 @@ class BINN(nn.Module):
             idx = torch.randint(0, cache['outputs'].shape[0], (self.num_samples,), device=pred.device)
             outputs_b = cache['outputs'][idx]
             ut_b = cache['ut_array'][idx]
-            uxx_b = cache['uxx_array'][:, idx, :]      # FIX: points is axis 1 here, not axis 0
+            uxx_b = cache['uxx_array'][:, idx, :]
             mask_b = cache['mass_mask'][idx]
-        
         else:
-            # phase > 1 but cache not built yet -- shouldn't normally happen once
-            # refresh_collocation_cache() is wired into Phase 2 entry, but fall
-            # back to the uncached path rather than crashing.
             x = torch.empty(self.num_samples, self.dimensions, device=pred.device).uniform_(
                 self.lb[0, 0], self.ub[0, 0])
             t = torch.empty(self.num_samples, 1, device=pred.device).uniform_(
@@ -537,922 +660,432 @@ class BINN(nn.Module):
                     if mask_b.any() else torch.tensor(0.0, device=pred.device))
 
         return raw_gls, raw_pde, raw_l0, raw_softwall, raw_mass
-        
+
     # -----------------------
-    # Parameter Extraction (Unscaling)
+    # Parameter Extraction
     # -----------------------
     def generate_terms(self):
-        # 1. Dynamically grab the exact powers used by the layer!
-        # Returns tuples like (3, 0) for u^3, or (1, 2) for u*v^2
-        poly_terms = self.reaction.eql_layer.poly.powers
-        
+        """Structural term list -- shared across all species equations, so no per-species logic needed."""
+        poly_terms = self.reaction.eql_layer.poly.powers if self.reaction.eql_layer.poly is not None else []
+
         hill_terms = []
-        # Raw Hill
-        for i in range(self.species): hill_terms.append((i,))
-        # Cross Hill
+        for i in range(self.species):
+            hill_terms.append((i,))
         for i in range(self.species):
             for j in range(self.species):
-                if i != j: hill_terms.append((i, j))
-                
+                if i != j:
+                    hill_terms.append((i, j))
+
         return poly_terms, hill_terms
-    
+
+    def _extract_hill_shape_params(self):
+        """n, K for each Hill function in the shared basis (independent of species head)."""
+        eql = self.reaction.eql_layer
+        ns_inc, Ks_inc, ns_dec, Ks_dec = [], [], [], []
+
+        def get_vals(module):
+            n = torch.sigmoid(module.raw_n) * 3 + 1
+            k_phys = F.softplus(module.raw_K)
+            return n.item(), k_phys.item()
+
+        for hill_module in eql.hill.hill_modules:
+            if eql.include_increasing_hill:
+                for i in range(self.species):
+                    n, k = get_vals(hill_module.hill_inc_raw[i]); ns_inc.append(n); Ks_inc.append(k)
+                for i in range(self.species):
+                    for j in range(self.species):
+                        if i != j:
+                            n, k = get_vals(hill_module.hill_inc_cross[f"{i}_{j}"])
+                            ns_inc.append(n); Ks_inc.append(k)
+            if eql.include_decreasing_hill:
+                for i in range(self.species):
+                    n, k = get_vals(hill_module.hill_dec_raw[i]); ns_dec.append(n); Ks_dec.append(k)
+                for i in range(self.species):
+                    for j in range(self.species):
+                        if i != j:
+                            n, k = get_vals(hill_module.hill_dec_cross[f"{i}_{j}"])
+                            ns_dec.append(n); Ks_dec.append(k)
+
+        return np.array(ns_inc), np.array(Ks_inc), np.array(ns_dec), np.array(Ks_dec)
+
     def extract_params(self, full=True):
         """
-        Extracts PHYSICAL parameters from the BINN.
-        
-        - Network Weights (w) are ALREADY physical (w_net = w_phys).
-        - Hill K parameters (K) need unscaling (K_phys = K_net / S^n).
+        Returns a LIST of dicts, length self.n_equations (1 if mcas, else
+        species). When mcas=True this deliberately does NOT report
+        species 1's mirrored equation separately -- there's only one
+        equation to show, matching the classic +F/-F printout instead of
+        printing the same information twice with a sign flip.
         """
         eql = self.reaction.eql_layer
-        
-        # 1. Get Network Weights (Now Physical)
-        # We clone to avoid modifying the graph
-        raw_w_t = eql.fc.weight[0].detach() 
-        w_phys_t = raw_w_t  # No division needed!
-        
-        # 2. Get Gates
-        try:
-            gates_t = eql.l0_gate.get_gates().detach()
-        except:
-            log_alpha = eql.l0_gate.log_alpha.detach()
-            gates_t = torch.sigmoid(log_alpha).clamp(0.0, 1.0)
-
-        # 3. Calculate Effective Physical Weights
-        effective_t = w_phys_t * gates_t
-
-        # 4. Get Scales (S^n) - Needed ONLY for unscaling Hill K's
-        # scales_t = eql._generate_scales_fast().view(-1).detach()
-
-        # Convert to numpy for export
-        raw_w = raw_w_t.cpu().numpy().reshape(-1)
-        raw_w_phys = w_phys_t.cpu().numpy().reshape(-1)
-        gates = gates_t.cpu().numpy().reshape(-1)
-        effective = effective_t.cpu().numpy().reshape(-1)
-
-        # Gather structure
-        num_poly = int(eql.num_poly_features)
-        num_hill = int(eql.num_hill_features)
+        num_poly = eql.num_poly_features
+        num_hill = eql.num_hill_features
         poly_terms, hill_terms = self.generate_terms()
-        n_hill_single = len(hill_terms)
-        dup = int(self.duplicates)
-        
-        s_u, s_v = self.max_scale[0, 0].item(), self.max_scale[0, 1].item()
 
-        # --- EXTRACT HILL PARAMS (K_phys = K_net / S^n) ---
-        # We must iterate through the Hill modules to unscale K using the correct S^n
-        
-        raw_ns_inc_list, raw_Ks_inc_list = [], []
-        raw_ns_dec_list, raw_Ks_dec_list = [], []
-        
-        # Flat list of all hill functions for easy indexing if needed, 
-        # but iterating the module list is safer for matching S_u vs S_v
-        
-        for hill_module in eql.hill.hill_modules:
-            # def get_vals(module, base_scale):
-            #     n = torch.sigmoid(module.raw_n) * 3 + 1
-            #     k_net = F.softplus(module.raw_K)
-            #     # Unscale K: K_phys = K_net / S^n
-            #     k_phys = k_net / (base_scale ** n)
-            #     return n.item(), k_phys.item()
-            
-            def get_vals(module, base_scale):
-                n = torch.sigmoid(module.raw_n) * 3 + 1
-                # K is already physical
-                k_phys = F.softplus(module.raw_K)
-                return n.item(), k_phys.item()
+        results = []
+        for s_idx in range(self.n_equations):
+            w_row, gate_module, sign = eql.get_species_weight_and_gate(s_idx)
+            raw_w_t = (sign * w_row).detach()
 
-            # Inc Raw
-            for i in range(self.species):
-                n, k = get_vals(hill_module.hill_inc_raw[i], s_u if i==0 else s_v)
-                raw_ns_inc_list.append(n); raw_Ks_inc_list.append(k)
-            # Inc Cross
-            for i in range(self.species):
-                for j in range(self.species):
-                    if i != j:
-                        key = f"{i}_{j}"
-                        n, k = get_vals(hill_module.hill_inc_cross[key], s_u if i==0 else s_v)
-                        raw_ns_inc_list.append(n); raw_Ks_inc_list.append(k)
-            # Dec Raw
-            for i in range(self.species):
-                n, k = get_vals(hill_module.hill_dec_raw[i], s_u if i==0 else s_v)
-                raw_ns_dec_list.append(n); raw_Ks_dec_list.append(k)
-            # Dec Cross
-            for i in range(self.species):
-                for j in range(self.species):
-                    if i != j:
-                        key = f"{i}_{j}"
-                        n, k = get_vals(hill_module.hill_dec_cross[key], s_u if i==0 else s_v)
-                        raw_ns_dec_list.append(n); raw_Ks_dec_list.append(k)
+            try:
+                gates_t = gate_module.get_gates().detach()
+            except AttributeError:
+                log_alpha = gate_module.log_alpha.detach()
+                gates_t = torch.sigmoid(log_alpha).clamp(0.0, 1.0)
 
-        ns_inc = np.array(raw_ns_inc_list)
-        Ks_inc = np.array(raw_Ks_inc_list)
-        ns_dec = np.array(raw_ns_dec_list)
-        Ks_dec = np.array(raw_Ks_dec_list)
+            effective_t = raw_w_t * gates_t
 
-        # --- ORGANIZE ARRAYS ---
-        poly_coeffs_unscaled = effective[:num_poly] if num_poly > 0 else np.array([])
-        
-        hill_block = effective[num_poly : num_poly + num_hill] if num_hill > 0 else np.array([])
-        hill_inc_unscaled_list = []
-        hill_dec_unscaled_list = []
-        ptr = 0
-        
-        for d in range(dup):
-            hill_inc_unscaled_list.extend(hill_block[ptr : ptr + n_hill_single])
-            ptr += n_hill_single
-            hill_dec_unscaled_list.extend(hill_block[ptr : ptr + n_hill_single])
-            ptr += n_hill_single
+            raw_w = raw_w_t.cpu().numpy().reshape(-1)
+            gates = gates_t.cpu().numpy().reshape(-1)
+            effective = effective_t.cpu().numpy().reshape(-1)
 
-        hill_inc_unscaled = np.array(hill_inc_unscaled_list)
-        hill_dec_unscaled = np.array(hill_dec_unscaled_list)
+            eq_result = {'raw_w_unscaled': raw_w, 'effective_unscaled': effective}
 
-        # K's are already unscaled by the loop above
-        Ks_inc_unscaled = Ks_inc
-        Ks_dec_unscaled = Ks_dec
+            if full:
+                eq_result.update({
+                    'raw_w': raw_w,
+                    'gates': gates,
+                    'effective': effective,
+                    'num_poly': num_poly,
+                    'num_hill': num_hill,
+                    'poly_terms': poly_terms,
+                    'hill_terms': hill_terms,
+                    'poly_coeffs_unscaled': effective[:num_poly] if num_poly else np.array([]),
+                })
 
-        # --- RECONSTRUCT RAW_W_UNSCALED ---
-        raw_w_unscaled = raw_w_phys
+                if num_hill > 0:
+                    hill_block = effective[num_poly:num_poly + num_hill]
+                    n_form = self.species + self.species * (self.species - 1)
+                    forms = []
+                    if eql.include_increasing_hill: forms.append('inc')
+                    if eql.include_decreasing_hill: forms.append('dec')
 
-        if not full:
-            return {'raw_w_unscaled': raw_w_unscaled, 'effective_unscaled': effective}
+                    inc_vals, dec_vals = [], []
+                    ptr = 0
+                    for d in range(self.duplicates):
+                        for form in forms:
+                            block = hill_block[ptr: ptr + n_form]
+                            ptr += n_form
+                            if form == 'inc':
+                                inc_vals.extend(block)
+                            else:
+                                dec_vals.extend(block)
 
-        return {
-            'raw_w': raw_w,                 # Network weights (Physical)
-            'raw_w_unscaled': raw_w_unscaled, # Physical weights (Same as raw_w)
-            'gates': gates,
-            'effective': effective,         # Effective Physical weights
-            'effective_unscaled': effective, 
-            'num_poly': num_poly, 'num_hill': num_hill,
-            'ns_inc': ns_inc, 'Ks_inc': Ks_inc, 
-            'ns_dec': ns_dec, 'Ks_dec': Ks_dec,
-            'poly_terms': poly_terms, 'hill_terms': hill_terms,
-            'poly_coeffs_unscaled': poly_coeffs_unscaled,
-            'hill_inc_unscaled': hill_inc_unscaled, 
-            'hill_dec_unscaled': hill_dec_unscaled,
-            'Ks_inc_unscaled': Ks_inc_unscaled, 
-            'Ks_dec_unscaled': Ks_dec_unscaled 
-        }
-
-
-
-
-    ### OG ###                                    
-    @torch.no_grad()    
-    def fine_tune_eql(self, threshold=0.01, epsilon=0.1):
-        """
-        Fine-tunes the discovered EQL equation.
-        Sequence: Zeroing -> Poly Merging -> Hill Merging -> Poly Simplification.
-        
-        Improvements:
-        1. Uses Synthetic Grid for density-independent shape comparison.
-        2. Enforces 'Same-Form' check so Inc/Dec terms aren't mixed.
-        3. Uses 'epsilon' for both merging and simplification.
-        """
-        eql = self.reaction.eql_layer
-        device = eql.fc.weight.device
-        
-        # --- TASK 0: SYNTHETIC GRID GENERATION ---
-        # Robust 100x100 mesh to capture all feature behaviors
-        steps = 100 
-        s_u, s_v = self.max_scale[0, 0].item(), self.max_scale[0, 1].item()
-        u_space = torch.linspace(0, s_u, steps, device=device)
-        v_space = torch.linspace(0, s_v, steps, device=device)
-        grid_u, grid_v = torch.meshgrid(u_space, v_space, indexing='ij')
-        
-        # Shape (10000, 2)
-        uv_synthetic = torch.stack([grid_u.flatten(), grid_v.flatten()], dim=1)
-        
-        # Calculate ALL features on this grid
-        features = eql.get_features(uv_synthetic) 
-        
-        # --- TASK 1: ZEROING (Pruning Noise) ---
-        params = self.extract_params(full=True)
-        eff_unscaled = torch.tensor(params['effective_unscaled'], device=device)
-        
-        # Identify weak terms
-        small_mask = torch.abs(eff_unscaled) < threshold
-        eql.fc.weight.data[0, small_mask] = 0.0
-        eql.l0_gate.log_alpha.data[small_mask] = -10.0 # Lock gate
-
-        # Refresh params/counts
-        params = self.extract_params(full=True)
-        num_poly = eql.num_poly_features
-        num_hill = eql.num_hill_features
-        
-        # Determine the "Species" of each Hill term
-        # e.g. If you have [Inc, Dec] repeated 5 times, n_hill_single = 2.
-        # Term 0 is Inc, Term 1 is Dec, Term 2 is Inc...
-        n_poly_single = num_poly // self.duplicates
-        n_hill_single = len(params['hill_terms']) 
-
-        # --- TASK 2: COMBINE DUPLICATE POLYNOMIALS ---
-        for i in range(n_poly_single):
-            indices = [i + j * n_poly_single for j in range(self.duplicates)]
-            primary = indices[0]
-            
-            for other in indices[1:]:
-                if torch.abs(eql.fc.weight.data[0, other]) < 1e-8: continue
-                
-                eql.fc.weight.data[0, primary] += eql.fc.weight.data[0, other]
-                eql.fc.weight.data[0, other] = 0.0
-                
-                eql.l0_gate.log_alpha.data[primary] = torch.max(
-                    eql.l0_gate.log_alpha.data[primary], 
-                    eql.l0_gate.log_alpha.data[other]
-                )
-                eql.l0_gate.log_alpha.data[other] = -10.0
-
-        # --- TASK 3A: MERGE DUPLICATE HILLS (Same Form Only) ---
-        for i in range(num_hill):
-            h_idx = num_poly + i
-            weight_primary = eql.fc.weight.data[0, h_idx]
-            if torch.abs(weight_primary) < 1e-8: continue
-            
-            # 1. Identify Form: 0 for Inc, 1 for Dec (for example)
-            form_id_i = (h_idx - num_poly) % n_hill_single
-            
-            f_hill = features[:, h_idx]
-            # Center for Pearson Correlation
-            f_hill_c = f_hill - torch.mean(f_hill)
-            norm_hill_c = torch.norm(f_hill_c) + 1e-9
-            
-            for next_h_idx in range(h_idx + 1, num_poly + num_hill):
-                weight_duplicate = eql.fc.weight.data[0, next_h_idx]
-                if torch.abs(weight_duplicate) < 1e-8: continue
-                
-                # 2. Strict Form Check
-                form_id_next = (next_h_idx - num_poly) % n_hill_single
-                
-                # If they are different forms, skip immediately.
-                if form_id_i != form_id_next:
-                    continue
-                
-                # 3. Correlation Check
-                f_other = features[:, next_h_idx]
-                f_other_c = f_other - torch.mean(f_other)
-                norm_other_c = torch.norm(f_other_c) + 1e-9
-                
-                correlation = torch.sum(f_hill_c * f_other_c) / (norm_hill_c * norm_other_c)
-                dist = 1.0 - torch.abs(correlation)
-                
-                if dist < epsilon:
-                    print(f"Merging Duplicate Hills: {h_idx} and {next_h_idx} (Dist: {dist:.4f})")
-                    
-                    # Merge internal parameters using a weighted average!
-                    self._average_hill_params(h_idx - num_poly, next_h_idx - num_poly, 
-                                              weight_primary, weight_duplicate)
-                    
-                    # Consolidate the linear coefficient weights
-                    eql.fc.weight.data[0, h_idx] += eql.fc.weight.data[0, next_h_idx]
-                    eql.fc.weight.data[0, next_h_idx] = 0.0
-                    
-                    # Keep the strongest gate open
-                    eql.l0_gate.log_alpha.data[h_idx] = torch.max(
-                        eql.l0_gate.log_alpha.data[h_idx], 
-                        eql.l0_gate.log_alpha.data[next_h_idx]
-                    )
-                    eql.l0_gate.log_alpha.data[next_h_idx] = -10.0
-                    
-                    # Update primary weight for any subsequent merges in the loop
-                    weight_primary = eql.fc.weight.data[0, h_idx]
-
-        # --- TASK 3B: HEURISTIC SIMPLIFICATION (Strict Rule-Based Mapping) ---
-        for i in range(num_hill):
-            h_idx = num_poly + i
-            hill_weight = eql.fc.weight.data[0, h_idx].item()
-            if abs(hill_weight) < 1e-8: continue
-
-            # Grab the specific HillFunction object
-            hf = eql.all_hill_funcs[i]
-            
-            # 1. Extract physical k and n
-            n_val = (torch.sigmoid(hf.raw_n) * 3 + 1).item()
-            k_val = F.softplus(hf.raw_K).item()
-            
-            # 2. Calculate heuristics
-            n_rounded = round(n_val)
-            max_u = s_u
-            max_denom = 1.0 + k_val * (max_u ** n_val)
-            
-            # 3. YOUR LOGIC GATES
-            is_flat_denom = max_denom < 2.0
-            is_integer_exp = abs(n_val - n_rounded) < epsilon
-            
-            if is_flat_denom and is_integer_exp:               
-                # --- FIND THE CORRESPONDING POLYNOMIAL ---                
-                backup_K = hf.raw_K.data.clone()
-                backup_n = hf.raw_n.data.clone()
-                
-                # Force k = 0
-                hf.raw_K.data.fill_(-20.0) 
-                
-                # Force n = n_rounded
-                target_sigmoid = max(min((n_rounded - 1.0) / 3.0, 0.999), 0.001) 
-                hf.raw_n.data.fill_(torch.logit(torch.tensor(target_sigmoid)).item())
-                
-                # Generate the perfect polynomial shape
-                perfect_shape = eql.get_features(uv_synthetic)[:, h_idx]
-                perfect_norm = torch.norm(perfect_shape) + 1e-9
-                
-                # Search the polynomial basis for the exact match
-                best_p_idx = -1
-                best_corr = -1.0
-                
-                for p_idx in range(num_poly):
-                    f_poly = features[:, p_idx]
-                    poly_norm = torch.norm(f_poly) + 1e-9
-                    
-                    # Cosine similarity (1.0 = identical shape)
-                    corr = torch.sum(perfect_shape * f_poly) / (perfect_norm * poly_norm)
-                    
-                    if corr > best_corr:
-                        best_corr = corr.item()
-                        best_p_idx = p_idx
-                
-                # 4. EXECUTE THE TRANSFER
-                # If we found a perfect structural match (correlation > 0.99)
-                if best_corr > 0.99:
-                    print(f"Moving weight {hill_weight:.4f} directly to Poly {best_p_idx}, max_denom={max_denom:.2f}, n={n_val:.3f}")
-                    
-                    # Move the exact coefficient
-                    eql.fc.weight.data[0, best_p_idx] += hill_weight
-                    
-                    # Transfer Gate L0 Importance
-                    eql.l0_gate.log_alpha.data[best_p_idx] = torch.max(
-                        eql.l0_gate.log_alpha.data[best_p_idx],
-                        eql.l0_gate.log_alpha.data[h_idx]
-                    )
-                    
-                    # Kill the Hill term
-                    eql.fc.weight.data[0, h_idx] = 0.0
-                    eql.l0_gate.log_alpha.data[h_idx] = -10.0
-                    
+                    eq_result['hill_inc_unscaled'] = np.array(inc_vals)
+                    eq_result['hill_dec_unscaled'] = np.array(dec_vals)
                 else:
-                    # Failsafe: The required polynomial doesn't exist in your basis 
-                    # (e.g., Hill became u^3, but poly basis stops at degree 2).
-                    print(f"Target polynomial not in basis. Restoring Hill term.")
-                    hf.raw_K.data = backup_K
-                    hf.raw_n.data = backup_n
+                    eq_result['hill_inc_unscaled'] = np.array([])
+                    eq_result['hill_dec_unscaled'] = np.array([])
 
-        # --- TASK 4: FINAL ZEROING (Pruning Noise) ---
-        params = self.extract_params(full=True)
-        eff_unscaled = torch.tensor(params['effective_unscaled'], device=device)
-        
-        # Identify weak terms
-        small_mask = torch.abs(eff_unscaled) < threshold
-        eql.fc.weight.data[0, small_mask] = 0.0
-        eql.l0_gate.log_alpha.data[small_mask] = -10.0 # Lock gate
+            results.append(eq_result)
 
-        # Refresh params/counts
-        params = self.extract_params(full=True)
-        num_poly = eql.num_poly_features
-        num_hill = eql.num_hill_features
+        if full and num_hill > 0:
+            ns_inc, Ks_inc, ns_dec, Ks_dec = self._extract_hill_shape_params()
+            for eq_result in results:
+                eq_result['ns_inc'], eq_result['Ks_inc'] = ns_inc, Ks_inc
+                eq_result['ns_dec'], eq_result['Ks_dec'] = ns_dec, Ks_dec
+        elif full:
+            for eq_result in results:
+                eq_result['ns_inc'] = eq_result['Ks_inc'] = np.array([])
+                eq_result['ns_dec'] = eq_result['Ks_dec'] = np.array([])
 
-        _ = self.extract_params(full=True)
-        print(f"Fine-tuning committed.")
+        return results
 
-
-
-
-    ### GEMINI ###
-    # @torch.no_grad()
-    # def _validate_swap(self, h_idx, p_idx, poly_coeff, cache):
-    #     """Helper to validate a proposed Hill -> Poly swap against actual PDE loss."""
-    #     eql = self.reaction.eql_layer
-        
-    #     # 1. Snapshot original state
-    #     orig_hill_w = eql.fc.weight.data[0, h_idx].item()
-    #     orig_poly_w = eql.fc.weight.data[0, p_idx].item()
-    #     orig_hill_gate = eql.l0_gate.log_alpha.data[h_idx].item()
-    #     orig_poly_gate = eql.l0_gate.log_alpha.data[p_idx].item()
-        
-    #     # 2. Compute BEFORE loss using cache
-    #     outputs_b = cache['outputs']
-    #     ut_b = cache['ut_array']
-    #     uxx_b = cache['uxx_array']
-        
-    #     before_loss = self.pde_loss_from_derivatives(outputs_b, ut_b, uxx_b, epoch=0).item()
-        
-    #     # 3. Apply proposed swap
-    #     eql.fc.weight.data[0, p_idx] += poly_coeff
-    #     eql.fc.weight.data[0, h_idx] = 0.0
-        
-    #     eql.l0_gate.log_alpha.data[p_idx] = max(orig_poly_gate, orig_hill_gate)
-    #     eql.l0_gate.log_alpha.data[h_idx] = -10.0
-        
-    #     # 4. Compute AFTER loss
-    #     after_loss = self.pde_loss_from_derivatives(outputs_b, ut_b, uxx_b, epoch=0).item()
-        
-    #     # 5. Evaluate (allow 1% tolerance for numerical noise)
-    #     if after_loss <= before_loss * 1.01:
-    #         print(f"      -> VALIDATED! PDE Loss: {before_loss:.4e} -> {after_loss:.4e}")
-    #         return True
-    #     else:
-    #         print(f"      -> REJECTED! PDE Loss spiked: {before_loss:.4e} -> {after_loss:.4e}")
-    #         # Revert
-    #         eql.fc.weight.data[0, h_idx] = orig_hill_w
-    #         eql.fc.weight.data[0, p_idx] = orig_poly_w
-    #         eql.l0_gate.log_alpha.data[h_idx] = orig_hill_gate
-    #         eql.l0_gate.log_alpha.data[p_idx] = orig_poly_gate
-    #         return False
-
-    # @torch.no_grad()    
-    # def fine_tune_eql(self, threshold=0.01, epsilon=0.1, r2_threshold=0.99):
-    #     """
-    #     Data-driven, loss-validated fine-tuning.
-    #     Strictly enforces 1-to-1 Hill-to-Polynomial mapping.
-    #     """
-    #     eql = self.reaction.eql_layer
-    #     device = eql.fc.weight.device
-        
-    #     # --- THE FIX: Notebook-Proof Cache Generation ---
-    #     if not hasattr(self, '_collocation_cache'):
-    #         # print("No collocation cache found (likely running post-training). Building a temporary one...")
-    #         # We must explicitly re-enable gradients here so the PDE derivatives can be computed!
-    #         with torch.enable_grad():
-    #             self.refresh_collocation_cache(cache_size=50_000) 
-                
-    #     cache = self._collocation_cache
-        
-    #     # --- TASK 1: ZEROING (Pruning Noise) ---
-    #     # ... [Rest of the code remains exactly the same] ...        
-    #     # --- TASK 1: ZEROING (Pruning Noise) ---
-    #     params = self.extract_params(full=True)
-    #     eff_unscaled = torch.tensor(params['effective_unscaled'], device=device)
-        
-    #     small_mask = torch.abs(eff_unscaled) < threshold
-    #     eql.fc.weight.data[0, small_mask] = 0.0
-    #     eql.l0_gate.log_alpha.data[small_mask] = -10.0 
-
-    #     params = self.extract_params(full=True)
-    #     num_poly = eql.num_poly_features
-    #     num_hill = eql.num_hill_features
-    #     n_poly_single = num_poly // self.duplicates
-    #     n_hill_single = len(params['hill_terms']) 
-
-    #     # --- TASK 2: COMBINE DUPLICATE POLYNOMIALS ---
-    #     for i in range(n_poly_single):
-    #         indices = [i + j * n_poly_single for j in range(self.duplicates)]
-    #         primary = indices[0]
-    #         for other in indices[1:]:
-    #             if torch.abs(eql.fc.weight.data[0, other]) < 1e-8: continue
-                
-    #             eql.fc.weight.data[0, primary] += eql.fc.weight.data[0, other]
-    #             eql.fc.weight.data[0, other] = 0.0
-                
-    #             eql.l0_gate.log_alpha.data[primary] = torch.max(
-    #                 eql.l0_gate.log_alpha.data[primary], 
-    #                 eql.l0_gate.log_alpha.data[other]
-    #             )
-    #             eql.l0_gate.log_alpha.data[other] = -10.0
-
-    #     # Extract data-driven features using the cache
-    #     features = eql.get_features(cache['outputs'])
-
-    #     # --- TASK 3A: MERGE DUPLICATE HILLS ---
-    #     for i in range(num_hill):
-    #         h_idx = num_poly + i
-    #         weight_primary = eql.fc.weight.data[0, h_idx]
-    #         if torch.abs(weight_primary) < 1e-8: continue
-            
-    #         form_id_i = (h_idx - num_poly) % n_hill_single
-    #         f_hill = features[:, h_idx]
-    #         f_hill_c = f_hill - torch.mean(f_hill)
-    #         norm_hill_c = torch.norm(f_hill_c) + 1e-9
-            
-    #         for next_h_idx in range(h_idx + 1, num_poly + num_hill):
-    #             weight_duplicate = eql.fc.weight.data[0, next_h_idx]
-    #             if torch.abs(weight_duplicate) < 1e-8: continue
-                
-    #             form_id_next = (next_h_idx - num_poly) % n_hill_single
-    #             if form_id_i != form_id_next: continue
-                
-    #             f_other = features[:, next_h_idx]
-    #             f_other_c = f_other - torch.mean(f_other)
-    #             norm_other_c = torch.norm(f_other_c) + 1e-9
-                
-    #             dist = 1.0 - torch.abs(torch.sum(f_hill_c * f_other_c) / (norm_hill_c * norm_other_c))
-                
-    #             if dist < epsilon:
-    #                 print(f"Merging Duplicate Hills: {h_idx} and {next_h_idx} (Dist: {dist:.4f})")
-    #                 self._average_hill_params(h_idx - num_poly, next_h_idx - num_poly, 
-    #                                           weight_primary, weight_duplicate)
-                    
-    #                 eql.fc.weight.data[0, h_idx] += eql.fc.weight.data[0, next_h_idx]
-    #                 eql.fc.weight.data[0, next_h_idx] = 0.0
-                    
-    #                 eql.l0_gate.log_alpha.data[h_idx] = torch.max(
-    #                     eql.l0_gate.log_alpha.data[h_idx], 
-    #                     eql.l0_gate.log_alpha.data[next_h_idx]
-    #                 )
-    #                 eql.l0_gate.log_alpha.data[next_h_idx] = -10.0
-    #                 weight_primary = eql.fc.weight.data[0, h_idx]
-
-    #     # --- TASK 3B: DATA-WEIGHTED, STRICT 1-TO-1 SIMPLIFICATION ---
-    #     for i in range(num_hill):
-    #         h_idx = num_poly + i
-    #         hill_weight = eql.fc.weight.data[0, h_idx].item()
-    #         if abs(hill_weight) < 1e-8: continue
-
-    #         hf = eql.all_hill_funcs[i]
-    #         n_val = (torch.sigmoid(hf.raw_n) * 3 + 1).item()
-    #         k_val = F.softplus(hf.raw_K).item()
-            
-    #         # 1. Exact Match Shortcut (Increasing Only)
-    #         is_increasing = hf.increasing
-    #         is_flat_denom = k_val < 0.05 
-    #         is_integer_exp = abs(n_val - round(n_val)) < epsilon
-            
-    #         proposed_p_idx = -1
-    #         proposed_coeff = hill_weight
-            
-    #         if is_increasing and is_flat_denom and is_integer_exp:
-    #             # Build target tuple
-    #             term = params['hill_terms'][i % n_hill_single]
-    #             target = [0] * self.species
-    #             if len(term) == 1:
-    #                 target[term[0]] = round(n_val)
-    #             else:
-    #                 target[term[0]] = round(n_val)
-    #                 target[term[1]] += 1
-    #             target = tuple(target)
-                
-    #             if sum(target) <= self.degree and target in eql.poly.powers:
-    #                 proposed_p_idx = eql.poly.powers.index(target)
-    #                 print(f"Proposed Exact Match: Hill {h_idx} -> Poly {proposed_p_idx} (Tuple: {target})")
-            
-    #         # 2. Data-Weighted 1D Regression Fallback
-    #         if proposed_p_idx == -1:
-    #             y = features[:, h_idx]
-    #             ss_tot = torch.sum((y - y.mean()) ** 2) + 1e-12
-                
-    #             best_r2 = -1.0
-                
-    #             for p_idx in range(num_poly):
-    #                 x = features[:, p_idx]
-    #                 # 1D Least Squares: beta = (x * y) / (x^2)
-    #                 beta = torch.sum(x * y) / (torch.sum(x ** 2) + 1e-12)
-    #                 y_hat = beta * x
-                    
-    #                 ss_res = torch.sum((y - y_hat) ** 2)
-    #                 r2 = (1 - ss_res / ss_tot).item()
-                    
-    #                 if r2 > best_r2:
-    #                     best_r2 = r2
-    #                     proposed_p_idx = p_idx
-    #                     proposed_coeff = hill_weight * beta.item()
-                        
-    #             if best_r2 >= r2_threshold:
-    #                 print(f"Proposed Regression Match: Hill {h_idx} -> Poly {proposed_p_idx} (R2: {best_r2:.4f})")
-    #             else:
-    #                 proposed_p_idx = -1 # Reject, R2 too low
-
-    #         # 3. Loss Validation Gate
-    #         if proposed_p_idx != -1:
-    #             self._validate_swap(h_idx, proposed_p_idx, proposed_coeff, cache)
-    #             # # Grab the gates
-    #             # orig_hill_gate = eql.l0_gate.log_alpha.data[h_idx].item()
-    #             # orig_poly_gate = eql.l0_gate.log_alpha.data[proposed_p_idx].item()
-                
-    #             # # Move the weight unconditionally
-    #             # eql.fc.weight.data[0, proposed_p_idx] += proposed_coeff
-    #             # eql.fc.weight.data[0, h_idx] = 0.0
-                
-    #             # # Transfer the L0 gate importance
-    #             # eql.l0_gate.log_alpha.data[proposed_p_idx] = max(orig_poly_gate, orig_hill_gate)
-    #             # eql.l0_gate.log_alpha.data[h_idx] = -10.0
-    #             # print(f"      -> FORCED SWAP EXECUTED.")
-
-    #     # --- TASK 4: FINAL ZEROING ---
-    #     params = self.extract_params(full=True)
-    #     eff_unscaled = torch.tensor(params['effective_unscaled'], device=device)
-    #     small_mask = torch.abs(eff_unscaled) < threshold
-    #     eql.fc.weight.data[0, small_mask] = 0.0
-    #     eql.l0_gate.log_alpha.data[small_mask] = -10.0 
-
-    #     print(f"Fine-tuning committed.")
-
-
-
-
-    ### CLAUDE ###
-    # def fine_tune_eql(self, threshold=0.01, epsilon=0.1, swap_to_poly=True,
-    #                 denom_threshold=1.1, num_points=20000):
-    #     """
-    #     ...
-    #     num_points: max number of (u, v) points sampled from the actual training
-    #         data to use for TASK 3A's duplicate-merging correlation check. Replaces
-    #         the old uniform 100x100 synthetic grid -- sampling directly from
-    #         train_data means dense/frequently-visited regions of concentration
-    #         space get proportionally more influence on the correlation, and empty
-    #         regions get none, instead of every cell in [0, s_u] x [0, s_v] counting
-    #         equally regardless of whether the trajectory ever goes there.
-    #     """
-    #     eql = self.reaction.eql_layer
-    #     device = eql.fc.weight.device
-
-    #     # --- TASK 0: SAMPLE FROM THE TRAINING DATA DISTRIBUTION ---
-    #     s_u, s_v = self.max_scale[0, 0].item(), self.max_scale[0, 1].item()
-
-    #     uv_data = self.train_data[:, -2:].to(device)   # actual (u, v) pairs seen during training
-    #     print(uv_data.shape[0], flush=True)
-    #     if uv_data.shape[0] > num_points:
-    #         idx = torch.randperm(uv_data.shape[0], device=device)[:num_points]
-    #         uv_synthetic = uv_data[idx]
-    #     else:
-    #         uv_synthetic = uv_data
-
-    #     # Calculate ALL features at these data-distributed points
-    #     features = eql.get_features(uv_synthetic)
-
-    #     # --- TASK 1: ZEROING (Pruning Noise) ---
-    #     params = self.extract_params(full=True)
-    #     eff_unscaled = torch.tensor(params['effective_unscaled'], device=device)
-        
-    #     # Identify weak terms
-    #     small_mask = torch.abs(eff_unscaled) < threshold
-    #     eql.fc.weight.data[0, small_mask] = 0.0
-    #     eql.l0_gate.log_alpha.data[small_mask] = -10.0 # Lock gate
-
-    #     # Refresh params/counts
-    #     params = self.extract_params(full=True)
-    #     num_poly = eql.num_poly_features
-    #     num_hill = eql.num_hill_features
-        
-    #     # Determine the "Species" of each Hill term
-    #     # e.g. If you have [Inc, Dec] repeated 5 times, n_hill_single = 2.
-    #     # Term 0 is Inc, Term 1 is Dec, Term 2 is Inc...
-    #     n_poly_single = num_poly // self.duplicates
-    #     n_hill_single = len(params['hill_terms']) 
-
-    #     # --- TASK 2: COMBINE DUPLICATE POLYNOMIALS ---
-    #     for i in range(n_poly_single):
-    #         indices = [i + j * n_poly_single for j in range(self.duplicates)]
-    #         primary = indices[0]
-            
-    #         for other in indices[1:]:
-    #             if torch.abs(eql.fc.weight.data[0, other]) < 1e-8: continue
-                
-    #             eql.fc.weight.data[0, primary] += eql.fc.weight.data[0, other]
-    #             eql.fc.weight.data[0, other] = 0.0
-                
-    #             eql.l0_gate.log_alpha.data[primary] = torch.max(
-    #                 eql.l0_gate.log_alpha.data[primary], 
-    #                 eql.l0_gate.log_alpha.data[other]
-    #             )
-    #             eql.l0_gate.log_alpha.data[other] = -10.0
-
-    #     # --- TASK 3A: MERGE DUPLICATE HILLS (Same Form Only) ---
-    #     for i in range(num_hill):
-    #         h_idx = num_poly + i
-    #         weight_primary = eql.fc.weight.data[0, h_idx]
-    #         if torch.abs(weight_primary) < 1e-8: continue
-            
-    #         # 1. Identify Form: 0 for Inc, 1 for Dec (for example)
-    #         form_id_i = (h_idx - num_poly) % n_hill_single
-            
-    #         f_hill = features[:, h_idx]
-    #         # Center for Pearson Correlation
-    #         f_hill_c = f_hill - torch.mean(f_hill)
-    #         norm_hill_c = torch.norm(f_hill_c) + 1e-9
-            
-    #         for next_h_idx in range(h_idx + 1, num_poly + num_hill):
-    #             weight_duplicate = eql.fc.weight.data[0, next_h_idx]
-    #             if torch.abs(weight_duplicate) < 1e-8: continue
-                
-    #             # 2. Strict Form Check
-    #             form_id_next = (next_h_idx - num_poly) % n_hill_single
-                
-    #             # If they are different forms, skip immediately.
-    #             if form_id_i != form_id_next:
-    #                 continue
-                
-    #             # 3. Correlation Check
-    #             f_other = features[:, next_h_idx]
-    #             f_other_c = f_other - torch.mean(f_other)
-    #             norm_other_c = torch.norm(f_other_c) + 1e-9
-                
-    #             correlation = torch.sum(f_hill_c * f_other_c) / (norm_hill_c * norm_other_c)
-    #             dist = 1.0 - torch.abs(correlation)
-                
-    #             if dist < epsilon:
-    #                 print(f"Merging Duplicate Hills: {h_idx} and {next_h_idx} (Dist: {dist:.4f})")
-                    
-    #                 # Merge internal parameters using a weighted average!
-    #                 self._average_hill_params(h_idx - num_poly, next_h_idx - num_poly, 
-    #                                           weight_primary, weight_duplicate)
-                    
-    #                 # Consolidate the linear coefficient weights
-    #                 eql.fc.weight.data[0, h_idx] += eql.fc.weight.data[0, next_h_idx]
-    #                 eql.fc.weight.data[0, next_h_idx] = 0.0
-                    
-    #                 # Keep the strongest gate open
-    #                 eql.l0_gate.log_alpha.data[h_idx] = torch.max(
-    #                     eql.l0_gate.log_alpha.data[h_idx], 
-    #                     eql.l0_gate.log_alpha.data[next_h_idx]
-    #                 )
-    #                 eql.l0_gate.log_alpha.data[next_h_idx] = -10.0
-                    
-    #                 # Update primary weight for any subsequent merges in the loop
-    #                 weight_primary = eql.fc.weight.data[0, h_idx]
-
-    #     # --- TASK 3B: EXACT MONOMIAL COLLAPSE (Increasing) + DEGENERACY PRUNE (Decreasing) ---
-    #     # Increasing Hills: as K -> 0, x^n/(1+Kx^n) collapses EXACTLY to the monomial
-    #     # x^n (or x^n * x_j for cross terms) -- an algebraic identity, not a curve fit.
-    #     # We just check K is negligible over the observed domain and n is ~integer,
-    #     # then look up the matching power-tuple directly in the polynomial basis.
-    #     #
-    #     # Decreasing Hills: 1/(K+eps) - x^n/(1+Kx^n) = 1/(K*(1+Kx^n)) has NO degenerate
-    #     # limit that matches a monomial -- it diverges as K->0 and vanishes as K->infinity.
-    #     # There's nothing to "convert" it to. What we CAN do is catch the vanishing case
-    #     # directly: if the term's peak value (at x=0, where it's largest) is already below
-    #     # the zeroing threshold, it contributes nothing anywhere in the domain, so we
-    #     # prune it here explicitly. We also flag the opposite failure mode -- K collapsing
-    #     # toward 0, which turns the term into a near-constant offset with no bias feature
-    #     # in the polynomial basis to absorb it -- since that usually means the term is
-    #     # fighting the loss in a way substitution can't fix.
-    #     poly_terms, hill_terms = self.generate_terms()
-    #     terms_per_form = len(hill_terms)      # raw + cross terms, one form (inc or dec)
-    #     block_size = terms_per_form * 2       # inc block + dec block, per duplicate
-
-    #     for i in range(num_hill):
-    #         h_idx = num_poly + i
-    #         hill_weight = eql.fc.weight.data[0, h_idx].item()
-    #         if abs(hill_weight) < 1e-8:
-    #             continue
-
-    #         local_i = i % block_size
-    #         is_increasing = local_i < terms_per_form
-    #         term = hill_terms[local_i % terms_per_form]
-    #         hf = eql.all_hill_funcs[i]
-
-    #         n_val = (torch.sigmoid(hf.raw_n) * 3 + 1).item()
-    #         k_val = F.softplus(hf.raw_K).item()
-    #         species_idx = term[0]
-    #         max_u = s_u if species_idx == 0 else s_v
-
-    #         if is_increasing:
-    #             # --- Exact collapse check: K ~ 0 over the observed domain ---
-    #             n_rounded = round(n_val)
-    #             # max_denom = 1.0 + k_val * (max_u ** n_val)
-    #             # is_flat_denom = max_denom < denom_threshold
-    #             # is_integer_exp = abs(n_val - n_rounded) < epsilon
-    #             x_vals = uv_synthetic[:, species_idx].clamp(min=0)
-    #             denom_vals = 1.0 + k_val * (x_vals ** n_val)
-    #             max_denom = torch.quantile(denom_vals, 0.99).item()
-    #             is_flat_denom = max_denom < denom_threshold
-    #             is_integer_exp = abs(n_val - n_rounded) < epsilon
-
-    #             if not (is_flat_denom and is_integer_exp):
-    #                 continue
-
-    #             target = [0] * self.species
-    #             target[species_idx] = n_rounded
-    #             if len(term) == 2:
-    #                 target[term[1]] += 1
-    #             target = tuple(target)
-
-    #             if sum(target) > self.degree or target not in poly_terms:
-    #                 print(f"Hill {h_idx} (inc) -> {target} not in polynomial basis "
-    #                     f"(degree {self.degree}). Restoring.")
-    #                 continue
-
-    #             best_p_idx = poly_terms.index(target)  # primary duplicate slot (post TASK 2 merge)
-
-    #             print(f"Moving weight {hill_weight:.4f} from Hill {h_idx} (inc) to Poly "
-    #                 f"{best_p_idx} (term={target}, max_denom={max_denom:.2f}, n={n_val:.3f})")
-
-    #             eql.fc.weight.data[0, best_p_idx] += hill_weight
-    #             eql.l0_gate.log_alpha.data[best_p_idx] = torch.max(
-    #                 eql.l0_gate.log_alpha.data[best_p_idx],
-    #                 eql.l0_gate.log_alpha.data[h_idx]
-    #             )
-    #             eql.fc.weight.data[0, h_idx] = 0.0
-    #             eql.l0_gate.log_alpha.data[h_idx] = -10.0
-
-    #         else:
-    #             # --- Decreasing Hill: no polynomial collapse exists. Check degeneracy instead. ---
-    #             peak_val = 1.0 / (k_val + 1e-8)              # value at x=0, the term's maximum
-    #             peak_contribution = abs(hill_weight) * peak_val
-
-    #             if peak_contribution < threshold:
-    #                 print(f"Pruning Hill {h_idx} (dec): peak contribution "
-    #                     f"{peak_contribution:.4e} < threshold {threshold} everywhere in domain.")
-    #                 eql.fc.weight.data[0, h_idx] = 0.0
-    #                 eql.l0_gate.log_alpha.data[h_idx] = -10.0
-    #             elif k_val < 1e-4:
-    #                 print(f"Warning: Hill {h_idx} (dec) has K={k_val:.2e} -> collapsing toward "
-    #                     f"a near-constant offset (peak {peak_val:.2e}) with no bias term in the "
-    #                     f"polynomial basis to absorb it. Leaving as a Hill term; worth inspecting.")
-
-    #     # --- TASK 4: FINAL ZEROING (Pruning Noise) ---
-    #     params = self.extract_params(full=True)
-    #     eff_unscaled = torch.tensor(params['effective_unscaled'], device=device)
-        
-    #     # Identify weak terms
-    #     small_mask = torch.abs(eff_unscaled) < threshold
-    #     eql.fc.weight.data[0, small_mask] = 0.0
-    #     eql.l0_gate.log_alpha.data[small_mask] = -10.0 # Lock gate
-
-    #     # Refresh params/counts
-    #     params = self.extract_params(full=True)
-    #     num_poly = eql.num_poly_features
-    #     num_hill = eql.num_hill_features
-
-    #     _ = self.extract_params(full=True)
-    #     print(f"Fine-tuning committed.")
-
-
-
-
+    # -----------------------
+    # Fine-tuning / pruning
+    # -----------------------
+    def _zero_weak_terms(self, threshold):
+        """Zeroes weak terms on FREE rows only -- mirror species have no
+        row of their own; their reported coefficients automatically
+        reflect their primary's zeroing since they're read as -1*primary."""
+        eql = self.reaction.eql_layer
+        all_params = self.extract_params(full=True)
+        for free_idx, s_idx in enumerate(eql.free_species):
+            p = all_params[s_idx]
+            eff = torch.tensor(p['effective_unscaled'], device=eql.fc.weight.device)
+            small_mask = torch.abs(eff) < threshold
+            eql.fc.weight.data[free_idx, small_mask] = 0.0
+            eql.l0_gates[free_idx].log_alpha.data[small_mask] = -10.0
 
     def _average_hill_params(self, idx1, idx2, weight1, weight2):
-        """
-        Helper to average n and raw_K for two Hill modules using a weighted average
-        based on the magnitude of their linear coefficients.
-        """
+        """Weighted average of two shared Hill functions' (n, K), indexed
+        directly into EQLLayer.all_hill_funcs (already built respecting
+        duplicates + include flags)."""
         eql = self.reaction.eql_layer
-        
-        # Construct a flat list of Hill modules following Sequential Ptr logic
-        all_hf = []
-        for hm in eql.hill.hill_modules:
-            all_hf.extend(hm.hill_inc_raw + list(hm.hill_inc_cross.values()))
-            all_hf.extend(hm.hill_dec_raw + list(hm.hill_dec_cross.values()))
-            
-        hf1 = all_hf[idx1]
-        hf2 = all_hf[idx2]
-        
-        # Calculate the proportional weight of each term
-        abs_w1 = torch.abs(weight1)
-        abs_w2 = torch.abs(weight2)
+        hf1 = eql.all_hill_funcs[idx1]
+        hf2 = eql.all_hill_funcs[idx2]
+
+        abs_w1, abs_w2 = torch.abs(weight1), torch.abs(weight2)
         total_w = abs_w1 + abs_w2
-        
-        # Prevent division by zero (though handled by the 1e-8 check in the main loop)
-        if total_w < 1e-8:
-            prop1, prop2 = 0.5, 0.5
-        else:
-            prop1 = abs_w1 / total_w
-            prop2 = abs_w2 / total_w
-        
+        prop1, prop2 = (0.5, 0.5) if total_w < 1e-8 else (abs_w1 / total_w, abs_w2 / total_w)
+
         with torch.no_grad():
-            # Update primary module with WEIGHTED average parameters
-            hf1.raw_n.data = (hf1.raw_n.data * prop1) + (hf2.raw_n.data * prop2)
-            hf1.raw_K.data = (hf1.raw_K.data * prop1) + (hf2.raw_K.data * prop2)
-            
-            # Prune parameters of merged module
+            hf1.raw_n.data = hf1.raw_n.data * prop1 + hf2.raw_n.data * prop2
+            hf1.raw_K.data = hf1.raw_K.data * prop1 + hf2.raw_K.data * prop2
             hf2.raw_n.data.fill_(0.0)
             hf2.raw_K.data.fill_(0.0)
 
-    def generate_equation(self, eps=1e-12):
-        p = self.extract_params(full=True)
-        poly_terms = p['poly_terms']
-        hill_terms = p['hill_terms']
-        dup = int(self.duplicates)
-        species = ['u','v']
-        terms = []
+    @torch.no_grad()
+    def fine_tune_eql(self, threshold=0.01, epsilon=0.15, num_points=20000):
+        """
+        Fine-tunes the discovered EQL equations. All mutations below
+        touch only FREE rows (eql.fc.weight / eql.l0_gates are indexed by
+        free-row position, not species index) -- mirror species need no
+        separate handling since their coefficients are always read as
+        -1 * their primary's, which stays correct automatically as the
+        primary's row gets pruned/merged/collapsed.
 
-        # poly coeffs unscaled
-        poly_coeffs = np.asarray(p['poly_coeffs_unscaled']) if 'poly_coeffs_unscaled' in p else np.asarray(p.get('raw_w_unscaled', []))[:p['num_poly']]
+        Per-row steps (independent per free row): zero weak terms, merge
+        duplicate polynomials.
 
-        for term, coeff in zip(poly_terms * dup, poly_coeffs):
-            if abs(coeff) > eps:
-                s = f"{float(coeff):.3f}"
-                # 'term' is now a tuple of powers, e.g., (2, 1) for u^2 * v
-                for i, power in enumerate(term):
-                    if power == 1:
-                        s += f" * {species[i]}"
-                    elif power > 1:
-                        s += f" * {species[i]}^{power}"
-                terms.append(s)
+        Shared-basis steps (done once, since Hill n/K live in the shared
+        feature bank -- weight transfers are applied to EVERY free row
+        that has a nonzero coefficient there): merge duplicate Hills,
+        collapse near-monomial increasing Hills into the matching
+        polynomial term.
 
-        # increasing hills (use unscaled coefficients and Ks and ns)
-        inc_b = np.asarray(p['hill_inc_unscaled'])
-        Ks_inc = np.asarray(p['Ks_inc_unscaled'])
-        ns_inc = np.asarray(p.get('ns_inc_unscaled', p.get('ns_inc', [])))
+        Uses points sampled directly from train_data instead of a uniform
+        grid over concentration space -- a uniform grid scales as
+        steps^species and is infeasible past ~3 species.
+        """
+        eql = self.reaction.eql_layer
+        device = eql.fc.weight.device
+        species = self.species
+        dup = self.duplicates
+        n_free = eql.n_free
 
-        for term, coeff, K, n in zip(hill_terms * dup, inc_b, Ks_inc, ns_inc):
-            if abs(coeff) <= eps: 
+        if eql.hill is None:
+            self._zero_weak_terms(threshold)
+            print("Fine-tuning committed (poly-only library, no Hill merging needed).")
+            return
+
+        # --- TASK 0: SAMPLE FROM THE TRAINING DATA DISTRIBUTION ---
+        uv_data = self.train_data[:, -species:].to(device)
+        if uv_data.shape[0] > num_points:
+            idx = torch.randperm(uv_data.shape[0], device=device)[:num_points]
+            uv_synthetic = uv_data[idx]
+        else:
+            uv_synthetic = uv_data
+
+        features = eql.get_features(uv_synthetic)
+
+        num_poly = eql.num_poly_features
+        num_hill = eql.num_hill_features
+        n_poly_single = num_poly // dup if dup else 0
+        _, hill_terms = self.generate_terms()
+        n_hill_single = len(hill_terms)
+
+        forms = []
+        if eql.include_increasing_hill: forms.append('inc')
+        if eql.include_decreasing_hill: forms.append('dec')
+        hill_block_size = n_hill_single * len(forms)  # per duplicate
+
+        # --- TASK 1: ZERO WEAK TERMS (per free row) ---
+        self._zero_weak_terms(threshold)
+
+        # --- TASK 2: COMBINE DUPLICATE POLYNOMIALS (per free row) ---
+        if eql.include_poly:
+            for free_idx in range(n_free):
+                for i in range(n_poly_single):
+                    indices = [i + j * n_poly_single for j in range(dup)]
+                    primary = indices[0]
+                    for other in indices[1:]:
+                        if torch.abs(eql.fc.weight.data[free_idx, other]) < 1e-8:
+                            continue
+                        eql.fc.weight.data[free_idx, primary] += eql.fc.weight.data[free_idx, other]
+                        eql.fc.weight.data[free_idx, other] = 0.0
+                        eql.l0_gates[free_idx].log_alpha.data[primary] = torch.max(
+                            eql.l0_gates[free_idx].log_alpha.data[primary],
+                            eql.l0_gates[free_idx].log_alpha.data[other])
+                        eql.l0_gates[free_idx].log_alpha.data[other] = -10.0
+
+        def any_free_row_nonzero(h_idx):
+            return any(torch.abs(eql.fc.weight.data[fi, h_idx]) > 1e-8 for fi in range(n_free))
+
+        # --- TASK 3A: MERGE DUPLICATE HILLS (shared basis, same form only) ---
+        for i in range(num_hill):
+            h_idx = num_poly + i
+            if not any_free_row_nonzero(h_idx):
                 continue
-            coeff_f = float(coeff); K_f = float(K); n_f = float(n)
-            if len(term) == 1:
-                s = f"{coeff_f:.3f} * {species[term[0]]}^{n_f:.3f} / (1 + {K_f:.3f} * {species[term[0]]}^{n_f:.3f})"
+
+            form_id_i = i % hill_block_size
+            f_hill = features[:, h_idx]
+            f_hill_c = f_hill - torch.mean(f_hill)
+            norm_hill_c = torch.norm(f_hill_c) + 1e-9
+
+            for j in range(i + 1, num_hill):
+                next_h_idx = num_poly + j
+                if not any_free_row_nonzero(next_h_idx):
+                    continue
+                if j % hill_block_size != form_id_i:
+                    continue
+
+                f_other = features[:, next_h_idx]
+                f_other_c = f_other - torch.mean(f_other)
+                norm_other_c = torch.norm(f_other_c) + 1e-9
+
+                correlation = torch.sum(f_hill_c * f_other_c) / (norm_hill_c * norm_other_c)
+                dist = 1.0 - torch.abs(correlation)
+
+                if dist < epsilon:
+                    print(f"Merging Duplicate Hills: {h_idx} and {next_h_idx} (Dist: {dist:.4f})")
+
+                    w_primary = max((eql.fc.weight.data[fi, h_idx] for fi in range(n_free)), key=abs)
+                    w_duplicate = max((eql.fc.weight.data[fi, next_h_idx] for fi in range(n_free)), key=abs)
+                    self._average_hill_params(i, j, w_primary, w_duplicate)
+
+                    for free_idx in range(n_free):
+                        eql.fc.weight.data[free_idx, h_idx] += eql.fc.weight.data[free_idx, next_h_idx]
+                        eql.fc.weight.data[free_idx, next_h_idx] = 0.0
+                        eql.l0_gates[free_idx].log_alpha.data[h_idx] = torch.max(
+                            eql.l0_gates[free_idx].log_alpha.data[h_idx],
+                            eql.l0_gates[free_idx].log_alpha.data[next_h_idx])
+                        eql.l0_gates[free_idx].log_alpha.data[next_h_idx] = -10.0
+
+        # --- TASK 3B: COLLAPSE NEAR-MONOMIAL INCREASING HILLS INTO POLYNOMIALS ---
+        if eql.include_poly:
+            poly_terms = self.generate_terms()[0]
+            for i in range(num_hill):
+                h_idx = num_poly + i
+                if not any_free_row_nonzero(h_idx):
+                    continue
+
+                # Which form does this slot hold? Derive it from `forms`
+                # rather than assuming inc-then-dec: when only one family
+                # is included, slot 0 is that family, not necessarily inc.
+                slot = i % hill_block_size
+                if len(forms) == 2:
+                    form = 'inc' if slot < n_hill_single else 'dec'
+                else:
+                    form = forms[0]
+
+                term = hill_terms[slot % n_hill_single]
+
+                hf = eql.all_hill_funcs[i]
+                n_val = (torch.sigmoid(hf.raw_n) * 3 + 1).item()
+                k_val = F.softplus(hf.raw_K).item()
+
+                max_u = self.max_scale[0, term[0]].item()
+                max_denom = 1.0 + k_val * (max_u ** n_val)
+                if max_denom >= 1.1:
+                    continue
+
+                target = [0] * species
+                if form == 'inc':
+                    # x_i^n / (1 + K x_i^n) ~ x_i^n: needs n near-integer.
+                    n_rounded = round(n_val)
+                    if abs(n_val - n_rounded) >= epsilon:
+                        continue
+                    target[term[0]] = n_rounded
+                    if len(term) == 2:
+                        target[term[1]] += 1
+                else:
+                    # x_j / (1 + K x_i^n) ~ x_j: n is irrelevant. The raw
+                    # (single-index) dec term collapses to a constant,
+                    # which the poly basis has no slot for.
+                    if len(term) != 2:
+                        continue
+                    target[term[1]] = 1
+
+                target = tuple(target)
+                if sum(target) > self.degree or target not in poly_terms:
+                    continue
+
+                best_p_idx = poly_terms.index(target)
+                print(f"Collapsing Hill {h_idx} ({form}) -> Poly {best_p_idx} "
+                      f"(term={target}, max_denom={max_denom:.2f}, n={n_val:.3f})")
+
+                for free_idx in range(n_free):
+                    w = eql.fc.weight.data[free_idx, h_idx]
+                    if torch.abs(w) < 1e-8:
+                        continue
+                    eql.fc.weight.data[free_idx, best_p_idx] += w
+                    eql.fc.weight.data[free_idx, h_idx] = 0.0
+                    eql.l0_gates[free_idx].log_alpha.data[best_p_idx] = torch.max(
+                        eql.l0_gates[free_idx].log_alpha.data[best_p_idx],
+                        eql.l0_gates[free_idx].log_alpha.data[h_idx])
+                    eql.l0_gates[free_idx].log_alpha.data[h_idx] = -10.0
+
+        # --- TASK 4: FINAL ZEROING (per free row) ---
+        self._zero_weak_terms(threshold)
+        print("Fine-tuning committed.")
+
+    def generate_equation(self, eps=1e-12, species_names=None):
+        """
+        Returns a list of dicts, length self.n_equations:
+        {'species': label, 'terms': [str, ...]}. When mcas=True, label is
+        "F(u, v)" (one shared reaction, not species-specific) and the list
+        has exactly one entry; when mcas=False, label is each species'
+        name and the list has one entry per species.
+        """
+        species_names = species_names or self.species_names
+        all_params = self.extract_params(full=True)
+        dup = self.duplicates
+        all_equations = []
+
+        for eq_idx, p in enumerate(all_params):
+            poly_terms = p['poly_terms']
+            hill_terms = p['hill_terms']
+            terms = []
+            poly_coeffs = np.asarray(p['poly_coeffs_unscaled'])
+
+            for term, coeff in zip(poly_terms * dup, poly_coeffs):
+                if abs(coeff) > eps:
+                    s = f"{float(coeff):.3f}"
+                    for i, power in enumerate(term):
+                        if power == 1:
+                            s += f" * {species_names[i]}"
+                        elif power > 1:
+                            s += f" * {species_names[i]}^{power}"
+                    terms.append(s)
+
+            if len(p['hill_inc_unscaled']):
+                inc_b = np.asarray(p['hill_inc_unscaled'])
+                Ks_inc, ns_inc = np.asarray(p['Ks_inc']), np.asarray(p['ns_inc'])
+                for term, coeff, K, n in zip(hill_terms * dup, inc_b, Ks_inc, ns_inc):
+                    if abs(coeff) <= eps:
+                        continue
+                    coeff_f, K_f, n_f = float(coeff), float(K), float(n)
+                    a, b = species_names[term[0]], (species_names[term[1]] if len(term) == 2 else None)
+                    if b is None:
+                        s = f"{coeff_f:.3f} * {a}^{n_f:.3f} / (1 + {K_f:.3f} * {a}^{n_f:.3f})"
+                    else:
+                        s = f"{coeff_f:.3f} * {b} * {a}^{n_f:.3f} / (1 + {K_f:.3f} * {a}^{n_f:.3f})"
+                    terms.append(s)
+
+            if len(p['hill_dec_unscaled']):
+                dec_b = np.asarray(p['hill_dec_unscaled'])
+                Ks_dec, ns_dec = np.asarray(p['Ks_dec']), np.asarray(p['ns_dec'])
+                for term, coeff, K, n in zip(hill_terms * dup, dec_b, Ks_dec, ns_dec):
+                    if abs(coeff) <= eps:
+                        continue
+                    coeff_f, K_f, n_f = float(coeff), float(K), float(n)
+                    a, b = species_names[term[0]], (species_names[term[1]] if len(term) == 2 else None)
+                    if b is None:
+                        s = f"{coeff_f:.3f} * [1 / (1 + {K_f:.3f} * {a}^{n_f:.3f})]"
+                    else:
+                        s = f"{coeff_f:.3f} * {b} * [1 / (1 + {K_f:.3f} * {a}^{n_f:.3f})]"
+                    terms.append(s)
+
+            if self.mcas:
+                # One shared reaction, not species-specific -- label it
+                # F(u, v) rather than implying it's "du/dt" specifically
+                # when it's really the term that's added to species 0 and
+                # subtracted from species 1.
+                label = f"F({', '.join(species_names)})"
             else:
-                s = f"{coeff_f:.3f} * {species[term[1]]} * {species[term[0]]}^{n_f:.3f} / (1 + {K_f:.3f} * {species[term[0]]}^{n_f:.3f})"
-            terms.append(s)
+                label = species_names[eq_idx]
 
-        # decreasing hills
-        dec_b = np.asarray(p['hill_dec_unscaled'])
-        Ks_dec = np.asarray(p['Ks_dec_unscaled'])
-        ns_dec = np.asarray(p.get('ns_dec_unscaled', p.get('ns_dec', [])))
+            all_equations.append({'species': label, 'terms': terms})
 
-        for term, coeff, K, n in zip(hill_terms * dup, dec_b, Ks_dec, ns_dec):
-            if abs(coeff) <= eps:
-                continue
-            coeff_f = float(coeff); K_f = float(K); n_f = float(n)
-            if len(term) == 1:
-                s = f"{coeff_f:.3f} * (1 / {K_f:.3f} - {species[term[0]]}^{n_f:.3f} / (1 + {K_f:.3f} * {species[term[0]]}^{n_f:.3f}))"
-            else:
-                s = f"{coeff_f:.3f} * {species[term[1]]} * (1 / {K_f:.3f} - {species[term[0]]}^{n_f:.3f} / (1 + {K_f:.3f} * {species[term[0]]}^{n_f:.3f}))"
-            terms.append(s)
+        return all_equations
 
-        return terms
+    def equations_as_strings(self, eps=1e-12, species_names=None):
+        """Flat list of strings, e.g. for the old `for term in model.model.generate_equation(): file.write(...)`
+        training-script loop -- call this instead."""
+        equations = self.generate_equation(eps=eps, species_names=species_names)
+        lines = []
+        for eq in equations:
+            header = f"{eq['species']} =" if self.mcas else f"d{eq['species']}/dt ="
+            lines.append(header)
+            lines.extend(eq['terms'] if eq['terms'] else ['0'])
+        return lines

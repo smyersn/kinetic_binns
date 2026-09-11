@@ -1,4 +1,4 @@
-import sys, os, re, json
+import sys, os, json
 from pathlib import Path
 file_dir = os.path.dirname(os.path.realpath(__file__))
 repo_start = f'{file_dir}/../../'
@@ -15,11 +15,7 @@ from modules.analysis.generate_loss_curves import generate_loss_curves
 from modules.analysis.visualize_surface import compare_surfaces_over_training_domain
 from modules.simulation.animation import (animate_u_array, animate_residuals)
 from modules.simulation.simulation import (simulate_uvmlp, simulate_feql)
-from modules.simulation.reaction_functions import (wave_pinning, turing_type,
-                                                   custom_equation) 
-from modules.simulation.paper_reaction_functions import (hill_poly, poly_poly,
-                                                   hill_hill, poly_hill) 
-
+from modules.simulation.reaction_library import REACTION_REGISTRY
 
 # Load params from configuration file
 dir_name = sys.argv[1]
@@ -32,30 +28,25 @@ with open(config_path, 'r') as f:
 # 2. Load variable from JSON
 training_data_path = config['training_data_path']
 batch_size = config['batch_size']
-species = config['species']           
-dimensions = config['dimensions']     
-epsilon = config['epsilon']           
-points = config['points']             
-params = config['params']             
-diff_coeffs = config['diff_coeffs']   
+species = config['species']
+dimensions = config['dimensions']
+epsilon = config['epsilon']
+points = config['points']
+params = config['params']
+diff_coeffs = config['diff_coeffs']
 
 duplicates = config['duplicates']
 degree = config['degree']
-pde_weight = config['pde_weight']
 l0_weight = config['l0_weight']
-# warm_up = config['warm_up']
 param_bounds = config['param_bounds']
 
+mcas = config.get('mcas', False)
+include_poly = config.get('include_poly', True)
+include_increasing_hill = config.get('include_increasing_hill', True)
+include_decreasing_hill = config.get('include_decreasing_hill', True)
+
 # 3. Map reaction function
-reaction_map = {
-    'wave_pinning': wave_pinning,
-    'turing_type': turing_type,
-    'custom_equation': custom_equation,
-    'hill_poly': hill_poly,
-    'poly_poly': poly_poly,
-    'hill_hill': hill_hill,
-    'poly_hill': poly_hill
-}
+reaction_map = {name: spec['fn'] for name, spec in REACTION_REGISTRY.items()}
 reaction = reaction_map[config['reaction']]
 
 # Get GPU
@@ -67,58 +58,64 @@ training_data = torch.load(training_data_path)['training_data']
 
 # Add noise to training data if specified in config file
 if epsilon != 0 or points != 0:
-    training_data = noise_and_interpolate(training_data, points, epsilon, 
-                                          dimensions, species, 
-                                          multiplicative_noise=False)
-    
+    training_data = noise_and_interpolate(training_data, points, epsilon,
+                                          dimensions, species,
+                                          multiplicative_noise=True)
+
 # Reformat and animate training data
-u_array, x_array, t_array = format_training_data_to_u_array(training_data)
+u_array, _, t_array = format_training_data_to_u_array(training_data)
 animate_u_array(u_array, t_array, f'{dir_name}/training_data.gif')
-    
+
 # Split training data
-# batch_size=int(0.1*len(training_data))
-# train_loader, val_loader = training_test_split(training_data, batch_size, species)
 train_data, val_data = training_test_split(training_data, device)
 
-# Determine number of epochs from batch size (step-dependent)
-total_data_points = len(training_data) # e.g., 4,040,000
-target_total_steps = 1_000_000
-steps_per_epoch = max(1, total_data_points // batch_size)
-# epochs = int(target_total_steps // steps_per_epoch)
-epochs = 50_000
+epochs = 100_000
+# epochs = 50_000
+# epochs = 10
 
 # Determine early stopping (5% of total epochs)
 early_stopping = int(epochs * 0.05)
 
-# print(batch_size, total_data_points, epochs, early_stopping)
+# Set phase boundaries
+phase_1_end = 5_000
+phase_2_end = 20_000
+phase_3_end = 30_000
+# phase_1_end = int(0.1 * epochs)
+# phase_2_end = int(0.4 * epochs)
+# phase_3_end = int(0.6 * epochs)
+
 
 # initialize model and compile
 binn = BINN(
     dimensions=dimensions,
-    species=species, 
-    train_data=train_data, 
+    species=species,
+    train_data=train_data,
     duplicates=duplicates,
     diff_coeffs=diff_coeffs,
     degree=degree,
-    param_bounds=param_bounds)
+    param_bounds=param_bounds,
+    mcas=mcas,
+    include_poly=include_poly,
+    include_increasing_hill=include_increasing_hill,
+    include_decreasing_hill=include_decreasing_hill)
 
 binn.to(device)
 
 # Initialize optimizer
 param_groups = [
-    {'params': binn.surface_fitter.parameters(), 
-     'lr': 1e-2, 
-     'weight_decay': 1e-5,  
+    {'params': binn.surface_fitter.parameters(),
+     'lr': 1e-2,
+     'weight_decay': 1e-3,
      'name': 'surface'},
-    
-    {'params': binn.reaction.parameters(), 
-     'lr': 1e-3, 
-     'weight_decay': 0.0,   
+
+    {'params': binn.reaction.parameters(),
+     'lr': 1e-3,
+     'weight_decay': 0.0,
      'name': 'reaction'}]
 
 if binn.diffusion_fitter:
     param_groups.append({
-        'params': binn.diffusion_fitter.parameters(), 
+        'params': binn.diffusion_fitter.parameters(),
         'lr': 1e-3,
         'weight_decay': 0.0,
         'name': 'diffusion'})
@@ -130,9 +127,9 @@ scheduler = torch.optim.lr_scheduler.OneCycleLR(
     opt,
     # Provide a list of max_lrs matching the order of param_groups
     max_lr=[group['lr'] for group in param_groups],
-    total_steps=int(0.2*epochs),  
-    pct_start=0.3,        
-    div_factor=25,               
+    total_steps=phase_1_end,
+    pct_start=0.3,
+    div_factor=25,
     final_div_factor=1e4)
 
 model = model_wrapper(
@@ -151,7 +148,8 @@ if os.path.exists(checkpoint_path):
     print(f"\nFound existing checkpoint. Resuming from {checkpoint_path}...", flush=True)
     initial_epoch = model.load_checkpoint(checkpoint_path, device=device)
 
-# train jointly
+print(f"l0_weight from config: {l0_weight!r} (type {type(l0_weight).__name__})", flush=True)
+
 param_history, train_loss_dict, val_loss_dict = model.fit(
     train_data=train_data,
     val_data=val_data,
@@ -159,9 +157,10 @@ param_history, train_loss_dict, val_loss_dict = model.fit(
     batch_size=batch_size,
     l0_weight=l0_weight,
     early_stopping=early_stopping,
+    phase1_early_stopping=None,
+    phase_ends=(phase_1_end, phase_2_end, phase_3_end),
     initial_epoch=initial_epoch)
 
-# generate_loss_curves(train_loss_dict, val_loss_dict, dir_name, 20, 'training_loss_curves.png')
 generate_loss_curves(train_loss_dict, val_loss_dict, dir_name, 40, 'training_loss_curves.png')
 
 plot_param_history(binn, param_history, f"{dir_name}/param_history.png")
@@ -173,17 +172,17 @@ fn = f'{dir_name}/equation.txt'
 file = open(fn, 'a')
 
 file.write(f'Final equation:\n')
-for term in model.model.generate_equation():
-    file.write(f'{term}\n')
+for line in model.model.equations_as_strings():
+    file.write(f'{line}\n')
 
 if not diff_coeffs:
     file.write(f'\nDiff. coeffs:\n')
-    
+
     file.write(f'{[D.item() for D in model.model.diffusion_fitter()]}\n')
-        
+
 file.close()
 
-compare_surfaces_over_training_domain(training_data, model, device, 
+compare_surfaces_over_training_domain(training_data, model, device,
                                           reaction, params, dir_name,
                                           'feql_surface_untuned')
 
@@ -195,23 +194,23 @@ fn = f'{dir_name}/equation.txt'
 file = open(fn, 'a')
 
 file.write(f'\nFine tuned final equation:\n')
-for term in model.model.generate_equation():
-    file.write(f'{term}\n')
-        
+for line in model.model.equations_as_strings():
+    file.write(f'{line}\n')
+
 file.close()
 
-compare_surfaces_over_training_domain(training_data, model, device, 
+compare_surfaces_over_training_domain(training_data, model, device,
                                           reaction, params, dir_name,
                                           'feql_surface_tuned')
 
 # Simulate uvmlp
-uvmlp_u_array, uvmlp_x_array, uvmlp_times = simulate_uvmlp(training_data, model)
+uvmlp_u_array, _, uvmlp_times = simulate_uvmlp(training_data, model)
 animate_u_array(uvmlp_u_array, uvmlp_times, f'{dir_name}/uvmlp_sim.gif')
-animate_residuals(uvmlp_u_array, u_array, uvmlp_times, 
+animate_residuals(uvmlp_u_array, u_array, uvmlp_times,
                   name=f'{dir_name}/uvmlp_residuals.gif')
 
 # Simulate feql
-feql_u_array, feql_x_array, feql_times = simulate_feql(training_data, model)
+feql_u_array, _, feql_times = simulate_feql(training_data, model)
 animate_u_array(feql_u_array, feql_times, f'{dir_name}/feql_sim.gif')
-animate_residuals(feql_u_array, u_array, feql_times, 
+animate_residuals(feql_u_array, u_array, feql_times,
                   name=f'{dir_name}/feql_residuals.gif')

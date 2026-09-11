@@ -1,0 +1,8 @@
+{
+    "save_path": "/hpc/home/nsmyers1/projects/kinetic_binns/data/nonconserved/two",
+    "reaction": "brusselator",
+    "du": 0.02,
+    "dv": 0.16,
+    "a": 1.0,
+    "b": 3.0
+}

@@ -3,15 +3,96 @@ file_dir = os.path.dirname(os.path.realpath(__file__))
 repo_start = f'{file_dir}/../../'
 sys.path.append(repo_start)
 
-import time
 from numba import njit, prange
 from modules.utils.imports import *
 from modules.simulation.animation import animate_u_array
-from modules.simulation.paper_reaction_functions import (hill_poly, poly_poly,
-                                                         hill_hill, poly_hill)
 from modules.simulation.reaction_functions import (wave_pinning, turing_type,
                                                    custom_equation)
 from modules.utils.format_data import format_u_array_to_training_data
+
+def simulate_reaction(reaction, params, diff_coeffs, early_stop=True):
+    # --- Set Parameters --- 
+    dim = 2
+    species = 2
+    N = 200                           # grid points
+    L = 10                            # domain length
+    ss_tolerance = 0.025
+    device = 'cuda'
+    
+    T = 50
+    dx = L / N
+    dt = 0.0001                       # time step
+    nits = int(T / dt)                # number of time steps
+    du, dv = diff_coeffs                  # diffusion rates
+
+    # --- Initial Conditions ---
+    u0, v0 = 1, 1.0246
+    u = ((torch.rand(*(N,) * dim) + 0.5) * u0).to(device)
+    v = (torch.ones((N,) * dim) * v0).to(device)
+
+    # --- Laplacian kernel (5-point stencil) ---
+    laplace_kernel = torch.tensor([[0, 1, 0],
+                                [1, -4, 1],
+                                [0, 1, 0]], dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)
+
+    conv = nn.Conv2d(
+        in_channels=1,
+        out_channels=1,
+        kernel_size=3,
+        padding=1,
+        padding_mode='circular',
+        bias=False)
+
+    conv.weight.data = laplace_kernel
+    conv.weight.requires_grad = False
+    conv = conv.to(device)
+
+    # --- Storage ---
+    half_sec_nits = int(0.5 / dt)
+    half_secs = int(nits / half_sec_nits) + 1
+    
+    u_array = torch.zeros((half_secs, N, N, species))
+    x_array = torch.linspace(0, L, steps=200)
+    t_array = torch.arange(0, T + 0.5, 0.5)
+
+    # Track how many half secs have passed
+    i = 0
+
+    # --- Simulation loop ---
+    for t in range(nits+1):
+        
+        # Update storage every half second
+        if t % half_sec_nits == 0:
+            u_array[i] = torch.stack([u, v], dim=-1)
+            
+            # Stop simulation if it reaches steady state
+            if early_stop and t > 0:
+                current_save = u_array[i]
+                last_save = u_array[i-1]
+                diff = torch.max(torch.abs(current_save - last_save))
+                
+                if diff < ss_tolerance:
+                    print(f'Steady state at t = {t * dt}', flush=True)
+                    break
+            # Increase half sec counter    
+            i += 1
+            
+        # Compute Laplacian (diffusion)
+        lap_u = conv(u[None, None, :, :]).squeeze() / dx**2
+        lap_v = conv(v[None, None, :, :]).squeeze() / dx**2
+
+        # Reaction term
+        uv = torch.column_stack((u.flatten(), v.flatten()))
+        ruv = reaction(uv, params).view(N, N)
+        
+        # Euler update
+        u = u + dt * (du * lap_u + ruv)
+        v = v + dt * (dv * lap_v - ruv)        
+
+        if t % (nits // 10) == 0:
+            print(f"Progress: {(t / nits) * 100}%", flush=True)  
+            
+    return u_array.cpu(), x_array.cpu(), t_array.cpu()
 
 @njit(parallel=True)
 def fast_laplacian(mat, out_lap):
@@ -265,6 +346,24 @@ def simulate_feql(training_data, model):
 
     return u_array.cpu(), x_array.cpu(), t_array.cpu()
 
+# if __name__ == '__main__':        
+#     # Load parameters
+#     save_path = str(sys.argv[1])
+#     Du, Dv = float(sys.argv[2]), float(sys.argv[3])
+#     diff_coeffs = (Du, Dv)
+#     params = [float(sys.argv[4]), float(sys.argv[5]), float(sys.argv[6])]
+#     reaction_fn = wave_pinning
+    
+#     # Create save name
+#     save_name = f'{save_path}/du_{Du}_dv_{Dv}_a_{params[0]}_b_{params[1]}_k_{params[2]}'
+    
+#     # Simulate and animate
+#     u_array, x_array, t_array = simulate_reaction(reaction_fn, params, diff_coeffs, early_stop=True)
+#     animate_u_array(u_array, t_array, name=f'{save_name}.gif', titles=("u", "v"))
+    
+#     # Reformat to training data and save
+#     training_data = format_u_array_to_training_data(u_array, x_array, t_array)
+#     torch.save({'training_data': training_data}, f'{save_name}.pt')
 
 if __name__ == '__main__':        
     import json
@@ -275,44 +374,27 @@ if __name__ == '__main__':
     with open(config_path, "r") as f:
         config = json.load(f)
         
-    # 2. Extract base parameters from the dictionary
+    # 2. Extract parameters from the dictionary
     save_path = config["save_path"]
     Du, Dv = float(config["du"]), float(config["dv"])
     diff_coeffs = (Du, Dv)
-    reaction_str = config["reaction"]
     
-    # 3. Dynamically map the reaction string and build exact parameter lists
+    a, b, k = float(config["a"]), float(config["b"]), float(config["k"])
+    params = [a, b, k]
+    
+    # 3. Dynamically map the reaction string to the imported function
+    reaction_str = config["reaction"]
     if reaction_str == "wave_pinning":
         reaction_fn = wave_pinning
-        params = [config.get("a", 0), config.get("b", 0), config.get("k", 0)]
     elif reaction_str == "turing_type":
         reaction_fn = turing_type
-        params = [config.get("a", 0), config.get("b", 0), config.get("k", 0)]
     elif reaction_str == "custom_equation":
         reaction_fn = custom_equation
-        params = [config.get("a", 0), config.get("b", 0), config.get("k", 0)]
-        
-    # New paper ready functions
-    elif reaction_str == "hill_poly":
-        reaction_fn = hill_poly
-        params = [config['a'], config['b'], config['k'], config['n']]
-    elif reaction_str == "poly_poly":
-        reaction_fn = poly_poly
-        params = [config['a'], config['b']]
-    elif reaction_str == "hill_hill":
-        reaction_fn = hill_hill
-        params = [config['a'], config['b'], config['k1'], config['n1'], config['k2'], config['n2']]
-    elif reaction_str == "poly_hill":
-        reaction_fn = poly_hill
-        params = [config['a'], config['b'], config['k'], config['n']]
     else:
         raise ValueError(f"Unknown reaction function specified: {reaction_str}")
     
-    # 4. Create save name dynamically based on the input JSON filename
-    # This completely eliminates naming bugs like 'k_0.0' for poly_poly
-    json_filename = os.path.basename(config_path)
-    base_name = json_filename.replace('.json', '')
-    save_name = os.path.join(save_path, base_name)
+    # 4. Create save name (matching your original format)
+    save_name = f'{save_path}/du_{Du}_dv_{Dv}_a_{a}_b_{b}_k_{k}'
     
     print(f"Starting simulation for: {save_name}", flush=True)
     
@@ -324,4 +406,4 @@ if __name__ == '__main__':
     training_data = format_u_array_to_training_data(u_array, x_array, t_array)
     torch.save({'training_data': training_data}, f'{save_name}.pt')
     
-    print(f"Successfully saved data to {save_name}.pt", flush=True)
+    print(f"Successfully saved data to {save_name}.pt", flush=True)    
