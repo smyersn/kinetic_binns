@@ -16,6 +16,8 @@ from modules.analysis.visualize_surface import compare_surfaces_over_training_do
 from modules.simulation.animation import (animate_u_array, animate_residuals)
 from modules.simulation.simulation import (simulate_uvmlp, simulate_feql)
 from modules.simulation.reaction_library import REACTION_REGISTRY
+from modules.simulation.reaction_registry import library_size
+
 
 # Load params from configuration file
 dir_name = sys.argv[1]
@@ -41,6 +43,7 @@ l0_weight = config['l0_weight']
 param_bounds = config['param_bounds']
 
 mcas = config.get('mcas', False)
+l0_reference_gates = config.get('l0_reference_gates', None)
 include_poly = config.get('include_poly', True)
 include_increasing_hill = config.get('include_increasing_hill', True)
 include_decreasing_hill = config.get('include_decreasing_hill', True)
@@ -95,12 +98,21 @@ binn = BINN(
     degree=degree,
     param_bounds=param_bounds,
     mcas=mcas,
+    l0_reference_gates=l0_reference_gates,
     include_poly=include_poly,
     include_increasing_hill=include_increasing_hill,
     include_decreasing_hill=include_decreasing_hill)
 
 binn.to(device)
 
+# Calculate size of library, check it matches
+expected = library_size(species, degree, duplicates, include_poly,
+                        include_increasing_hill, include_decreasing_hill, mcas)
+actual = binn.reaction.eql_layer.total_features * binn.reaction.eql_layer.n_free
+if expected != actual:
+    print(f"WARNING: library_size says {expected} gates, model has {actual}. "
+          f"The two have drifted -- l0_reference_gates is unreliable.", flush=True)
+    
 # Initialize optimizer
 param_groups = [
     {'params': binn.surface_fitter.parameters(),

@@ -105,7 +105,7 @@ class model_wrapper():
         # pg['max_lr'].
         self.base_lrs = {pg.get('name'): pg.get('max_lr', pg['lr'])
                          for pg in self.optimizer.param_groups}
-        print(f"Base LRs captured: {self.base_lrs}", flush=True)
+        # print(f"Base LRs captured: {self.base_lrs}", flush=True)
         self._last_phase = None
         self._phase1_restored = False
 

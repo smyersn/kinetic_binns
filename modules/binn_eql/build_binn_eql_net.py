@@ -106,7 +106,7 @@ class BINN(nn.Module):
     def __init__(self, dimensions, species, train_data, duplicates=1,
                  diff_coeffs=None, uv_layers=None, degree=2, param_bounds=10,
                  fourier_scale=1.0, fourier_mapping_size=64,
-                 mcas=False, species_names=None,
+                 mcas=False, species_names=None, l0_reference_gates=None,
                  include_poly=True, include_increasing_hill=True, include_decreasing_hill=True):
         """
         mcas: single flag replacing the old conservation_groups/
@@ -145,8 +145,8 @@ class BINN(nn.Module):
         # not the number of species/PDEs being solved.
         self.n_equations = 1 if mcas else species
         self.conservation_groups = [[0, 1]] if mcas else []
+        self.l0_reference_gates = l0_reference_gates
         self.species_names = species_names if species_names is not None else default_species_names(species)
-
         # ---------------------------------------------------------
         # A. REGISTER BOUNDS & SCALES (Buffers)
         # ---------------------------------------------------------
@@ -397,7 +397,7 @@ class BINN(nn.Module):
               f"(PDE = {self.best_pde_floor:.4e})", flush=True)
         return True
 
-    def register_l0_scale(self):
+    def register_l0_scale(self, pde_history=None, window_frac=0.2):
         """
         Normalize by EXPLAINABLE RANGE (how much PDE loss the reaction
         terms can actually remove), not by the PDE floor.
@@ -416,6 +416,20 @@ class BINN(nn.Module):
         explainable gap itself, so an instantaneous reading is decided by
         whether the measurement lands in a trough or a peak.
 
+        Divides by GATES (total_features * n_free), not features:
+        reg_loss sums expected_l0 over every free row, so a 3-species
+        non-mcas run has 3x the penalty terms at the same library size.
+
+        When self.l0_reference_gates is set, that fixed count is used as
+        the divisor instead of this run's own. Without it, the price of
+        keeping one term falls as 1/n_gates, so growing the library
+        (more duplicates, higher degree, more species, more term
+        families) silently cheapens every term while ADDING spurious
+        candidates competing for the same explainable budget -- which is
+        why l0_weight previously had to be hand-multiplied to track
+        library size. With it, price per term is constant and l0_weight
+        means the same thing across configs.
+
         pde_history / window_frac are accepted but unused -- kept so
         existing call sites don't break.
         """
@@ -427,7 +441,9 @@ class BINN(nn.Module):
         floor = current if best is None else (min(best, current) if current is not None else best)
         null = self._pde_loss_null()
 
-        n_features = self.reaction.eql_layer.total_features
+        eql = self.reaction.eql_layer
+        n_gates = eql.total_features * eql.n_free
+        ref = getattr(self, 'l0_reference_gates', None) or n_gates
 
         if null is None or floor is None:
             self.l0_scale = 1.0
@@ -459,10 +475,16 @@ class BINN(nn.Module):
             self.l0_scale_locked = True
             return
 
-        self.l0_scale = explainable / n_features
+        self.l0_scale = explainable / ref
         frac = explainable / max(null, 1e-12)
         print(f"  Explainable range:            {explainable:.4e}  ({100*frac:.1f}% of null)")
-        print(f"  l0_scale = explainable / {n_features} features = {self.l0_scale:.4e}")
+        print(f"  Gates: {n_gates} ({eql.total_features} features x {eql.n_free} free row(s))")
+        if getattr(self, 'l0_reference_gates', None):
+            print(f"  Reference gates: {ref}  ->  library is {n_gates/ref:.2f}x reference")
+        else:
+            print(f"  Reference gates: (unset -- normalizing by this run's own "
+                  f"gate count; l0_weight will NOT transfer across library sizes)")
+        print(f"  l0_scale = explainable / {ref} = {self.l0_scale:.4e}")
         if frac < 0.1:
             print(f"  WARNING: terms reduce PDE loss by <10%. The residual is "
                   f"dominated by surface-derivative error the reaction cannot fix "
@@ -470,7 +492,7 @@ class BINN(nn.Module):
         print()
 
         self.l0_scale_locked = True
-
+        
     def refresh_collocation_cache(self, cache_size=200_000, mass_t_cutoff=None, chunk_size=20_000):
         """Precomputes ut_array/uxx_array for a fixed pool of collocation points."""
         t_cutoff = mass_t_cutoff if mass_t_cutoff is not None else getattr(self, 'mass_t_cutoff', 2.0)
@@ -825,7 +847,8 @@ class BINN(nn.Module):
             hf2.raw_K.data.fill_(0.0)
 
     @torch.no_grad()
-    def fine_tune_eql(self, threshold=0.01, epsilon=0.15, num_points=20000):
+    def fine_tune_eql(self, threshold=0.01, epsilon=0.1, n_tol=0.15,
+                      flat_denom=1.25, flat_quantile=0.95, num_points=20000):
         """
         Fine-tunes the discovered EQL equations. All mutations below
         touch only FREE rows (eql.fc.weight / eql.l0_gates are indexed by
@@ -941,7 +964,18 @@ class BINN(nn.Module):
                             eql.l0_gates[free_idx].log_alpha.data[next_h_idx])
                         eql.l0_gates[free_idx].log_alpha.data[next_h_idx] = -10.0
 
-        # --- TASK 3B: COLLAPSE NEAR-MONOMIAL INCREASING HILLS INTO POLYNOMIALS ---
+        # --- TASK 3B: COLLAPSE NEAR-MONOMIAL HILLS INTO POLYNOMIALS ---
+        # A Hill whose denominator never leaves 1 over the data is a
+        # monomial wearing a Hill costume:
+        #   inc:  x_i^n / (1 + K x_i^n) ~ x_i^n      (needs integer n)
+        #   dec:  x_j / (1 + K x_i^n)   ~ x_j        (n irrelevant)
+        # Flatness is measured on a QUANTILE of the real data, not at
+        # max_scale: max_scale is a 0.99 quantile, so a thin transient
+        # tail can make a term that is flat everywhere it matters look
+        # non-flat (max_denom=1.18 at u=10.4 for a term contributing 1.4%
+        # at u=3). The outer guard is include_poly alone -- gating it on
+        # include_increasing_hill too would skip the whole task in an
+        # inc-disabled run.
         if eql.include_poly:
             poly_terms = self.generate_terms()[0]
             for i in range(num_hill):
@@ -949,9 +983,9 @@ class BINN(nn.Module):
                 if not any_free_row_nonzero(h_idx):
                     continue
 
-                # Which form does this slot hold? Derive it from `forms`
-                # rather than assuming inc-then-dec: when only one family
-                # is included, slot 0 is that family, not necessarily inc.
+                # Which form this slot holds. Derived from `forms` rather
+                # than assuming inc-then-dec: with only one family
+                # included, slot 0 is that family, not necessarily inc.
                 slot = i % hill_block_size
                 if len(forms) == 2:
                     form = 'inc' if slot < n_hill_single else 'dec'
@@ -964,35 +998,51 @@ class BINN(nn.Module):
                 n_val = (torch.sigmoid(hf.raw_n) * 3 + 1).item()
                 k_val = F.softplus(hf.raw_K).item()
 
-                max_u = self.max_scale[0, term[0]].item()
-                max_denom = 1.0 + k_val * (max_u ** n_val)
-                if max_denom >= 1.1:
+                x_i = uv_synthetic[:, term[0]]
+                denom = 1.0 + k_val * x_i.pow(n_val)
+                q_denom = torch.quantile(denom, flat_quantile).item()
+                if q_denom >= flat_denom:
                     continue
 
+                n_rounded = int(round(n_val))
                 target = [0] * species
                 if form == 'inc':
-                    # x_i^n / (1 + K x_i^n) ~ x_i^n: needs n near-integer.
-                    n_rounded = round(n_val)
-                    if abs(n_val - n_rounded) >= epsilon:
+                    if abs(n_val - n_rounded) >= n_tol:
                         continue
                     target[term[0]] = n_rounded
                     if len(term) == 2:
                         target[term[1]] += 1
                 else:
-                    # x_j / (1 + K x_i^n) ~ x_j: n is irrelevant. The raw
-                    # (single-index) dec term collapses to a constant,
-                    # which the poly basis has no slot for.
+                    # A flat dec CROSS term is just its multiplier. A flat
+                    # dec RAW term is a constant, and the poly basis starts
+                    # at sum(p) >= 1, so there's no slot for it -- leave it
+                    # to _zero_weak_terms.
                     if len(term) != 2:
                         continue
                     target[term[1]] = 1
-
                 target = tuple(target)
+
                 if sum(target) > self.degree or target not in poly_terms:
+                    # No matching monomial exists (u^4 needs degree>=4,
+                    # v*u^2 needs degree>=3). Snap in place instead: round
+                    # n, drive K to ~0. The column stays a Hill feature but
+                    # IS a monomial numerically. NOTE: the coefficient is
+                    # not refit, so rounding n shifts the term's value
+                    # slightly with nothing compensating.
+                    if form != 'inc' or abs(n_val - n_rounded) >= n_tol:
+                        continue
+                    p = min(max((n_rounded - 1) / 3.0, 1e-4), 1 - 1e-4)
+                    hf.raw_n.data.fill_(float(np.log(p / (1 - p))))
+                    hf.raw_K.data.fill_(-20.0)   # softplus(-20) ~ 2e-9
+                    print(f"Snapping Hill {h_idx} -> {term}^{n_rounded} "
+                          f"(no degree-{self.degree} monomial slot, "
+                          f"q{flat_quantile:.2f}_denom={q_denom:.4f})")
                     continue
 
                 best_p_idx = poly_terms.index(target)
                 print(f"Collapsing Hill {h_idx} ({form}) -> Poly {best_p_idx} "
-                      f"(term={target}, max_denom={max_denom:.2f}, n={n_val:.3f})")
+                      f"(term={target}, q{flat_quantile:.2f}_denom={q_denom:.4f}, "
+                      f"n={n_val:.3f})")
 
                 for free_idx in range(n_free):
                     w = eql.fc.weight.data[free_idx, h_idx]
@@ -1004,7 +1054,7 @@ class BINN(nn.Module):
                         eql.l0_gates[free_idx].log_alpha.data[best_p_idx],
                         eql.l0_gates[free_idx].log_alpha.data[h_idx])
                     eql.l0_gates[free_idx].log_alpha.data[h_idx] = -10.0
-
+                    
         # --- TASK 4: FINAL ZEROING (per free row) ---
         self._zero_weak_terms(threshold)
         print("Fine-tuning committed.")
