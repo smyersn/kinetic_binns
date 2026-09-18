@@ -31,6 +31,104 @@ def default_species_names(species):
     return names
 
 
+def frame_stats(train_data, dimensions, species):
+    """
+    Per-frame spatial standard deviation of each species: (n_frames, species),
+    plus the frame times.
+
+    Standard deviation rather than mean because under conservation the means
+    barely move while the pattern forms -- a mean-based statistic sees almost
+    nothing. Computed by scatter-add over unique-time inverse indices, so it
+    costs one pass and does not assume any row ordering.
+    """
+    ts, inv = torch.unique(train_data[:, dimensions], return_inverse=True)
+    conc = train_data[:, -species:]
+    nf = len(ts)
+
+    counts = torch.zeros(nf, device=conc.device)
+    counts.index_add_(0, inv, torch.ones(len(inv), device=conc.device))
+    sums = torch.zeros(nf, species, device=conc.device)
+    sums.index_add_(0, inv, conc)
+    sq_sums = torch.zeros(nf, species, device=conc.device)
+    sq_sums.index_add_(0, inv, conc ** 2)
+
+    mean = sums / counts[:, None]
+    var = (sq_sums / counts[:, None] - mean ** 2).clamp_min(0.0)
+    return var.sqrt(), ts
+
+
+def unresolved_t_cutoff(train_data, dimensions, species, factor=5.0):
+    """
+    Smallest t past which the data resolves its own dynamics.
+
+    Detects LEADING frames whose frame-to-frame change is an outlier against
+    the rest of the run -- the signature of an initial condition that relaxed
+    faster than the output sampling interval. On such a frame neither finite
+    differences nor a smooth surface fitter can represent u_t, so including it
+    in the PDE residual feeds Phase 2 a left-hand side that is simply wrong,
+    and the optimizer compensates by shrinking D and the reaction terms
+    together until the (too-small) u_t is matched.
+
+    Only a contiguous run of flagged frames from the START is trimmed. A large
+    change in the middle of a run is a real event (a front arriving, a
+    bifurcation), not an under-resolved initial condition.
+
+    Returns 0.0 when nothing is flagged, so well-sampled datasets are
+    unaffected and this stays a no-op for them.
+    """
+    std, ts = frame_stats(train_data, dimensions, species)
+    if len(ts) < 4:
+        return 0.0
+
+    delta = (std[1:] - std[:-1]).abs().max(dim=1).values
+    typical = delta.median()
+    if typical <= 0:
+        return 0.0
+
+    flagged = delta > factor * typical
+    k = 0
+    while k < len(flagged) and flagged[k]:
+        k += 1
+    return ts[k].item() if k > 0 else 0.0
+
+def frame_activity_weights(train_data, dimensions, species,
+                           max_weight=50.0, factor=5.0):
+    """
+    Per-frame GLS weights proportional to how fast the pattern is changing,
+    so fitting capacity lands where the dynamics are instead of where they
+    are assumed to be. Returns (weights, frame_times), weights in [1, max_weight].
+    """
+    std, ts = frame_stats(train_data, dimensions, species)
+    nf = len(ts)
+    if nf < 4 or max_weight <= 1.0:
+        return torch.ones(nf), ts
+
+    # Central difference on the per-frame spatial std: large while the
+    # pattern grows, ~0 at steady state.
+    act = torch.zeros(nf)
+    act[1:-1] = (std[2:] - std[:-2]).abs().max(dim=1).values / 2
+    act[0] = (std[1] - std[0]).abs().max()
+    act[-1] = (std[-1] - std[-2]).abs().max()
+
+    # A noise-seeded IC collapses in the first frame or two -- a huge
+    # apparent "activity" that is really the sampling failing to resolve
+    # the smoothing. Zero k+1, not k: frame k's CENTRAL difference still
+    # straddles the unresolved frame, and leaving it in puts the peak
+    # weight back on the IC (verified: peak moved from t=25.5 to t=0.5).
+    delta = (std[1:] - std[:-1]).abs().max(dim=1).values
+    med = delta.median()
+    if med > 0:
+        flagged = delta > factor * med
+        k = 0
+        while k < len(flagged) and flagged[k]:
+            k += 1
+        act[:k + 1] = 0.0
+
+    peak = act.max()
+    if peak <= 0:
+        return torch.ones(nf), ts
+    return 1.0 + (max_weight - 1.0) * (act / peak), ts
+
 # ---------------------------------------------------------
 # 1. SUB-NETWORKS
 # ---------------------------------------------------------
@@ -107,6 +205,7 @@ class BINN(nn.Module):
                  diff_coeffs=None, uv_layers=None, degree=2, param_bounds=10,
                  fourier_scale=1.0, fourier_mapping_size=64,
                  mcas=False, species_names=None, l0_reference_gates=None,
+                 pde_t_cutoff=None, gls_max_weight=50.0,
                  include_poly=True, include_increasing_hill=True, include_decreasing_hill=True):
         """
         mcas: single flag replacing the old conservation_groups/
@@ -126,6 +225,13 @@ class BINN(nn.Module):
             architecture) is automatically enabled for the (0, 1) pair
             when mcas=True and disabled when False -- no separate
             conservation_groups list to configure anymore.
+
+        pde_t_cutoff: earliest time used for PDE collocation points and for
+            the PDE scale. None (default) auto-detects via
+            unresolved_t_cutoff(), which returns 0.0 for well-sampled data --
+            so this is a no-op there. Pass a float to set it explicitly, or
+            0.0 to disable the check entirely.
+
         include_poly / include_increasing_hill / include_decreasing_hill:
             toggle which term families populate the shared EQL library.
         """
@@ -147,6 +253,7 @@ class BINN(nn.Module):
         self.conservation_groups = [[0, 1]] if mcas else []
         self.l0_reference_gates = l0_reference_gates
         self.species_names = species_names if species_names is not None else default_species_names(species)
+
         # ---------------------------------------------------------
         # A. REGISTER BOUNDS & SCALES (Buffers)
         # ---------------------------------------------------------
@@ -174,6 +281,29 @@ class BINN(nn.Module):
         self.register_buffer('lb', lb_tensor.view(1, -1))
         self.register_buffer('ub', ub_tensor.view(1, -1))
 
+        w, ts_f = frame_activity_weights(train_data, dimensions, species,
+                                         max_weight=gls_max_weight)
+        self.register_buffer('gls_frame_weights', w.cpu())
+        self.register_buffer('gls_frame_edges', ((ts_f[1:] + ts_f[:-1]) / 2).cpu())
+        print(f"GLS activity weighting: peak {w.max():.0f} at "
+              f"t={ts_f[w.argmax()].item():.3g}, mean {w.mean():.1f}")
+
+        # PDE collocation floor. Auto-detected unless given explicitly.
+        if pde_t_cutoff is None:
+            self.pde_t_cutoff = unresolved_t_cutoff(train_data, dimensions, species)
+            if self.pde_t_cutoff > 0:
+                print(f"PDE t-cutoff auto-detected at t={self.pde_t_cutoff:.4g}: the "
+                      f"data's leading frame(s) change far faster than the sampling "
+                      f"interval, so u_t there is not resolvable by finite differences "
+                      f"OR by the surface fitter. Excluded from PDE collocation and "
+                      f"from the PDE scale.")
+            else:
+                print("PDE t-cutoff: 0 (data resolves its own initial transient).")
+        else:
+            self.pde_t_cutoff = float(pde_t_cutoff)
+            if self.pde_t_cutoff > 0:
+                print(f"PDE t-cutoff set explicitly to t={self.pde_t_cutoff:.4g}.")
+
         # Per-species concentration scales (Physical -> Dimensionless).
         # train_data columns are [x*dimensions, t, species concentrations],
         # so the last `species` columns are the concentrations.
@@ -183,6 +313,15 @@ class BINN(nn.Module):
 
         s_mean = conc.abs().mean(dim=0).cpu()
         self.register_buffer('mean_scale', s_mean.view(1, -1))
+
+        # Placeholder so the buffer key exists from epoch 0. Otherwise
+        # register_pde_scale creates it mid-training (Phase 2) and any
+        # checkpoint saved after that point cannot be loaded into a fresh
+        # BINN -- load_state_dict reports "Unexpected key(s): pde_scale".
+        # Overwritten with measured values once the surface is fit; the
+        # pde_scales_locked flag (not hasattr) is what gates its use.
+        self.register_buffer('pde_scale', torch.ones(species))
+        self.pde_scales_locked = False
 
         # Diffusion coefficients: fixed physical values (one per species)
         # or None to learn them via self.diffusion_fitter.
@@ -224,6 +363,11 @@ class BINN(nn.Module):
         inputs_hat = self.normalize(inputs)
         return self.surface_fitter(inputs_hat)
 
+    def _t_lo(self):
+        """Lower bound for PDE collocation sampling: the domain start, or
+        the unresolved-transient cutoff if one was detected."""
+        return max(self.lb[0, -1].item(), getattr(self, 'pde_t_cutoff', 0.0))
+
     # -----------------------
     # Loss Functions
     # -----------------------
@@ -233,19 +377,27 @@ class BINN(nn.Module):
         90th-percentile of u_t^2 for EACH species from the current
         surface_fitter. Must be called once the surface has been fit
         (start of Phase 2), not at __init__ time when it's still random.
+
+        Restricted to t >= pde_t_cutoff, matching the collocation points
+        the scale actually normalises. Including an unresolved initial
+        transient here would inflate the scale using the one part of the
+        domain the residual never sees.
         """
         if getattr(self, 'pde_scales_locked', False):
             return
 
-        print("\n--- Calculating Robust PDE Scales (90th percentile) ---")
+        t_lo = self._t_lo()
+        print(f"\n--- Calculating Robust PDE Scales (90th percentile, t>={t_lo:.4g}) ---")
         was_training = self.surface_fitter.training
         self.surface_fitter.eval()
 
+        subset = train_data[train_data[:, self.dimensions] >= t_lo] if t_lo > 0 else train_data
+
         all_sq = [[] for _ in range(self.species)]
-        total_points = len(train_data)
+        total_points = len(subset)
 
         for chunk_start in range(0, total_points, chunk_size):
-            chunk = train_data[chunk_start:chunk_start + chunk_size].clone().requires_grad_(True)
+            chunk = subset[chunk_start:chunk_start + chunk_size].clone().requires_grad_(True)
             outputs = self.surface_fitter(self.normalize(chunk[:, :self.dimensions + 1]))
 
             for s_idx in range(self.species):
@@ -296,6 +448,7 @@ class BINN(nn.Module):
             return
 
         t_cutoff = t_cutoff if t_cutoff is not None else getattr(self, 'mass_t_cutoff', 2.0)
+        t_cutoff = max(t_cutoff, self._t_lo())
         print(f"\n--- Calculating Robust Mass Scale(s) (90th percentile, t>={t_cutoff}) ---")
 
         was_training = self.surface_fitter.training
@@ -492,10 +645,18 @@ class BINN(nn.Module):
         print()
 
         self.l0_scale_locked = True
-        
+
     def refresh_collocation_cache(self, cache_size=200_000, mass_t_cutoff=None, chunk_size=20_000):
-        """Precomputes ut_array/uxx_array for a fixed pool of collocation points."""
+        """Precomputes ut_array/uxx_array for a fixed pool of collocation points.
+
+        Points are drawn from [pde_t_cutoff, t_max] rather than the full
+        domain: below that cutoff the data never resolved its own dynamics,
+        so u_t there is not a target worth fitting, and forcing the residual
+        to explain it drives D and the reaction coefficients down together.
+        """
         t_cutoff = mass_t_cutoff if mass_t_cutoff is not None else getattr(self, 'mass_t_cutoff', 2.0)
+        t_lo = self._t_lo()
+        t_hi = self.ub[0, -1].item()
 
         was_training = self.surface_fitter.training
         self.surface_fitter.eval()
@@ -506,8 +667,7 @@ class BINN(nn.Module):
             n = min(chunk_size, cache_size - chunk_start)
             x = torch.empty(n, self.dimensions, device=self.lb.device).uniform_(
                 self.lb[0, 0].item(), self.ub[0, 0].item())
-            t = torch.empty(n, 1, device=self.lb.device).uniform_(
-                self.lb[0, -1].item(), self.ub[0, -1].item())
+            t = torch.empty(n, 1, device=self.lb.device).uniform_(t_lo, t_hi)
             inputs = torch.cat([x, t], dim=1).requires_grad_(True)
             outputs = self.surface_fitter(self.normalize(inputs))
             ut_array, uxx_array = self.compute_field_derivatives(inputs, outputs)
@@ -529,7 +689,8 @@ class BINN(nn.Module):
             'uxx_array': torch.cat(uxx_list, dim=1),
             'mass_mask': torch.cat(mask_list, dim=0),
         }
-        print(f"Refreshed collocation cache: {cache_size} points ({chunk_size}/chunk), "
+        print(f"Refreshed collocation cache: {cache_size} points ({chunk_size}/chunk) "
+              f"over t in [{t_lo:.4g}, {t_hi:.4g}], "
               f"{self._collocation_cache['mass_mask'].sum().item()} pass mass cutoff")
 
     def compute_field_derivatives(self, inputs, outputs):
@@ -546,17 +707,16 @@ class BINN(nn.Module):
 
     def gls_loss(self, pred, true):
         residual = ((pred - true) / self.mean_scale) ** 2
-        ic_mask = self.inputs[:, -1:] == 0
-        weights = torch.where(ic_mask, 10.0, 1.0)
-        return torch.mean(residual * weights)
-
-    def gls_loss_time_weighted(self, pred, true, time_scale=5.0, max_weight=50.0):
-        """Smooth decay-over-time generalization of the t=0 IC weighting."""
-        residual = ((pred - true) / self.mean_scale) ** 2
         t = self.inputs[:, -1:]
-        t_min = self.lb[0, -1]
-        weights = 1.0 + (max_weight - 1.0) * torch.exp(-(t - t_min) / time_scale)
+        idx = torch.bucketize(t.reshape(-1).contiguous(), self.gls_frame_edges)
+        weights = self.gls_frame_weights[idx].reshape(t.shape)
         return torch.mean(residual * weights)
+    
+    def gls_loss_time_weighted(self, pred, true, time_scale=None, max_weight=None):
+        """Deprecated alias for gls_loss -- the time weighting was removed
+        (see gls_loss). Arguments are accepted and ignored so existing call
+        sites keep working."""
+        return self.gls_loss(pred, true)
 
     def pde_loss_from_derivatives(self, outputs, ut_array, uxx_array, epoch):
         """
@@ -578,7 +738,11 @@ class BINN(nn.Module):
             LHS = ut_array[:, s_idx][:, None]
             RHS = lap_s + F_reaction[:, s_idx][:, None]
 
-            if hasattr(self, 'pde_scale'):
+            # pde_scale exists as a buffer from __init__ (so checkpoints
+            # load cleanly), but holds placeholder ones until Phase 2
+            # measures it -- the locked flag, not hasattr, says whether the
+            # values mean anything.
+            if getattr(self, 'pde_scales_locked', False):
                 scale = torch.sqrt(self.pde_scale[s_idx])
             else:
                 scale = torch.tensor(1.0, device=outputs.device)
@@ -651,7 +815,7 @@ class BINN(nn.Module):
         return w_loss + k_loss
 
     def loss(self, pred, true, epoch, phase=None):
-        raw_gls = self.gls_loss_time_weighted(pred, true)
+        raw_gls = self.gls_loss(pred, true)
         raw_softwall = self.soft_wall_loss()
         raw_l0 = self.reg_loss(epoch)
 
@@ -669,8 +833,10 @@ class BINN(nn.Module):
         else:
             x = torch.empty(self.num_samples, self.dimensions, device=pred.device).uniform_(
                 self.lb[0, 0], self.ub[0, 0])
+            # Same collocation floor as refresh_collocation_cache, so the
+            # uncached path samples the same region as the cached one.
             t = torch.empty(self.num_samples, 1, device=pred.device).uniform_(
-                self.lb[0, -1], self.ub[0, -1])
+                self._t_lo(), self.ub[0, -1].item())
             inputs_rand = torch.cat([x, t], dim=1).requires_grad_()
             outputs_b = self.surface_fitter(self.normalize(inputs_rand))
             ut_b, uxx_b = self.compute_field_derivatives(inputs_rand, outputs_b)
@@ -1054,7 +1220,7 @@ class BINN(nn.Module):
                         eql.l0_gates[free_idx].log_alpha.data[best_p_idx],
                         eql.l0_gates[free_idx].log_alpha.data[h_idx])
                     eql.l0_gates[free_idx].log_alpha.data[h_idx] = -10.0
-                    
+
         # --- TASK 4: FINAL ZEROING (per free row) ---
         self._zero_weak_terms(threshold)
         print("Fine-tuning committed.")
