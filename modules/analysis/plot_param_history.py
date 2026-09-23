@@ -4,7 +4,7 @@ import matplotlib.lines as mlines
 from collections import defaultdict
 import os
 
-from modules.binn_eql.build_binn_eql_net import default_species_names
+from modules.binn_eql.model.binn import default_species_names
 
 def plot_param_history(binn_model,
                        param_history,
@@ -117,33 +117,16 @@ def plot_param_history(binn_model,
             idx = d * n_poly_single + i
             groups_poly.setdefault(name, []).append(idx)
 
-    # --- hill groups: create separate dicts for inc and dec (NEVER combine)
-    hill_inc_names = []
-    hill_dec_names = []
-    for t in hill_terms:
-        if len(t) == 1:
-            hill_inc_names.append(f"H_inc({basis_names[t[0]]})")
-            hill_dec_names.append(f"H_dec({basis_names[t[0]]})")
-        else:
-            hill_inc_names.append(f"H_inc({basis_names[t[0]]})*{basis_names[t[1]]}")
-            hill_dec_names.append(f"H_dec({basis_names[t[0]]})*{basis_names[t[1]]}")
-
-    groups_hill_inc = defaultdict(list)
-    groups_hill_dec = defaultdict(list)
-
-    current_idx = n_poly_total  # Start after all polynomials
-
-    for d in range(dup):
-        # 1. Assign Increasing indices for this duplicate
-        for i, name in enumerate(hill_inc_names):
-            groups_hill_inc[name].append(current_idx)
-            current_idx += 1
-
-        # 2. Assign Decreasing indices for this duplicate
-        for i, name in enumerate(hill_dec_names):
-            groups_hill_dec[name].append(current_idx)
-            current_idx += 1
-
+    # --- hill groups, read from the layer's own column layout (inc and dec kept separate)
+    eql = binn_model.reaction.eql_layer
+    groups_hill_inc, groups_hill_dec = defaultdict(list), defaultdict(list)
+    for i, (form, t) in enumerate(eql.hill_slots):
+        label = f"H_{form}({basis_names[t[0]]})"
+        if len(t) == 2:
+            label += f"*{basis_names[t[1]]}"
+        target = groups_hill_inc if form == 'inc' else groups_hill_dec
+        target[label].append(eql.num_poly_features + i)
+        
     # --- selection of top terms (optional)
     def pick_top(groups, arr2d, K):
         keys = list(groups.keys())

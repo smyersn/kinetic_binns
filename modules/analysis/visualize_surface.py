@@ -9,127 +9,142 @@ repo_start = f'{file_dir}/../../'
 sys.path.append(repo_start)
 
 from modules.utils.triangle import lltriangle
-from modules.binn_eql.build_binn_eql_net import default_species_names
+from modules.binn_eql.model.binn import default_species_names
 
-def plot_surfaces(model_dir, u_triangle_mesh, v_triangle_mesh, F_true_list, F_mlp_list,
-                  species_names=None, filename=None, use_latex=True):
+def _shared_range(arrays, pad=0.04):
     """
-    Grid of 3D surface plots: one ROW per equation being shown, 2 COLUMNS
-    (True, Learned). n_rows = len(F_true_list) -- NOT necessarily the
-    number of species/concentration fields in the system: when the caller
-    passes mcas-collapsed data (one shared F, not one per species),
-    n_rows is 1 even though species_names has 2 entries ('u', 'v'), since
-    the equation's argument list still needs both names even though only
-    one row is plotted.
-
+    (data min, data max, padded axis range) across several surfaces, ignoring
+    NaNs (the triangle mesh leaves the region outside the data as NaN).
+    Returns (None, None, None) if nothing is finite.
+    """
+    finite = [a for a in arrays if np.any(np.isfinite(a))]
+    if not finite:
+        return None, None, None
+ 
+    lo = float(min(np.nanmin(a) for a in finite))
+    hi = float(max(np.nanmax(a) for a in finite))
+    if hi - lo < 1e-12:                       # flat surface: invent a window round it
+        span = max(abs(hi), 1e-6)
+        return lo, hi, [lo - span, hi + span]
+    margin = (hi - lo) * pad
+    return lo, hi, [lo - margin, hi + margin]
+ 
+ 
+def plot_surfaces(model_dir, u_triangle_mesh, v_triangle_mesh, F_true_list, F_mlp_list,
+                  species_names=None, filename=None, use_latex=True,
+                  title_font_size=40, axis_title_size=22, tick_size=16,
+                  width=1500, height_per_row=640, camera_eye=(0.85, -2.05, 0.75),
+                  share_z=True, scale=2):
+    """
+    Grid of 3D surface plots: one ROW per equation, 2 COLUMNS (True, Learned).
+ 
+    n_rows = len(F_true_list) -- NOT necessarily the number of species: with
+    mcas-collapsed data (one shared F) n_rows is 1 even though species_names
+    has two entries, since the equation's argument list still needs both.
+ 
     F_true_list, F_mlp_list: length-n_rows lists of (501, 501) arrays.
-    species_names: the full concentration field list (e.g. ['u', 'v']),
-        used only for the parenthetical argument list in titles/axis
-        labels -- its length is independent of n_rows and is NOT
-        validated against it.
-
-    Subplot titles follow F_i^{True/MLP}(all species names) when n_rows
-    > 1 -- i is the 1-indexed equation number (row). When n_rows == 1,
-    the numeric subscript is dropped entirely (just F^{True/MLP}(...))
-    since there's nothing to index.
-
-    use_latex: if True (default), titles use "$F_1^{\\text{True}}(u, v)$"
-        LaTeX so the superscript stacks directly above the subscript
-        (needs MathJax). HTML <sub>/<sup> tags render sequentially, not
-        stacked -- that's unfixable with tag reordering, it's how HTML
-        inline elements work. write_image()'s kaleido-based static export
-        has an inconsistent track record rendering LaTeX across versions
-        (sometimes shows literal "$...$" instead of typeset math) --
-        render ONE figure and check it before trusting this for a full
-        sweep. If it doesn't render, set use_latex=False for a unicode-
-        subscript fallback ("F\u2081 True (u, v)") that has no MathJax
-        dependency and is guaranteed to render identically everywhere,
-        at the cost of not being stacked math notation.
+    species_names: full concentration field list (e.g. ['u', 'v']), used only
+        for the parenthetical argument list in titles; its length is
+        independent of n_rows and is NOT validated against it.
+ 
+    share_z: give both columns of a row one z-axis range and one color range,
+        taken from both surfaces. Without it each subplot auto-ranges, so a
+        learned F an order of magnitude too small looks like a shape
+        difference rather than an amplitude error. x and y are shared too:
+        both columns are evaluated on the same mesh.
+ 
+    camera_eye: viewer position. The distance from the origin sets the zoom;
+        ~2.3 fills the subplot with the cube, while the old (1, -2.5, 1)
+        (distance 2.9) left a wide empty border.
+ 
+    use_latex: titles as "$F_1^{\\text{True}}(u, v)$" so the superscript
+        stacks above the subscript (needs MathJax). HTML <sub>/<sup> render
+        sequentially instead, which no tag reordering fixes. kaleido's static
+        export has an inconsistent record with LaTeX across versions
+        (sometimes emitting literal "$...$"), so render ONE figure and check
+        it before trusting a full sweep; use_latex=False falls back to
+        unicode subscripts ("F\u2081 True (u, v)"), which render everywhere.
+ 
+    scale: write_image resolution multiplier; 2 keeps the larger titles crisp.
     """
     n_rows = len(F_true_list)
     if len(F_mlp_list) != n_rows:
         raise ValueError(f"F_true_list has {n_rows} entries but F_mlp_list has {len(F_mlp_list)}.")
     if not species_names:
-        # No names given at all -- best guess is one name per row, since
-        # we have no other information about the true species count.
+        # No names at all -- best guess is one per row, since we have no other
+        # information about the true species count.
         species_names = default_species_names(n_rows)
-
+ 
     args = ", ".join(species_names)
-    specs = [[{'type': 'scene'}, {'type': 'scene'}] for _ in range(n_rows)]
     subplot_titles = []
     subscript_digits = str.maketrans("0123456789", "\u2080\u2081\u2082\u2083\u2084\u2085\u2086\u2087\u2088\u2089")
     for i in range(1, n_rows + 1):
-        if n_rows == 1:
-            # Nothing to index when there's only one equation -- drop the subscript.
-            if use_latex:
-                subplot_titles.append(fr"$F^{{\text{{True}}}}({args})$")
-                subplot_titles.append(fr"$F^{{\text{{MLP}}}}({args})$")
-            else:
-                subplot_titles.append(f"F True ({args})")
-                subplot_titles.append(f"F MLP ({args})")
-        elif use_latex:
-            subplot_titles.append(fr"$F_{{{i}}}^{{\text{{True}}}}({args})$")
-            subplot_titles.append(fr"$F_{{{i}}}^{{\text{{MLP}}}}({args})$")
+        if n_rows == 1:                        # nothing to index with one equation
+            index_latex, index_plain = "", ""
         else:
-            i_sub = str(i).translate(subscript_digits)
-            subplot_titles.append(f"F{i_sub} True ({args})")
-            subplot_titles.append(f"F{i_sub} MLP ({args})")
-
-    fig = make_subplots(rows=n_rows, cols=2,
-                        specs=specs,
-                        subplot_titles=subplot_titles,
-                        horizontal_spacing=0,
-                        vertical_spacing=min(0.08, 0.6 / max(n_rows, 1)))
-
-    fig.update_annotations(font_size=24, font_color='#000000')
-
-    for row_idx in range(1, n_rows + 1):
-        F_true = F_true_list[row_idx - 1]
-        F_mlp = F_mlp_list[row_idx - 1]
-
-        fig.add_trace(
-            go.Surface(z=F_true, x=u_triangle_mesh, y=v_triangle_mesh,
-                                        colorscale='mint',
-                                        showscale=False),
-            row=row_idx, col=1)
-
-        fig.add_trace(
-            go.Surface(z=F_mlp, x=u_triangle_mesh, y=v_triangle_mesh,
-                                        colorscale='mint',
-                                        showscale=False),
-            row=row_idx, col=2)
-
-    # NOTE: the old zaxis had a hardcoded range=[-1.5, 11] and fixed
-    # tick0/dtick, tuned for wave_pinning's single F magnitude. Different
-    # species' reaction functions can have very different magnitudes (a
-    # Gray-Scott Fu and an FHN Fv are not on the same scale), so those are
-    # dropped here in favor of per-subplot auto-ranging. If you want a
-    # shared/fixed range again for a specific system, add it back per-row
-    # via fig.update_scenes(zaxis_range=[...], row=r, col=c).
-    scene_dict = dict(
-        aspectmode='cube', # Forces the 3D bounding box to be a perfect cube
-        xaxis_title='[u] (uM)',
-        yaxis_title='[v] (uM)',
-        zaxis_title='F',
-        xaxis = dict(tickfont = dict(size=18)),
-        yaxis = dict(tickfont = dict(size=18)),
-        zaxis = dict(tickfont = dict(size=18)),
-        camera=dict(eye=dict(x=1, y=-2.5, z=1)))
-
-    # 1. Update the overall figure layout (Remove scene and scene2 from here)
-    fig.update_layout(autosize=True,
-        width=1600,
-        height=800 * n_rows,
-        font=dict(color = '#000000', size=20))
-
-    # 2. Safely apply the scene dictionary to all 3D subplots
-    fig.update_scenes(**scene_dict)
-
+            index_latex, index_plain = f"_{{{i}}}", str(i).translate(subscript_digits)
+        if use_latex:
+            subplot_titles.append(fr"$F{index_latex}^{{\text{{True}}}}({args})$")
+            subplot_titles.append(fr"$F{index_latex}^{{\text{{MLP}}}}({args})$")
+        else:
+            subplot_titles.append(f"F{index_plain} True ({args})")
+            subplot_titles.append(f"F{index_plain} MLP ({args})")
+ 
+    fig = make_subplots(
+        rows=n_rows, cols=2,
+        specs=[[{'type': 'scene'}, {'type': 'scene'}] for _ in range(n_rows)],
+        subplot_titles=subplot_titles,
+        horizontal_spacing=0.01,
+        vertical_spacing=0.04 if n_rows > 1 else 0.0)
+ 
+    # x and y come from the same mesh in every panel, so range them once.
+    _, _, x_range = _shared_range([u_triangle_mesh], pad=0.0)
+    _, _, y_range = _shared_range([v_triangle_mesh], pad=0.0)
+ 
+    for row in range(1, n_rows + 1):
+        F_true, F_mlp = F_true_list[row - 1], F_mlp_list[row - 1]
+        if share_z:
+            cmin, cmax, z_range = _shared_range([F_true, F_mlp])
+        else:
+            cmin = cmax = z_range = None
+ 
+        for col, F in ((1, F_true), (2, F_mlp)):
+            fig.add_trace(
+                go.Surface(z=F, x=u_triangle_mesh, y=v_triangle_mesh,
+                           colorscale='mint', showscale=False,
+                           cmin=cmin, cmax=cmax),   # one color mapping per row
+                row=row, col=col)
+ 
+        # Per-row z range. Set here rather than in the shared scene dict below,
+        # which applies to every subplot at once.
+        fig.update_scenes(zaxis=dict(range=z_range), row=row, col=1)
+        fig.update_scenes(zaxis=dict(range=z_range), row=row, col=2)
+ 
+    fig.update_scenes(
+        aspectmode='cube',
+        xaxis=dict(title='[u] (uM)', range=x_range, tickfont=dict(size=tick_size)),
+        yaxis=dict(title='[v] (uM)', range=y_range, tickfont=dict(size=tick_size)),
+        zaxis=dict(title='F', tickfont=dict(size=tick_size)),
+        camera=dict(eye=dict(x=camera_eye[0], y=camera_eye[1], z=camera_eye[2])))
+ 
+    # Pull each title down onto its subplot: make_subplots places them at the
+    # top of the subplot's domain, which the camera zoom leaves empty.
+    for annotation in fig.layout.annotations:
+        annotation.font.size = title_font_size
+        annotation.yanchor = 'bottom'
+        annotation.y = annotation.y - 0.03 / max(n_rows, 1)
+ 
+    fig.update_layout(
+        autosize=False,
+        width=width,
+        height=height_per_row * n_rows,
+        margin=dict(l=0, r=0, t=int(1.6 * title_font_size), b=0),
+        font=dict(color='#000000', size=axis_title_size))
     fig.update_coloraxes(showscale=False)
-
+ 
     if filename:
-        fig.write_image(f'{model_dir}/{filename}.png')
-
+        fig.write_image(f'{model_dir}/{filename}.png', scale=scale)
+ 
     return fig
 
 def compare_surfaces_over_training_domain(training_data, model, device,

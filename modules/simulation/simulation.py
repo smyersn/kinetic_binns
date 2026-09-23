@@ -46,140 +46,119 @@ def simulate_uvmlp(training_data, model):
     return u_array.cpu(), x_array.cpu(), t_array.cpu()
 
 
-def simulate_feql(training_data, model):
+def simulate_feql(training_data, model, dt_cap=1e-4, cfl_safety=0.4):
     """
-    N-species general: each species' reaction term now comes directly
-    from its own output column of model.model.reaction (one independently-
-    gated equation per species head, stage-1 BINN change), instead of the
-    old [+R, -R] conv trick that hardcoded exactly 2 mass-conserving
-    species. This is what was crashing --
-    r_flat_phys.view(1, 1, nx, ny) assumed reaction() returned one value
-    per point; it now returns `species` values per point, so the view's
-    element count (nx*ny) no longer matched the tensor's actual size
-    (nx*ny*species).
+    Integrate the learned PDE (explicit Euler, periodic BCs) and save a
+    snapshot at each of the training data's frame times.
+ 
+    dt_cap: upper bound on the timestep from the reaction timescale. The
+        step actually used is min(dt_cap, cfl_safety * dx^2 / (4 max D)),
+        matching simulate_reaction_cpu -- so large learned diffusion
+        coefficients cannot silently destabilize the integration, and small
+        ones are not paid for with unnecessary steps.
+ 
+    N-species general: each species' reaction term comes from its own output
+    column of model.model.reaction, rather than the old [+R, -R] trick that
+    hardcoded two mass-conserving species.
     """
-    # --- Initial Conditions ---
+    # --- Initial conditions ---
     dimensions = model.model.dimensions
     species = model.model.species
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    # 1. Get Model Scale
-    # Shape: (1, species)
-    max_scale = model.model.max_scale.to(device)
-
-    xt = training_data[:, :dimensions+1]
+ 
+    xt = training_data[:, :dimensions + 1]
     t_array = torch.unique(xt[:, dimensions])
     x_array = torch.unique(xt[:, 0])
     points = len(x_array)
-
+ 
     ic = training_data[training_data[:, dimensions] == 0]
-
-    # stack every species' IC: shape becomes (1, species, H, W)
     grid_shape = [points] * dimensions
     species_ics = [ic[:, dimensions + 1 + s] for s in range(species)]
     uv_grid = torch.stack(species_ics, dim=0).reshape(1, species, *grid_shape).float().to(device)
-
-    # --- Parameters ---
-    T = float(xt[:, dimensions].max().item())
-    L = float(xt[:, 0].max().item())
-
-    nx, ny = points, points
-    dx = L / nx
-    dt = 0.0001
-    nits = int(T / dt)
-
-    # Get diffusion coefficients (one per species)
+ 
+    # --- Diffusion coefficients (one per species) ---
     if model.model.diff_coeffs:
         D_list = list(model.model.diff_coeffs)
     else:
         with torch.no_grad():
-            D_vals = model.model.diffusion_fitter()
-            D_list = [float(d) for d in D_vals]
-
-    # Create a tensor for diffusion coeffs to broadcast: shape (1, species, 1, 1)
+            D_list = [float(d) for d in model.model.diffusion_fitter()]
     D_tensor = torch.tensor(D_list, device=device).view(1, species, 1, 1)
-
-    # --- Laplacian kernel (Grouped Conv2d) ---
+ 
+    # --- Timestep: whichever of the reaction and diffusion limits is tighter ---
+    nx, ny = points, points
+    L = float(xt[:, 0].max().item())
+    dx = L / nx
+    max_D = max(D_list)
+    cfl_limit = dx ** 2 / (4 * max_D) if max_D > 0 else float('inf')
+    dt = min(dt_cap, cfl_safety * cfl_limit)
+ 
+    # --- Save schedule: the training data's own frame times ---
+    # The old code saved every int(0.5 / dt) steps, which assumed frames are
+    # 0.5 apart. Datasets store a fixed number of frames spread over T, so
+    # for a long run (Gray-Scott, T=8000) that filled every storage slot in
+    # the first fraction of the run and discarded the rest.
+    save_steps = [int(round(float(t) / dt)) for t in t_array]
+    nits = save_steps[-1]
+    limiter = 'reaction dt_cap' if dt_cap <= cfl_safety * cfl_limit else 'diffusion CFL'
+    print(f"Simulating to t={float(t_array[-1]):.4g} with dt={dt:.3e} "
+          f"({limiter} is binding; CFL limit={cfl_limit:.3e} for max D={max_D:.4g}) "
+          f"-> {nits:,} steps, {len(save_steps)} frames", flush=True)
+ 
+    # --- Laplacian as a grouped convolution (one independent channel per species) ---
     laplace_kernel = torch.tensor([[0, 1, 0],
                                    [1, -4, 1],
                                    [0, 1, 0]], dtype=torch.float32, device=device)
-
-    # Reshape for Conv2d: (Out=species, In/Groups=1, K=3, K=3)
-    weights = laplace_kernel.unsqueeze(0).unsqueeze(0).repeat(species, 1, 1, 1)
-
-    conv = nn.Conv2d(
-        in_channels=species,
-        out_channels=species,
-        kernel_size=3,
-        padding=1,
-        groups=species,   # Independent convolution for each channel
-        padding_mode='circular',
-        bias=False)
-
-    conv.weight.data = weights
+    conv = nn.Conv2d(in_channels=species, out_channels=species, kernel_size=3,
+                     padding=1, groups=species, padding_mode='circular', bias=False)
+    conv.weight.data = laplace_kernel.unsqueeze(0).unsqueeze(0).repeat(species, 1, 1, 1)
     conv.weight.requires_grad = False
     conv = conv.to(device)
-
-    # --- Neural network for reaction ---
+ 
     reaction = model.model.reaction.eval()
-
-    # --- Storage ---
-    half_sec_nits = int(0.5 / dt)
     u_array = torch.zeros((len(t_array), nx, ny, species), device=device)
-    storage_idx = 0
-
+ 
     @torch.compile
-    def physics_step(current_state):
-        # 1. Diffusion
-        lap_uv = conv(current_state) / (dx**2)
-
-        # 2. Reaction
-        # Permute to (Batch, H, W, Channels) -> Flatten
-        state_permuted = current_state.permute(0, 2, 3, 1).contiguous()
-        uv_flat_phys = state_permuted.view(-1, species)
-        r_flat_phys = reaction(uv_flat_phys)   # (n_points, species) -- one column per species
-
-        # (n_points, species) -> (1, species, H, W), matching current_state's
-        # layout. r_flat_phys's rows are in the same H-major flatten order
-        # state_permuted was built in, so transpose then reshape recovers
-        # the correct per-channel grid without a data reordering bug.
-        r_grid = r_flat_phys.permute(1, 0).reshape(1, species, nx, ny)
-
-        # 3. Euler Step -- reaction_term is r_grid directly now; no more
-        # [+R, -R] construction, since each channel already has its own
-        # independently-learned reaction output.
-        new_state = current_state + dt * (D_tensor * lap_uv + r_grid)
-        return new_state
-
-    # --- Progress Tracking Variables ---
-    print_interval = nits // 10  # 10%
+    def physics_step(state):
+        lap = conv(state) / (dx ** 2)
+ 
+        # (1, species, H, W) -> (n_points, species) for the reaction, and back.
+        # The rows keep the H-major flatten order, so transpose-then-reshape
+        # recovers each channel's grid without reordering the data.
+        flat = state.permute(0, 2, 3, 1).contiguous().view(-1, species)
+        r_grid = reaction(flat).permute(1, 0).reshape(1, species, nx, ny)
+ 
+        return state + dt * (D_tensor * lap + r_grid)
+ 
+    print_interval = max(1, nits // 10)
     last_time = time.time()
-
-    # Ensure no gradients are tracked for the loop (saves memory/speed)
+    next_frame = 0
+ 
     with torch.no_grad():
-        for t in range(nits):
-
-            # Save state
-            if t % half_sec_nits == 0 and storage_idx < len(t_array):
-                # Permute to (H, W, species) for storage
-                u_array[storage_idx] = uv_grid.squeeze(0).permute(1, 2, 0)
-                storage_idx += 1
-
-            # Run Physics
+        for step in range(nits + 1):
+            # while, not if: with a coarse dt two frame times can land on the
+            # same step, and every frame must still get written.
+            while next_frame < len(save_steps) and save_steps[next_frame] == step:
+                u_array[next_frame] = uv_grid.squeeze(0).permute(1, 2, 0)
+                next_frame += 1
+ 
+            if step == nits:
+                break
             uv_grid = physics_step(uv_grid)
-
-            # Print Progress and Time per 5% segment
-            if t > 0 and t % print_interval == 0:
-                current_time = time.time()
-                elapsed = current_time - last_time
-                last_time = current_time
-
-                mins = int(elapsed // 60)
-                secs = int(elapsed % 60)
-                print(f"Progress: {(t / nits) * 100:.0f}% | Segment took: {mins}m {secs}s", flush=True)
-            elif t == 0:
+ 
+            if step == 0:
                 print("Progress: 0%", flush=True)
-
+            elif step % print_interval == 0:
+                elapsed = time.time() - last_time
+                last_time = time.time()
+                print(f"Progress: {(step / nits) * 100:.0f}% | "
+                      f"Segment took: {int(elapsed // 60)}m {int(elapsed % 60)}s", flush=True)
+ 
+    if not torch.isfinite(u_array).all():
+        raise FloatingPointError(
+            f"Learned-PDE simulation diverged (dt={dt:.3e}, CFL limit={cfl_limit:.3e}, "
+            f"D={D_list}). The learned reaction may be stiffer than the true one; "
+            f"lower dt_cap.")
+ 
     return u_array.cpu(), x_array.cpu(), t_array.cpu()
 
 @njit(parallel=True)
