@@ -30,14 +30,18 @@ need rechecking.
 
 def library_size(species, degree, duplicates, include_poly=True,
                  include_increasing_hill=True, include_decreasing_hill=True,
-                 mcas=False):
+                 include_constant=False, mcas=False):
     """Total L0 gate count: total_features * n_free. Mirrors EQLLayer's
-    feature construction -- if you change the library there, change it here."""
+    feature construction -- if you change the library there, change it here.
+
+    include_constant admits the all-zero exponent tuple (a constant term),
+    matching PolynomialFeatures' own flag."""
     n_poly = 0
     if include_poly:
+        lowest = 0 if include_constant else 1
         n_poly = duplicates * sum(
             1 for p in itertools.product(range(degree + 1), repeat=species)
-            if 1 <= sum(p) <= degree)
+            if lowest <= sum(p) <= degree)
 
     n_forms = int(include_increasing_hill) + int(include_decreasing_hill)
     n_hill = duplicates * (species + species * (species - 1)) * n_forms

@@ -106,6 +106,66 @@ def l0_scale(null, floor, current, floor_epoch, eql, reference_gates=None):
     return scale
 
 
+def row_l0_scales(null, floor, eql, species_names, reference_gates=None):
+    """
+    Price of an open gate on each FREE row, in PDE-loss units:
+
+        price_row = (sum over the species this row drives of PDE_null - PDE_floor)
+                    / n_reference_gates
+
+    Unlike the single global price, a row is charged only against the
+    improvement it can actually deliver. With l0_weight = w, a term survives
+    if it earns more than w / n_reference_gates of ITS OWN equation's
+    explainable range -- a condition that does not depend on how many
+    equations there are, or on how unevenly the range is split between them.
+
+    A row that drives several species (mcas: one F applied as +F and -F) is
+    charged against their combined range, so mcas behaves exactly as under
+    global pricing.
+
+    Returns one price per free row, or None if the ranges cannot be measured.
+    """
+    if null is None or floor is None:
+        print("\n--- L0 scale: no collocation cache, defaulting to unit price ---\n")
+        return None
+
+    ref = reference_gates or eql.n_gates
+    explainable = [n - f for n, f in zip(null, floor)]
+
+    # Which species each free row drives (its own, plus any mirrors of it).
+    rows = [[] for _ in range(eql.n_free)]
+    for s, (_, row) in enumerate(eql.species_role):
+        rows[row].append(s)
+
+    print("\n--- L0 scale diagnostics (per-species pricing) ---")
+    print(f"  Reference gates: {ref}  (library has {eql.n_gates})")
+    print(f"  {'row':>4} {'species':>12} {'PDE null':>12} {'PDE floor':>12} "
+          f"{'explainable':>12} {'price/gate':>12}")
+
+    scales = []
+    for row, species in enumerate(rows):
+        row_range = sum(explainable[s] for s in species)
+        label = ", ".join(species_names[s] for s in species)
+        if row_range <= 0:
+            # Its terms fit worse than F = 0: Phase 2 did not converge for
+            # this row. Fall back to unit price rather than a free or
+            # negative one, which would disable pruning on that row.
+            print(f"  {row:>4} {label:>12} {sum(null[s] for s in species):12.4e} "
+                  f"{sum(floor[s] for s in species):12.4e} {row_range:12.4e} "
+                  f"{1.0:12.4e}  <- NEGATIVE range; Phase 2 did not converge here")
+            scales.append(1.0)
+            continue
+
+        price = row_range / ref
+        scales.append(price)
+        print(f"  {row:>4} {label:>12} {sum(null[s] for s in species):12.4e} "
+              f"{sum(floor[s] for s in species):12.4e} {row_range:12.4e} {price:12.4e}")
+
+    print("  A term on a row survives only if it removes more PDE loss than "
+          "l0_weight x that row's price.\n")
+    return scales
+
+
 class PDEFloorTracker:
     """
     Lowest full-cache PDE loss seen during Phase 2 and the reaction weights

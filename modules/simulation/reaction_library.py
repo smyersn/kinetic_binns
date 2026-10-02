@@ -153,6 +153,38 @@ def ic_localized_seed(N, background=(1.0, 0.0), seed_value=(0.5, 0.4), seed_frac
     return u, v
 
 
+def ic_square_seeds(N, background=(1.0, 0.0), seed_value=(0.5, 0.4), seed_frac=0.1,
+                    spacing_frac=0.25, noise=0.01):
+    """Gray-Scott, four seeds: the ic_localized_seed square repeated at the
+    corners of a square centred on the domain, plus the same small noise.
+
+    Four seeds put four times as much of the domain into the active pattern
+    early on, and the seeds' fronts collide in the middle, visiting (u, v)
+    states a single expanding seed never does. Both matter for learning:
+    background points (u = 1, v = 0) carry no information about the reaction.
+
+    spacing_frac is the distance between neighbouring seed centres as a
+    fraction of N. Keep it well below 0.5: at exactly 0.5 the seeds are
+    spaced evenly across the PERIODIC boundaries too, so the whole domain is
+    four identical copies of one quadrant (apart from the noise) and holds
+    no more information than a single seed on a quarter-size domain.
+    seed_value and seed_frac mean the same as in ic_localized_seed."""
+    u = np.full((N, N), background[0], dtype=np.float64)
+    v = np.full((N, N), background[1], dtype=np.float64)
+
+    r = max(1, int(N * seed_frac / 2))
+    c = N // 2
+    d = int(round(N * spacing_frac / 2))      # centre-to-seed offset along each axis
+    for cy in (c - d, c + d):
+        for cx in (c - d, c + d):
+            u[cy - r:cy + r, cx - r:cx + r] = seed_value[0]
+            v[cy - r:cy + r, cx - r:cx + r] = seed_value[1]
+
+    u += noise * (np.random.rand(N, N) - 0.5)
+    v += noise * (np.random.rand(N, N) - 0.5)
+    return u, v
+
+
 def ic_homogeneous_plus_noise(N, u_ss, v_ss, noise=0.01):
     """Turing convention (Brusselator, Schnakenberg): perturb the
     homogeneous fixed point with small random noise and let the
@@ -210,7 +242,9 @@ REACTION_REGISTRY = {
     "gray_scott": {
         **REACTION_SPECS["gray_scott"],
         "fn": gray_scott,
-        "ic_builder": lambda N, p: ic_localized_seed(N),
+        # Four seeds in a square (was: ic_localized_seed, one central seed).
+        # Datasets made before this change used the single seed.
+        "ic_builder": lambda N, p: ic_square_seeds(N),
     },
     "brusselator": {
         **REACTION_SPECS["brusselator"],

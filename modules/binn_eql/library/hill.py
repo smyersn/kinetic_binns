@@ -90,6 +90,8 @@ class HillFeatures(nn.Module):
         return slots
 
     def forward(self, x):
+        # Reference implementation. EQLLayer computes the same features in
+        # batched form (EQLLayer._hill_features); keep the two consistent.
         features = []
         for _, term, fn in self.slots():
             f = fn(x[:, term[0]:term[0] + 1])

@@ -46,7 +46,7 @@ def simulate_uvmlp(training_data, model):
     return u_array.cpu(), x_array.cpu(), t_array.cpu()
 
 
-def simulate_feql(training_data, model, dt_cap=1e-4, cfl_safety=0.4):
+def simulate_feql(training_data, model, dt_cap=1e-4, cfl_safety=0.4, max_retries=3):
     """
     Integrate the learned PDE (explicit Euler, periodic BCs) and save a
     snapshot at each of the training data's frame times.
@@ -55,7 +55,15 @@ def simulate_feql(training_data, model, dt_cap=1e-4, cfl_safety=0.4):
         step actually used is min(dt_cap, cfl_safety * dx^2 / (4 max D)),
         matching simulate_reaction_cpu -- so large learned diffusion
         coefficients cannot silently destabilize the integration, and small
-        ones are not paid for with unnecessary steps.
+        ones are not paid for with unnecessary steps. PASS THE REACTION'S OWN
+        dt_cap (REACTION_SPECS[name]["dt_cap"]); the 1e-4 default is a
+        conservative fallback and is ~5000x too strict for gray_scott, whose
+        cap is 0.5.
+ 
+    max_retries: the LEARNED reaction can be stiffer than the true one, so a
+        step that was stable during data generation is not guaranteed stable
+        here. On divergence the step is cut by 4x and the run restarted, up
+        to this many times, rather than failing outright.
  
     N-species general: each species' reaction term comes from its own output
     column of model.model.reaction, rather than the old [+R, -R] trick that
@@ -132,32 +140,40 @@ def simulate_feql(training_data, model, dt_cap=1e-4, cfl_safety=0.4):
     print_interval = max(1, nits // 10)
     last_time = time.time()
     next_frame = 0
+    state = uv_grid
  
     with torch.no_grad():
         for step in range(nits + 1):
             # while, not if: with a coarse dt two frame times can land on the
             # same step, and every frame must still get written.
             while next_frame < len(save_steps) and save_steps[next_frame] == step:
-                u_array[next_frame] = uv_grid.squeeze(0).permute(1, 2, 0)
+                u_array[next_frame] = state.squeeze(0).permute(1, 2, 0)
                 next_frame += 1
  
             if step == nits:
                 break
-            uv_grid = physics_step(uv_grid)
+            state = physics_step(state)
  
             if step == 0:
                 print("Progress: 0%", flush=True)
             elif step % print_interval == 0:
+                if not torch.isfinite(state).all():
+                    break          # diverged; no point finishing the run
                 elapsed = time.time() - last_time
                 last_time = time.time()
                 print(f"Progress: {(step / nits) * 100:.0f}% | "
                       f"Segment took: {int(elapsed // 60)}m {int(elapsed % 60)}s", flush=True)
  
     if not torch.isfinite(u_array).all():
+        if max_retries > 0:
+            print(f"Diverged at dt={dt:.3e}; retrying at dt={dt / 4:.3e} "
+                  f"({max_retries} attempt(s) left).", flush=True)
+            return simulate_feql(training_data, model, dt_cap=dt / 4,
+                                 cfl_safety=cfl_safety, max_retries=max_retries - 1)
         raise FloatingPointError(
-            f"Learned-PDE simulation diverged (dt={dt:.3e}, CFL limit={cfl_limit:.3e}, "
-            f"D={D_list}). The learned reaction may be stiffer than the true one; "
-            f"lower dt_cap.")
+            f"Learned-PDE simulation diverged at dt={dt:.3e} (CFL limit={cfl_limit:.3e}, "
+            f"D={D_list}) and after {max_retries} step reductions. The learned reaction "
+            f"is far stiffer than the true one.")
  
     return u_array.cpu(), x_array.cpu(), t_array.cpu()
 

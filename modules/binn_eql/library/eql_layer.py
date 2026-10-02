@@ -18,6 +18,7 @@ mcas=True   Two-state active/inactive systems (species == 2 only). One
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from modules.binn_eql.library.hard_concrete_gate import HardConcreteGate
 from modules.binn_eql.library.hill import DuplicateHillFeatures
@@ -43,7 +44,8 @@ class EQLLayer(nn.Module):
 
     def __init__(self, species, duplicates, max_scale, degree,
                  include_poly=True, include_increasing_hill=True,
-                 include_decreasing_hill=True, mcas=False):
+                 include_decreasing_hill=True, include_constant=False,
+                 mcas=False):
         super().__init__()
         if not (include_poly or include_increasing_hill or include_decreasing_hill):
             raise ValueError("EQLLayer needs at least one of include_poly, "
@@ -59,7 +61,9 @@ class EQLLayer(nn.Module):
         self.register_buffer('max_scale', max_scale)  # (1, species): 99th pct of |u|
 
         # --- Candidate library ------------------------------------------
-        self.poly = PolynomialFeatures(species, duplicates, degree) if include_poly else None
+        self.include_constant = include_constant
+        self.poly = (PolynomialFeatures(species, duplicates, degree, include_constant)
+                     if include_poly else None)
         self.num_poly_features = duplicates * len(self.poly.powers) if include_poly else 0
 
         has_hill = include_increasing_hill or include_decreasing_hill
@@ -73,6 +77,20 @@ class EQLLayer(nn.Module):
         self.hill_slots = [(form, term) for form, term, _ in slots]
         self.all_hill_funcs = [fn for _, _, fn in slots]
         self.num_hill_features = len(slots)
+
+        # Column layout of the Hill features as index tensors, so all of them
+        # can be computed in a few batched operations (see _hill_features)
+        # instead of one small module call each. persistent=False keeps them
+        # out of the state_dict, so checkpoints are unaffected.
+        self.register_buffer('hill_input_idx', torch.tensor(
+            [term[0] for _, term in self.hill_slots], dtype=torch.long), persistent=False)
+        self.register_buffer('hill_cross_idx', torch.tensor(
+            [term[1] if len(term) == 2 else 0 for _, term in self.hill_slots],
+            dtype=torch.long), persistent=False)
+        self.register_buffer('hill_is_cross', torch.tensor(
+            [len(term) == 2 for _, term in self.hill_slots], dtype=torch.bool), persistent=False)
+        self.register_buffer('hill_is_increasing', torch.tensor(
+            [form == 'inc' for form, _ in self.hill_slots], dtype=torch.bool), persistent=False)
 
         self.total_features = self.num_poly_features + self.num_hill_features
 
@@ -94,12 +112,32 @@ class EQLLayer(nn.Module):
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
+    def hill_parameters(self):
+        """(n, K) of every Hill feature as (num_hill_features,) tensors, in column order."""
+        raw_n = torch.cat([fn.raw_n for fn in self.all_hill_funcs])
+        raw_K = torch.cat([fn.raw_K for fn in self.all_hill_funcs])
+        return torch.sigmoid(raw_n) * 3 + 1, F.softplus(raw_K)
+
+    def _hill_features(self, x):
+        """
+        All Hill features at once; equivalent to self.hill(x) (the per-module
+        reference implementation in hill.py), column for column.
+        """
+        n, K = self.hill_parameters()
+        x_n = x[:, self.hill_input_idx].pow(n)                 # (batch, num_hill)
+        denominator = 1 + K * x_n
+        numerator = torch.where(self.hill_is_increasing, x_n, torch.ones_like(x_n))
+        features = numerator / denominator
+        multiplier = torch.where(self.hill_is_cross, x[:, self.hill_cross_idx],
+                                 torch.ones_like(features))
+        return features * multiplier
+
     def get_features(self, x):
         features = []
         if self.poly is not None:
             features.append(self.poly(x))
         if self.hill is not None:
-            features.append(self.hill(x))
+            features.append(self._hill_features(x))
         return torch.cat(features, dim=1)
 
     def forward(self, x):
@@ -143,13 +181,9 @@ class EQLLayer(nn.Module):
             empty = torch.zeros(0, device=w_phys.device)
             return w_phys, empty, empty
 
-        scale = self.max_scale[0]
-        k_phys, k_ceiling = [], []
-        for fn, (_, term) in zip(self.all_hill_funcs, self.hill_slots):
-            kd_min = epsilon * (scale[term[0]] + 1e-6)
-            k_phys.append(fn.K.view(1))
-            k_ceiling.append((1.0 / (kd_min ** fn.n)).view(1))
-        return w_phys, torch.cat(k_phys), torch.cat(k_ceiling)
+        n, K = self.hill_parameters()
+        kd_min = epsilon * (self.max_scale[0][self.hill_input_idx] + 1e-6)
+        return w_phys, K, 1.0 / (kd_min ** n)
 
     @torch.no_grad()
     def _initialize_K(self):

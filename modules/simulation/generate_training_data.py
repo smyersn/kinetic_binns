@@ -34,13 +34,13 @@ diff_coeffs_pool = {
     # pack roughly 10 wavelengths across the domain. Feature counts in the
     # comments are from direct simulation at N=128 (connected above-mean
     # regions in u at the final frame).
-    "fitzhugh_nagumo": {"du": [0.02], "dv": [0.0]},   # only the activator diffuses
+    # "fitzhugh_nagumo": {"du": [0.02], "dv": [0.0]},   # only the activator diffuses
     "gray_scott": {"du": [0.0004], "dv": [0.0002]},   # 271 features (was: total extinction)
                                                        # classic GS values (0.16/0.08) assume
                                                        # dx=1 on a 200-wide grid -> domain 200.
                                                        # L=10 here, so scale by (10/200)^2 = 1/400.
-    "brusselator": {"du": [0.02], "dv": [0.16]},      # 132 features (was 5)
-    "schnakenberg": {"du": [0.01], "dv": [0.1]},      # 92 features (was 1)
+    # "brusselator": {"du": [0.02], "dv": [0.16]},      # 132 features (was 5)
+    # "schnakenberg": {"du": [0.01], "dv": [0.1]},      # 92 features (was 1)
 }
 
 param_pool = {
@@ -59,9 +59,9 @@ param_pool = {
     # Sustained spirals also need a broken-wavefront initial condition that
     # ic_pulse_stimulus does not provide, so expect decaying pulses from
     # these runs until that IC is written.
-    "fitzhugh_nagumo": {"a": [0.5, 0.7, 0.9], "b": [0.8], "eps": [0.05, 0.1]},
-    "brusselator": {"a": [1.0, 2.0], "b": [2.0, 3.0, 4.0]},
-    "schnakenberg": {"a": [0.1, 0.2], "b": [0.8, 0.9, 1.2]},
+    # "fitzhugh_nagumo": {"a": [0.5, 0.7, 0.9], "b": [0.8], "eps": [0.05, 0.1]},
+    # "brusselator": {"a": [2.0], "b": [3.5]},
+    # "schnakenberg": {"a": [0.05], "b": [1.0]},
     # gray_scott is intentionally absent here -- see paired_params below.
     # Gray-Scott's autocatalytic term is quadratic in v, so feed/kill can't
     # be gridded independently without risking sub-threshold combinations
@@ -90,6 +90,7 @@ paired_params = {
 # back to REACTION_SPECS's default for that reaction.
 sim_overrides = {
     # e.g. "gray_scott": {"T": 12000},
+    "gray_scott": {"T": 2000, "num_frames": 101}
 }
 
 # T and dt_cap defaults in REACTION_SPECS were verified by direct simulation

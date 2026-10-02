@@ -58,13 +58,16 @@ class BINN(nn.Module):
     diff_coeffs           fixed D per species, or None/[] to learn D
     duplicates, degree    library size: copies of each term, max polynomial degree
     include_*             which term families populate the library
+    include_constant      add a constant term to the polynomial library, for
+                          reactions with a source or feed rate
     param_bounds          soft bound on |w| (see BINNLoss.soft_wall)
     mcas                  two-state conserved system: learn one F, apply +F/-F
                           (see library/eql_layer.py)
     l0_reference_gates    fixed gate count for the L0 scale (see calibration.l0_scale)
     pde_t_cutoff          earliest time used in the PDE residual; None to detect
                           an unresolved initial transient automatically
-    gls_max_weight        maximum per-frame GLS weight
+    gls_max_weight        maximum per-frame GLS activity weight; 1.0 disables
+                          the weighting (every frame weighted equally)
     """
 
     def __init__(self, dimensions, species, train_data, duplicates=1,
@@ -72,7 +75,8 @@ class BINN(nn.Module):
                  fourier_scale=1.0, fourier_mapping_size=64,
                  mcas=False, species_names=None, l0_reference_gates=None,
                  pde_t_cutoff=None, gls_max_weight=50.0,
-                 include_poly=True, include_increasing_hill=True, include_decreasing_hill=True):
+                 include_poly=True, include_increasing_hill=True, include_decreasing_hill=True,
+                 include_constant=False):
         super().__init__()
         self.dimensions = dimensions
         self.species = species
@@ -116,7 +120,8 @@ class BINN(nn.Module):
             species=species, duplicates=duplicates, max_scale=self.max_scale,
             degree=degree, include_poly=include_poly,
             include_increasing_hill=include_increasing_hill,
-            include_decreasing_hill=include_decreasing_hill, mcas=mcas)
+            include_decreasing_hill=include_decreasing_hill,
+            include_constant=include_constant, mcas=mcas)
 
     # ------------------------------------------------------------------
     # Data-derived buffers

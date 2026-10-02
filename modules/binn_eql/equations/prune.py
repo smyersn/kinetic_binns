@@ -215,20 +215,23 @@ def fine_tune_eql(binn, threshold=0.01, epsilon=0.1, n_tol=0.15,
     num_points     training points used for the merge/flatness tests
     """
     eql = binn.reaction.eql_layer
+    has_hill = eql.hill is not None
 
-    if eql.hill is None:
-        zero_weak_terms(eql, threshold)
-        print("Fine-tuning committed (poly-only library, no Hill merging needed).")
-        return
-
-    samples = _sample_concentrations(binn, num_points, eql.fc.weight.device)
-    features = eql.get_features(samples)
+    # Features are measured BEFORE any mutation: merging Hills changes their
+    # n and K, and the collinearity tests must see the trained shapes.
+    if has_hill:
+        samples = _sample_concentrations(binn, num_points, eql.fc.weight.device)
+        features = eql.get_features(samples)
 
     zero_weak_terms(eql, threshold)
+    # Runs for every library. A poly-only run used to return before this,
+    # leaving each monomial split across its duplicate copies.
     if eql.include_poly:
         merge_duplicate_polynomials(eql)
-    merge_duplicate_hills(eql, features, epsilon)
-    if eql.include_poly:
-        collapse_flat_hills(eql, samples, binn.degree, n_tol, flat_denom, flat_quantile)
+    if has_hill:
+        merge_duplicate_hills(eql, features, epsilon)
+        if eql.include_poly:
+            collapse_flat_hills(eql, samples, binn.degree, n_tol, flat_denom, flat_quantile)
     zero_weak_terms(eql, threshold)
-    print("Fine-tuning committed.")
+    print("Fine-tuning committed."
+          + ("" if has_hill else " (poly-only library, no Hill merging needed.)"))

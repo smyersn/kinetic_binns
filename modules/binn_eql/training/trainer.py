@@ -64,11 +64,29 @@ class Trainer:
     scheduler    stepped once per epoch during Phase 1 only
     out_dir      run directory (equation log, checkpoints, best weights)
     mass_weight  weight of the mass-conservation loss
+    validation   Phases 2-4 validation loss, which drives Phase 4 model
+                 selection and early stopping:
+                   'sampled'     (legacy) PDE on random cache samples, one per
+                                 validation batch -- noisy, and drawn from the
+                                 same cache as training
+                   'full_cache'  PDE over the whole cache in eval mode --
+                                 deterministic
+    checkpoint_minutes  wall-clock interval between resumable checkpoints
+    physics_steps_per_epoch
+                 reaction steps per epoch in Phases 2-4. None (default): one
+                 per data batch, as originally -- so the step count grows
+                 with the data size (points^2). An integer fixes it, so the
+                 resolution of the data affects only the surface fit (Phase 1)
+                 and runs at different resolutions get identical reaction
+                 training.
     """
 
     def __init__(self, model, loss_fn, optimizer, scheduler=None, out_dir='.',
-                 save_prefix=None, mass_weight=1.0, log_every=1000,
-                 checkpoint_every=50, floor_track_every=100):
+                 save_prefix=None, mass_weight=1.0, validation='sampled',
+                 log_every=1000, checkpoint_minutes=10.0, floor_track_every=100,
+                 physics_steps_per_epoch=None):
+        if validation not in ('sampled', 'full_cache'):
+            raise ValueError(f"validation must be 'sampled' or 'full_cache', got {validation!r}")
         self.model = model
         self.loss_fn = loss_fn
         self.optimizer = optimizer
@@ -76,8 +94,10 @@ class Trainer:
         self.out_dir = out_dir
         self.save_prefix = save_prefix or os.path.join(out_dir, 'binn')
         self.mass_weight = mass_weight
+        self.validation = validation
+        self.physics_steps_per_epoch = physics_steps_per_epoch
         self.log_every = log_every
-        self.checkpoint_every = checkpoint_every
+        self.checkpoint_minutes = checkpoint_minutes
         self.floor_track_every = floor_track_every
 
         # The training script's param groups are the single source of truth
@@ -111,6 +131,14 @@ class Trainer:
         schedule.validate(epochs)
         self._check_scheduler_length(schedule)
 
+        data_steps = -(-len(train_data) // batch_size)   # ceil
+        if self.physics_steps_per_epoch:
+            print(f"Phases 2-4: {self.physics_steps_per_epoch} reaction steps per epoch "
+                  f"(fixed; one per data batch would be {data_steps}).", flush=True)
+        else:
+            print(f"Phases 2-4: {data_steps} reaction steps per epoch (one per data batch).",
+                  flush=True)
+
         if initial_epoch == 0:
             self.param_history = _empty_param_history()
 
@@ -125,7 +153,7 @@ class Trainer:
 
         device = train_data.device
         total_iter = initial_epoch + epochs
-        start_time = epoch_start = time.time()
+        start_time = epoch_start = last_checkpoint = time.time()
         current_phase = None
         epoch = initial_epoch
 
@@ -181,8 +209,12 @@ class Trainer:
             # --- 5. Logging and checkpointing ---------------------------
             if epoch % self.log_every == 0:
                 self._print_progress(epoch, start_time, epoch_start, batch_size, total_iter)
-            if epoch % self.checkpoint_every == 0 or epoch == epochs - 1:
+            # Checkpoints are written by wall-clock time: the histories grow
+            # every epoch, so a fixed epoch interval makes saving ever costlier.
+            if (time.time() - last_checkpoint >= 60 * self.checkpoint_minutes
+                    or epoch == epochs - 1):
                 self._save_checkpoint(epoch)
+                last_checkpoint = time.time()
 
         self._print_summary(epoch, best_model.epoch, start_time, epoch_start, batch_size, total_iter)
         return self.param_history, self.train_loss_dict, self.val_loss_dict
@@ -264,40 +296,97 @@ class Trainer:
     # One pass over the data
     # ==================================================================
     def _run_epoch(self, data, batch_size, weights, phase, train):
-        """One pass over data (with optimizer steps if train). Returns per-sample mean losses."""
+        """
+        One training or validation pass. Returns per-sample mean losses.
+
+        Phase 1 fits the surface to the data. In Phases 2-4 the surface is
+        frozen and GLS carries zero weight, so the data only set the number
+        of steps: each step draws fresh collocation points instead.
+        """
+        uses_data = 'surface' in phase.trains or phase.gls_weight > 0
+        if uses_data:
+            return self._data_epoch(data, batch_size, weights, phase, train)
+        if not train and self.validation == 'full_cache':
+            return self._full_cache_validation(weights, phase)
+        return self._physics_epoch(len(data), batch_size, weights, phase, train)
+
+    def _data_epoch(self, data, batch_size, weights, phase, train):
+        """Phase 1: minibatches of data through the surface fitter."""
         self.model.train(train)
         species = self.model.species
         order = torch.randperm(len(data)) if train else torch.arange(len(data))
-        totals = dict.fromkeys(LOSS_KEYS, 0.0)
+        totals = torch.zeros(len(LOSS_KEYS), device=data.device)
 
-        # Gradients stay enabled during validation: the uncached collocation
-        # path differentiates the surface with respect to its inputs.
         for start in range(0, len(data), batch_size):
             batch = data[order[start:start + batch_size]]
             inputs, targets = batch[:, :-species], batch[:, -species:]
-
             if train:
                 self.optimizer.zero_grad()
-
             terms = self.loss_fn(inputs, self.model(inputs), targets, phase.number)
-            weighted = torch.stack([terms.gls, terms.pde, terms.l0]) * weights
-            mass = (self.mass_weight * terms.mass if phase.mass_active
-                    else torch.tensor(0.0, device=inputs.device))
-            total = weighted.sum() + terms.soft_wall + mass
+            totals += self._step(terms, weights, phase, train) * len(inputs)
 
-            if train:
-                total.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                self.optimizer.step()
+        return self._to_means(totals, len(data))
 
-            n = len(inputs)
-            totals['loss'] += total.item() * n
-            totals['gls'] += weighted[0].item() * n
-            totals['pde'] += weighted[1].item() * n
-            totals['reg'] += (weighted[2] + terms.soft_wall).item() * n
-            totals['mass'] += mass.item() * n
+    def _physics_epoch(self, n_samples, batch_size, weights, phase, train):
+        """
+        Phases 2-4: steps on freshly sampled collocation points; the data are
+        never touched. The step count is physics_steps_per_epoch if set,
+        otherwise one per data batch, weighted by the batch sizes so the
+        logged losses match what a data-driven pass would record.
+        """
+        if self.physics_steps_per_epoch:
+            step_weights = [1] * self.physics_steps_per_epoch
+        else:
+            step_weights = [min(batch_size, n_samples - start)
+                            for start in range(0, n_samples, batch_size)]
 
-        return {k: v / len(data) for k, v in totals.items()}
+        self.model.train(train)
+        totals = torch.zeros(len(LOSS_KEYS), device=self.model.lb.device)
+
+        # Validation needs no autograd graph, except on the uncached path,
+        # which differentiates the surface to get u_t and lap u.
+        with torch.set_grad_enabled(train or self.loss_fn.cache is None):
+            for w in step_weights:
+                if train:
+                    self.optimizer.zero_grad()
+                terms = self.loss_fn.physics_terms()
+                totals += self._step(terms, weights, phase, train) * w
+
+        return self._to_means(totals, sum(step_weights))
+
+    def _full_cache_validation(self, weights, phase):
+        """Phases 2-4, validation='full_cache': one deterministic evaluation over the whole cache."""
+        self.model.eval()
+        terms = self.loss_fn.full_cache_terms()
+        if terms is None:
+            raise RuntimeError("full_cache validation needs the collocation cache, "
+                               "which is built at Phase 2 entry.")
+        with torch.no_grad():
+            return self._to_means(self._step(terms, weights, phase, train=False), 1)
+
+    def _step(self, terms, weights, phase, train):
+        """
+        Combine the loss terms, take an optimizer step if training, and return
+        the logged quantities as a GPU tensor ordered like LOSS_KEYS. Nothing
+        here synchronizes with the host, so the CPU can queue work ahead.
+        """
+        weighted = torch.stack([terms.gls, terms.pde, terms.l0]) * weights
+        mass = (self.mass_weight * terms.mass if phase.mass_active
+                else torch.zeros((), device=weighted.device))
+        total = weighted.sum() + terms.soft_wall + mass
+
+        if train:
+            total.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.optimizer.step()
+
+        return torch.stack([total, weighted[0], weighted[1],
+                            weighted[2] + terms.soft_wall, mass]).detach()
+
+    @staticmethod
+    def _to_means(totals, n):
+        """Single host sync per pass: divide and copy all logged losses at once."""
+        return dict(zip(LOSS_KEYS, (totals / n).tolist()))
 
     @staticmethod
     def _record(history, losses):
