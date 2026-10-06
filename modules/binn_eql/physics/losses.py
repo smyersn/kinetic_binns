@@ -311,8 +311,7 @@ class BINNLoss:
                 null=self.full_cache_pde_per_species(zero_reaction=True),
                 floor=self.full_cache_pde_per_species(),
                 eql=self.model.reaction.eql_layer,
-                species_names=self.model.species_names,
-                reference_gates=self.model.l0_reference_gates)
+                species_names=self.model.species_names)
             self.l0_scale = 1.0
         else:
             self.l0_scale = l0_scale(
@@ -320,8 +319,7 @@ class BINNLoss:
                 floor=floor,
                 current=current,
                 floor_epoch=self.floor_tracker.epoch,
-                eql=self.model.reaction.eql_layer,
-                reference_gates=self.model.l0_reference_gates)
+                eql=self.model.reaction.eql_layer)
         self.l0_scale_locked = True
 
     # ------------------------------------------------------------------

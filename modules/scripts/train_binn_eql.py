@@ -9,7 +9,7 @@ interrupted run resumes from <run_dir>/latest_checkpoint.pt.
 """
 import json
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -30,7 +30,6 @@ from modules.binn_eql.physics.losses import BINNLoss
 from modules.binn_eql.training.trainer import Trainer
 from modules.simulation.animation import animate_residuals, animate_u_array
 from modules.simulation.reaction_library import REACTION_REGISTRY
-from modules.simulation.reaction_registry import library_size
 from modules.simulation.simulation import simulate_feql, simulate_uvmlp
 from modules.utils.format_data import (format_training_data_to_u_array,
                                        format_u_array_to_training_data)
@@ -52,7 +51,7 @@ PHASE_ENDS = (5_000, 40_000, 75_000)    # default ends of the surface, physics a
 # PHASE_ENDS = (10, 20, 30)    # default ends of the surface, physics and L0-ramp phases
 EARLY_STOPPING = int(0.05 * EPOCHS)     # Phase 4 patience
 LEARNING_RATES = {'surface': 1e-2, 'reaction': 1e-3, 'diffusion': 1e-3}
-SURFACE_WEIGHT_DECAY = 1e-2
+SURFACE_WEIGHT_DECAY = 1e-3             # default; override per run with "surface_weight_decay"
 
 # Post-training pruning (see equations/prune.py)
 PRUNE_THRESHOLD = 0.01
@@ -73,10 +72,9 @@ class RunConfig:
     diff_coeffs: list             # fixed D per species; [] to learn D
     duplicates: int
     degree: int
-    l0_weight: float
+    l0_weight: float              # with l0_divide_by_equations: the BASE weight
     param_bounds: float
     mcas: bool = False
-    l0_reference_gates: Optional[int] = None
     include_poly: bool = True
     include_increasing_hill: bool = True
     include_decreasing_hill: bool = True
@@ -84,17 +82,35 @@ class RunConfig:
     # Surface-fit resolution and cost
     fourier_scale: float = 1.0       # spread of Fourier frequencies; raise for fine/fast patterns
     fourier_mapping_size: int = 64   # number of Fourier frequencies
+    surface_weight_decay: float = SURFACE_WEIGHT_DECAY   # raise for noisy data (stops the surface
+                                                         # fitting the noise); keep low when noise-free
+    surface_lr_schedule: str = "onecycle"   # Phase 1 surface LR: "onecycle" (warm up, then anneal
+                                            # to ~0) or "constant" (base LR throughout -- how the
+                                            # surface trained before the OneCycle fix)
     physics_steps_per_epoch: Optional[int] = None   # fixed Phase 2-4 steps; None = one per data batch
     phase_ends: Optional[list] = None               # (p1, p2, p3) end epochs; None = PHASE_ENDS
     gls_max_weight: float = 50.0  # 1.0 = no GLS activity weighting
     validation: str = "sampled"   # Phase 2-4 validation / model selection: "sampled" or "full_cache"
     l0_pricing: str = "auto"      # gate pricing: "auto" (global for mcas, else per_species),
                                   # or force "global" / "per_species"
- 
+    l0_divide_by_equations: bool = False   # True: train with l0_weight / (number of learned
+                                           # equations): 1 for mcas, else one per species
+    # Set by load(): True if config.json still has the retired "l0_reference_gates"
+    # key, i.e. its l0_weight is on the old scale (old weight = new weight x 51).
+    legacy_l0_scale: bool = field(default=False, init=False, repr=False)
+
     @classmethod
     def load(cls, path):
         with open(path) as f:
-            return cls(**json.load(f))
+            data = json.load(f)
+        # Run folders made before the reference gate count was removed still
+        # carry the key. Drop it so they load for analysis (resimulation,
+        # reaction checks); main() refuses to TRAIN them -- see there.
+        legacy = 'l0_reference_gates' in data
+        data.pop('l0_reference_gates', None)
+        cfg = cls(**data)
+        cfg.legacy_l0_scale = legacy
+        return cfg
  
  
 # ---------------------------------------------------------------------------
@@ -130,7 +146,6 @@ def build_binn(cfg, train_data):
         dimensions=cfg.dimensions, species=cfg.species, train_data=train_data,
         duplicates=cfg.duplicates, diff_coeffs=cfg.diff_coeffs, degree=cfg.degree,
         param_bounds=cfg.param_bounds, mcas=cfg.mcas,
-        l0_reference_gates=cfg.l0_reference_gates,
         include_poly=cfg.include_poly,
         include_increasing_hill=cfg.include_increasing_hill,
         include_decreasing_hill=cfg.include_decreasing_hill,
@@ -140,25 +155,16 @@ def build_binn(cfg, train_data):
         gls_max_weight=cfg.gls_max_weight)
  
  
-def check_library_size(cfg, binn):
-    """Warn if library_size() (used to set l0_reference_gates) disagrees with the model."""
-    expected = library_size(
-        species=cfg.species, degree=cfg.degree, duplicates=cfg.duplicates, mcas=cfg.mcas,
-        include_poly=cfg.include_poly,
-        include_increasing_hill=cfg.include_increasing_hill,
-        include_decreasing_hill=cfg.include_decreasing_hill,
-        include_constant=cfg.include_constant)
-    actual = binn.reaction.eql_layer.n_gates
-    if expected != actual:
-        print(f"WARNING: library_size says {expected} gates, model has {actual}. "
-              f"The two have drifted -- l0_reference_gates is unreliable.", flush=True)
- 
- 
-def build_optimizer(binn, phase_ends):
-    """AdamW with one param group per sub-network; OneCycleLR over Phase 1."""
+def build_optimizer(binn, phase_ends, surface_weight_decay=SURFACE_WEIGHT_DECAY,
+                    lr_schedule="onecycle"):
+    """
+    AdamW with one param group per sub-network, plus the Phase 1 schedule:
+    OneCycleLR over Phase 1 ("onecycle"), or none ("constant"), in which case
+    the trainer holds every trained group at its base LR.
+    """
     groups = [
         {'params': binn.surface_fitter.parameters(), 'name': 'surface',
-         'lr': LEARNING_RATES['surface'], 'weight_decay': SURFACE_WEIGHT_DECAY},
+         'lr': LEARNING_RATES['surface'], 'weight_decay': surface_weight_decay},
         {'params': binn.reaction.parameters(), 'name': 'reaction',
          'lr': LEARNING_RATES['reaction'], 'weight_decay': 0.0},
     ]
@@ -167,6 +173,10 @@ def build_optimizer(binn, phase_ends):
                        'lr': LEARNING_RATES['diffusion'], 'weight_decay': 0.0})
  
     optimizer = torch.optim.AdamW(groups, weight_decay=0.0)
+    if lr_schedule == "constant":
+        return optimizer, None
+    if lr_schedule != "onecycle":
+        raise ValueError(f'surface_lr_schedule must be "onecycle" or "constant", got {lr_schedule!r}')
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer, max_lr=[g['lr'] for g in groups], total_steps=phase_ends[0],
         pct_start=0.3, div_factor=25, final_div_factor=1e4)
@@ -261,6 +271,14 @@ def animate_simulations(trainer, training_data, raw_data, u_array, run_dir, cfg,
 def main(run_dir):
     run_dir = Path(run_dir)
     cfg = RunConfig.load(run_dir / 'config.json')
+    if cfg.legacy_l0_scale:
+        # The price per gate used to be divided by the reference count (51), and
+        # a checkpoint stores the price it calibrated, so resuming or retraining
+        # this config would silently change the penalty by 51x.
+        raise SystemExit(
+            f"{run_dir}/config.json uses the retired \"l0_reference_gates\" key, so its "
+            f"l0_weight ({cfg.l0_weight}) is on the old scale. Start a new run folder with "
+            f"l0_weight = old / reference count (e.g. 50 / 51 = 0.98) and no such key.")
  
     # --- Data ---
     raw_data, training_data = load_training_data(cfg)
@@ -270,9 +288,11 @@ def main(run_dir):
  
     # --- Model, objective, optimizer ---
     binn = build_binn(cfg, train_data).to(DEVICE)
-    check_library_size(cfg, binn)
     phase_ends = tuple(cfg.phase_ends) if cfg.phase_ends else PHASE_ENDS
-    optimizer, scheduler = build_optimizer(binn, phase_ends)
+    optimizer, scheduler = build_optimizer(binn, phase_ends, cfg.surface_weight_decay,
+                                           cfg.surface_lr_schedule)
+    print(f"Surface weight decay: {cfg.surface_weight_decay:g}; "
+          f"Phase 1 LR schedule: {cfg.surface_lr_schedule}", flush=True)
     loss_fn = BINNLoss(binn, l0_pricing=cfg.l0_pricing)
     trainer = Trainer(binn, loss_fn, optimizer, scheduler, out_dir=str(run_dir),
                       validation=cfg.validation,
@@ -285,10 +305,16 @@ def main(run_dir):
         initial_epoch = trainer.resume(checkpoint, device=DEVICE)
  
     # --- Train ---
-    print(f"l0_weight from config: {cfg.l0_weight!r} (type {type(cfg.l0_weight).__name__})", flush=True)
+    l0_weight = cfg.l0_weight
+    if cfg.l0_divide_by_equations:
+        l0_weight = cfg.l0_weight / binn.n_equations
+        print(f"l0_weight: base {cfg.l0_weight!r} / {binn.n_equations} learned equation(s) "
+              f"= {l0_weight:g}", flush=True)
+    else:
+        print(f"l0_weight from config: {cfg.l0_weight!r}", flush=True)
     param_history, train_losses, val_losses = trainer.fit(
         train_data, val_data, epochs=EPOCHS, batch_size=cfg.batch_size,
-        l0_weight=cfg.l0_weight, phase_ends=phase_ends, initial_epoch=initial_epoch,
+        l0_weight=l0_weight, phase_ends=phase_ends, initial_epoch=initial_epoch,
         early_stopping=EARLY_STOPPING)
  
     # --- Results ---

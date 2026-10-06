@@ -63,7 +63,6 @@ class BINN(nn.Module):
     param_bounds          soft bound on |w| (see BINNLoss.soft_wall)
     mcas                  two-state conserved system: learn one F, apply +F/-F
                           (see library/eql_layer.py)
-    l0_reference_gates    fixed gate count for the L0 scale (see calibration.l0_scale)
     pde_t_cutoff          earliest time used in the PDE residual; None to detect
                           an unresolved initial transient automatically
     gls_max_weight        maximum per-frame GLS activity weight; 1.0 disables
@@ -73,7 +72,7 @@ class BINN(nn.Module):
     def __init__(self, dimensions, species, train_data, duplicates=1,
                  diff_coeffs=None, uv_layers=None, degree=2, param_bounds=10,
                  fourier_scale=1.0, fourier_mapping_size=64,
-                 mcas=False, species_names=None, l0_reference_gates=None,
+                 mcas=False, species_names=None,
                  pde_t_cutoff=None, gls_max_weight=50.0,
                  include_poly=True, include_increasing_hill=True, include_decreasing_hill=True,
                  include_constant=False):
@@ -85,7 +84,6 @@ class BINN(nn.Module):
         self.degree = degree
         self.param_bounds = param_bounds
         self.mcas = mcas
-        self.l0_reference_gates = l0_reference_gates
         self.species_names = species_names or default_species_names(species)
 
         # mcas changes how many equations are *reported*, not how many

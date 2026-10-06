@@ -46,27 +46,23 @@ def mass_scales(model, data, groups, t_cutoff):
             for group in groups]
 
 
-def l0_scale(null, floor, current, floor_epoch, eql, reference_gates=None):
+def l0_scale(null, floor, current, floor_epoch, eql):
     """
     Price of one active gate in PDE-loss units:
 
-        l0_scale = (PDE_null - PDE_floor) / n_reference_gates
+        l0_scale = PDE_null - PDE_floor
 
     PDE_null is the residual with every reaction term zeroed and PDE_floor
     the best residual reached with all terms active. Their difference is the
     improvement the library can actually deliver; normalizing by it rather
     than by the floor (mostly irreducible surface-derivative error, which
     grows as the grid coarsens) makes l0_weight resolution-independent:
-    l0_weight = 1 asks each term to earn an equal share of that improvement.
-
-    Normalizing by a fixed reference gate count, rather than this run's own,
-    keeps the price per term constant as the library grows, so l0_weight
-    transfers across library sizes.
+    a term survives only if it earns more than the fraction l0_weight of
+    that improvement (e.g. 0.5 = half of what the whole library can explain).
 
     Returns 1.0 (no rescaling) when the range cannot be measured.
     """
     n_gates = eql.n_gates
-    ref = reference_gates or n_gates
 
     if null is None or floor is None:
         print("\n--- L0 scale: no collocation cache, defaulting to 1.0 ---\n")
@@ -88,16 +84,11 @@ def l0_scale(null, floor, current, floor_epoch, eql, reference_gates=None):
               "pruning result from this run.\n")
         return 1.0
 
-    scale = explainable / ref
+    scale = explainable
     fraction = explainable / max(null, 1e-12)
     print(f"  Explainable range:            {explainable:.4e}  ({100 * fraction:.1f}% of null)")
     print(f"  Gates: {n_gates} ({eql.total_features} features x {eql.n_free} free row(s))")
-    if reference_gates:
-        print(f"  Reference gates: {ref}  ->  library is {n_gates / ref:.2f}x reference")
-    else:
-        print("  Reference gates: (unset -- normalizing by this run's own gate "
-              "count; l0_weight will NOT transfer across library sizes)")
-    print(f"  l0_scale = explainable / {ref} = {scale:.4e}")
+    print(f"  l0_scale = explainable = {scale:.4e}")
     if fraction < 0.1:
         print("  WARNING: terms reduce PDE loss by <10%. The residual is dominated "
               "by surface-derivative error the reaction cannot fix -- likely a "
@@ -106,16 +97,15 @@ def l0_scale(null, floor, current, floor_epoch, eql, reference_gates=None):
     return scale
 
 
-def row_l0_scales(null, floor, eql, species_names, reference_gates=None):
+def row_l0_scales(null, floor, eql, species_names):
     """
     Price of an open gate on each FREE row, in PDE-loss units:
 
-        price_row = (sum over the species this row drives of PDE_null - PDE_floor)
-                    / n_reference_gates
+        price_row = sum over the species this row drives of (PDE_null - PDE_floor)
 
     Unlike the single global price, a row is charged only against the
     improvement it can actually deliver. With l0_weight = w, a term survives
-    if it earns more than w / n_reference_gates of ITS OWN equation's
+    if it earns more than the fraction w of ITS OWN equation's
     explainable range -- a condition that does not depend on how many
     equations there are, or on how unevenly the range is split between them.
 
@@ -129,7 +119,6 @@ def row_l0_scales(null, floor, eql, species_names, reference_gates=None):
         print("\n--- L0 scale: no collocation cache, defaulting to unit price ---\n")
         return None
 
-    ref = reference_gates or eql.n_gates
     explainable = [n - f for n, f in zip(null, floor)]
 
     # Which species each free row drives (its own, plus any mirrors of it).
@@ -138,7 +127,7 @@ def row_l0_scales(null, floor, eql, species_names, reference_gates=None):
         rows[row].append(s)
 
     print("\n--- L0 scale diagnostics (per-species pricing) ---")
-    print(f"  Reference gates: {ref}  (library has {eql.n_gates})")
+    print(f"  Library: {eql.n_gates} gates")
     print(f"  {'row':>4} {'species':>12} {'PDE null':>12} {'PDE floor':>12} "
           f"{'explainable':>12} {'price/gate':>12}")
 
@@ -156,7 +145,7 @@ def row_l0_scales(null, floor, eql, species_names, reference_gates=None):
             scales.append(1.0)
             continue
 
-        price = row_range / ref
+        price = row_range
         scales.append(price)
         print(f"  {row:>4} {label:>12} {sum(null[s] for s in species):12.4e} "
               f"{sum(floor[s] for s in species):12.4e} {row_range:12.4e} {price:12.4e}")
