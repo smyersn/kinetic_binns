@@ -15,6 +15,21 @@ mcas=True   Two-state active/inactive systems (species == 2 only). One
             reaction F is learned for species 0; species 1 is a *mirror*
             that receives exactly -F (same weights, same gate sample), so
             u + v is conserved by construction rather than by training.
+
+Gates per copy or per term
+--------------------------
+The library holds `duplicates` copies of every term. By default each COLUMN
+has its own gate. With gate_per_term=True all copies of a term share one
+gate: the copies of a monomial (identical columns), and the copies of a Hill
+slot (same form and inputs, different n and K). The copies keep their own
+weights (and Hill shapes), but open and close together, and the L0 penalty
+counts each term once however many copies carry it.
+
+Why: the data defend the SUM of a term's copies. With a gate per copy, each
+gate is defended only by its own copy's share of the coefficient (a third,
+with 3 copies, or less if copies start with opposite signs) while paying the
+full price, so all copies of a real term can close together during the L0
+ramp. A shared gate is defended by the whole term.
 """
 import torch
 import torch.nn as nn
@@ -45,7 +60,7 @@ class EQLLayer(nn.Module):
     def __init__(self, species, duplicates, max_scale, degree,
                  include_poly=True, include_increasing_hill=True,
                  include_decreasing_hill=True, include_constant=False,
-                 mcas=False):
+                 mcas=False, gate_per_term=False):
         super().__init__()
         if not (include_poly or include_increasing_hill or include_decreasing_hill):
             raise ValueError("EQLLayer needs at least one of include_poly, "
@@ -58,6 +73,7 @@ class EQLLayer(nn.Module):
         self.include_increasing_hill = include_increasing_hill
         self.include_decreasing_hill = include_decreasing_hill
         self.mcas = mcas
+        self.gate_per_term = gate_per_term
         self.register_buffer('max_scale', max_scale)  # (1, species): 99th pct of |u|
 
         # --- Candidate library ------------------------------------------
@@ -98,8 +114,12 @@ class EQLLayer(nn.Module):
         self.species_role, self.free_species = resolve_species_roles(species, mcas)
         self.n_free = len(self.free_species)
         self.fc = nn.Linear(self.total_features, self.n_free, bias=False)
+        column_index = self._column_terms() if gate_per_term else None
+        n_gates_per_row = (int(column_index.max().item()) + 1 if gate_per_term
+                           else self.total_features)
         self.l0_gates = nn.ModuleList(
-            [HardConcreteGate(self.total_features) for _ in range(self.n_free)])
+            [HardConcreteGate(n_gates_per_row, column_index=column_index)
+             for _ in range(self.n_free)])
 
         if self.hill is not None:
             self._initialize_K()
@@ -107,7 +127,30 @@ class EQLLayer(nn.Module):
 
     @property
     def n_gates(self):
-        return self.total_features * self.n_free
+        """Independent gates over all free rows (terms x rows when gate_per_term)."""
+        return self.l0_gates[0].num_gates * self.n_free
+
+    def _column_terms(self):
+        """
+        Term index of every column, (total_features,) long tensor. Columns
+        that are copies of the same term get the same index:
+            polynomial column c   ->  c mod (number of monomials)
+            Hill column           ->  one index per distinct (form, inputs)
+        Term indices are numbered polynomial terms first, then Hill terms in
+        order of first appearance.
+        """
+        ids = []
+        n_mono = 0
+        if self.poly is not None:
+            n_mono = len(self.poly.powers)
+            ids += [c % n_mono for c in range(self.num_poly_features)]
+        hill_ids = {}
+        for form, term in self.hill_slots:
+            key = (form, tuple(term))
+            if key not in hill_ids:
+                hill_ids[key] = n_mono + len(hill_ids)
+            ids.append(hill_ids[key])
+        return torch.tensor(ids, dtype=torch.long)
 
     # ------------------------------------------------------------------
     # Forward

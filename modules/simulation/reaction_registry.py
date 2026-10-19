@@ -69,4 +69,20 @@ REACTION_SPECS = {
                     "T": 60, "early_stop": False, "dt_cap": 0.002},
     "schnakenberg": {"param_keys": ["a", "b"], "conserved": False,
                      "T": 300, "early_stop": False, "dt_cap": 0.005},
+
+    # --- Three-species, mass-conserving (Sostar & Dzeroski, minimal MCRD
+    # networks for cell polarity, Table 2 models 1-3) ---
+    # u1 + u2 + u3 is conserved, but each species has its own equation, so
+    # these are NOT the two-state +F/-F (mcas) format: train with mcas=False.
+    # u_total is the total concentration; it sets the initial condition (the
+    # homogeneous steady state with that total) and is ignored by the
+    # reaction itself. "species" defaults to 2 for every entry without it.
+    # Defaults verified by direct simulation with the parameters in
+    # generate_three_species_data.py: spots by t ~ 45, slow coarsening after.
+    "mcrd3_m1": {"param_keys": ["k1", "k15", "k16", "k20", "u_total"], "conserved": True,
+                 "species": 3, "T": 100, "early_stop": False, "dt_cap": 0.001},
+    "mcrd3_m2": {"param_keys": ["k1", "k6", "k9", "k23", "u_total"], "conserved": True,
+                 "species": 3, "T": 100, "early_stop": False, "dt_cap": 0.001},
+    "mcrd3_m3": {"param_keys": ["k1", "k6", "k9", "k11", "u_total"], "conserved": True,
+                 "species": 3, "T": 100, "early_stop": False, "dt_cap": 0.001},
 }

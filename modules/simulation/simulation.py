@@ -12,6 +12,7 @@ from modules.utils.format_data import format_u_array_to_training_data
 
 N_GRID = 200  # grid points per side -- shared between simulate_reaction_cpu
               # and the IC builders dispatched from REACTION_REGISTRY below
+SPECIES_TITLES = ("u", "v", "w")   # animation panel titles, matching the BINN's species names
 
 def simulate_uvmlp(training_data, model):
     # --- Initial Conditions ---
@@ -194,12 +195,14 @@ def simulate_reaction_cpu(reaction, params, diff_coeffs, initial_condition,
                            T=50, early_stop=True, min_steady_state_check_frac=0.1,
                            num_frames=101, dt_cap=0.0001):
     """
-    reaction: callable (uv, params) -> (Fu, Fv). Every entry in
-        REACTION_REGISTRY['...']['fn'] already matches this -- no wrapping
-        needed at the call site regardless of whether the underlying
-        system is mass-conserving or not.
-    initial_condition: (u0, v0) tuple of NxN arrays. REACTION_REGISTRY['...']
-        ['ic_builder'](N, params_dict) produces this.
+    reaction: callable (uv, params) -> (F_1, ..., F_S), with uv an (N*N, S)
+        array. Every entry in REACTION_REGISTRY['...']['fn'] already matches
+        this -- no wrapping needed at the call site regardless of whether the
+        underlying system is mass-conserving or not.
+    diff_coeffs: one diffusion coefficient per species, e.g. (du, dv).
+    initial_condition: tuple of NxN arrays, one per species ((u0, v0) for
+        two species). REACTION_REGISTRY['...']['ic_builder'](N, params_dict)
+        produces this. The number of species is taken from its length.
     min_steady_state_check_frac: fraction of T to wait before the early-stop
         check activates. Turing-unstable systems start almost exactly at
         their homogeneous fixed point, so frame-to-frame diff can sit below
@@ -217,13 +220,15 @@ def simulate_reaction_cpu(reaction, params, diff_coeffs, initial_condition,
         silently destabilize the integration. Comes from
         REACTION_SPECS[name]['dt_cap'].
     """
-    species = 2
+    species = len(initial_condition)
     N = N_GRID
     L = 10                            # domain length
     ss_tolerance = 0.025
 
     dx = L / N
-    du, dv = diff_coeffs
+    diff_coeffs = [float(d) for d in diff_coeffs]
+    if len(diff_coeffs) != species:
+        raise ValueError(f"{len(diff_coeffs)} diffusion coefficient(s) for {species} species")
 
     # Explicit-Euler diffusion is only stable for dt < dx^2 / (4*D), while
     # the reaction kinetics impose their own separate ceiling (dt_cap).
@@ -233,7 +238,7 @@ def simulate_reaction_cpu(reaction, params, diff_coeffs, initial_condition,
     # for the low-diffusion coefficients now in use (~20x more steps than
     # needed). Take the min of both limits instead.
     cfl_safety = 0.4
-    max_D = max(du, dv)
+    max_D = max(diff_coeffs)
     cfl_limit = dx**2 / (4 * max_D) if max_D > 0 else float('inf')
     dt = min(dt_cap, cfl_safety * cfl_limit)
 
@@ -244,31 +249,26 @@ def simulate_reaction_cpu(reaction, params, diff_coeffs, initial_condition,
 
     inv_dx2 = 1.0 / (dx**2)
 
-    u, v = initial_condition
-    u, v = u.copy(), v.copy()
+    fields = [np.array(f, dtype=np.float64) for f in initial_condition]
 
     # Preallocated once, reused every step -- avoids reallocating on each
     # of up to hundreds of thousands of Euler steps.
-    lap_u = np.zeros((N, N), dtype=np.float64)
-    lap_v = np.zeros((N, N), dtype=np.float64)
+    laps = [np.zeros((N, N), dtype=np.float64) for _ in range(species)]
 
     # Save a snapshot every `save_interval` steps, chosen so exactly
     # num_frames snapshots span the full run.
     save_interval = max(1, nits // (num_frames - 1))
 
-    u_list, v_list, t_list = [], [], []
+    frames, t_list = [], []           # frames[k] is a list of one NxN array per species
     min_steady_state_check_time = min_steady_state_check_frac * T
 
     for t in range(nits + 1):
         if t % save_interval == 0 or t == nits:
-            u_list.append(u.copy())
-            v_list.append(v.copy())
+            frames.append([f.copy() for f in fields])
             t_list.append(t * dt)
 
             if early_stop and len(t_list) > 1 and t_list[-1] > min_steady_state_check_time:
-                u_diff = np.max(np.abs(u_list[-1] - u_list[-2]))
-                v_diff = np.max(np.abs(v_list[-1] - v_list[-2]))
-                diff = max(u_diff, v_diff)
+                diff = max(np.max(np.abs(a - b)) for a, b in zip(frames[-1], frames[-2]))
                 if diff < ss_tolerance:
                     print(f'Steady state at t = {t_list[-1]:.2f}', flush=True)
                     break
@@ -276,36 +276,32 @@ def simulate_reaction_cpu(reaction, params, diff_coeffs, initial_condition,
         if t == nits:
             break
 
-        fast_laplacian(u, lap_u)
-        fast_laplacian(v, lap_v)
+        for f, lap in zip(fields, laps):
+            fast_laplacian(f, lap)
 
-        uv = np.column_stack((u.flatten(), v.flatten()))
-        Fu, Fv = reaction(uv, params)
+        uv = np.column_stack([f.flatten() for f in fields])
+        rates = reaction(uv, params)
 
-        if hasattr(Fu, 'detach'):
-            Fu = Fu.detach().cpu().numpy()
-        if hasattr(Fv, 'detach'):
-            Fv = Fv.detach().cpu().numpy()
+        new_fields = []
+        for f, lap, D, F in zip(fields, laps, diff_coeffs, rates):
+            if hasattr(F, 'detach'):
+                F = F.detach().cpu().numpy()
+            new_fields.append(f + dt * (D * lap * inv_dx2 + F.reshape(N, N)))
+        fields = new_fields
 
-        Fu = Fu.reshape(N, N)
-        Fv = Fv.reshape(N, N)
-
-        u = u + dt * (du * lap_u * inv_dx2 + Fu)
-        v = v + dt * (dv * lap_v * inv_dx2 + Fv)
-
-        if not np.isfinite(u).all() or not np.isfinite(v).all():
+        if not all(np.isfinite(f).all() for f in fields):
             # Should not happen now that dt respects the CFL limit, but
             # fail loudly rather than silently saving a file of NaNs --
             # that is exactly how the first Brusselator/Schnakenberg
             # sweep produced 101 frames of garbage without any warning.
             raise FloatingPointError(
                 f"Simulation diverged to NaN/inf at t={t * dt:.4f} (step {t}/{nits}). "
-                f"dt={dt:.3e}, CFL limit={cfl_limit:.3e}, D=({du}, {dv}).")
+                f"dt={dt:.3e}, CFL limit={cfl_limit:.3e}, D={tuple(diff_coeffs)}.")
 
         if t % max(1, nits // 10) == 0 and t > 0:
             print(f"Progress: {(t / nits) * 100:.0f}%", flush=True)
 
-    u_array = np.stack([np.stack([uf, vf], axis=-1) for uf, vf in zip(u_list, v_list)]).astype(np.float32)
+    u_array = np.stack([np.stack(frame, axis=-1) for frame in frames]).astype(np.float32)
     x_array = np.linspace(0, L, N, dtype=np.float32)
     t_array = np.array(t_list, dtype=np.float32)
 
@@ -320,8 +316,13 @@ if __name__ == '__main__':
         config = json.load(f)
 
     save_path = config["save_path"]
-    diff_coeffs = (float(config["du"]), float(config["dv"]))
     reaction_str = config["reaction"]
+    # One coefficient per species: "diff_coeffs": [d1, d2, ...], or the
+    # two-species keys "du", "dv" that older configs use.
+    if "diff_coeffs" in config:
+        diff_coeffs = tuple(float(d) for d in config["diff_coeffs"])
+    else:
+        diff_coeffs = (float(config["du"]), float(config["dv"]))
 
     if reaction_str not in REACTION_REGISTRY:
         raise ValueError(f"Unknown reaction function specified: {reaction_str}. "
@@ -348,7 +349,8 @@ if __name__ == '__main__':
         spec["fn"], params, diff_coeffs,
         initial_condition=initial_condition, T=T, early_stop=early_stop,
         num_frames=num_frames, dt_cap=dt_cap)
-    animate_u_array(u_array, t_array, name=f'{save_name}.gif', titles=("u", "v"))
+    animate_u_array(u_array, t_array, name=f'{save_name}.gif',
+                    titles=tuple(SPECIES_TITLES[:u_array.shape[-1]]))
 
     training_data = format_u_array_to_training_data(u_array, x_array, t_array)
     torch.save({'training_data': training_data}, f'{save_name}.pt')

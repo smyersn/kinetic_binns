@@ -87,7 +87,8 @@ def l0_scale(null, floor, current, floor_epoch, eql):
     scale = explainable
     fraction = explainable / max(null, 1e-12)
     print(f"  Explainable range:            {explainable:.4e}  ({100 * fraction:.1f}% of null)")
-    print(f"  Gates: {n_gates} ({eql.total_features} features x {eql.n_free} free row(s))")
+    print(f"  Gates: {n_gates} ({eql.l0_gates[0].num_gates} per row over "
+          f"{eql.total_features} features x {eql.n_free} free row(s))")
     print(f"  l0_scale = explainable = {scale:.4e}")
     if fraction < 0.1:
         print("  WARNING: terms reduce PDE loss by <10%. The residual is dominated "

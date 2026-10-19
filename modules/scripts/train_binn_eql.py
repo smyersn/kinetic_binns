@@ -79,6 +79,8 @@ class RunConfig:
     include_increasing_hill: bool = True
     include_decreasing_hill: bool = True
     include_constant: bool = False   # constant term in the polynomial library (feed/source rates)
+    gate_per_term: bool = False      # True: the duplicate copies of each library term share one
+                                     # L0 gate, so L0 counts terms, not copies (see eql_layer.py)
     # Surface-fit resolution and cost
     fourier_scale: float = 1.0       # spread of Fourier frequencies; raise for fine/fast patterns
     fourier_mapping_size: int = 64   # number of Fourier frequencies
@@ -87,6 +89,9 @@ class RunConfig:
     surface_lr_schedule: str = "onecycle"   # Phase 1 surface LR: "onecycle" (warm up, then anneal
                                             # to ~0) or "constant" (base LR throughout -- how the
                                             # surface trained before the OneCycle fix)
+    surface_ema_epochs: Optional[float] = None   # Phase 1 surface weight averaging over ~this many
+                                                 # epochs (None = off); validation, best-surface
+                                                 # selection and the restored surface use the average
     physics_steps_per_epoch: Optional[int] = None   # fixed Phase 2-4 steps; None = one per data batch
     phase_ends: Optional[list] = None               # (p1, p2, p3) end epochs; None = PHASE_ENDS
     gls_max_weight: float = 50.0  # 1.0 = no GLS activity weighting
@@ -150,6 +155,7 @@ def build_binn(cfg, train_data):
         include_increasing_hill=cfg.include_increasing_hill,
         include_decreasing_hill=cfg.include_decreasing_hill,
         include_constant=cfg.include_constant,
+        gate_per_term=cfg.gate_per_term,
         fourier_scale=cfg.fourier_scale,
         fourier_mapping_size=cfg.fourier_mapping_size,
         gls_max_weight=cfg.gls_max_weight)
@@ -293,10 +299,15 @@ def main(run_dir):
                                            cfg.surface_lr_schedule)
     print(f"Surface weight decay: {cfg.surface_weight_decay:g}; "
           f"Phase 1 LR schedule: {cfg.surface_lr_schedule}", flush=True)
+    eql = binn.reaction.eql_layer
+    print(f"L0 gates: {'one per term' if cfg.gate_per_term else 'one per copy'} -- "
+          f"{eql.n_gates} gate(s) over {eql.total_features} column(s) x {eql.n_free} row(s)",
+          flush=True)
     loss_fn = BINNLoss(binn, l0_pricing=cfg.l0_pricing)
     trainer = Trainer(binn, loss_fn, optimizer, scheduler, out_dir=str(run_dir),
                       validation=cfg.validation,
-                      physics_steps_per_epoch=cfg.physics_steps_per_epoch)
+                      physics_steps_per_epoch=cfg.physics_steps_per_epoch,
+                      surface_ema_epochs=cfg.surface_ema_epochs)
  
     initial_epoch = 0
     checkpoint = run_dir / 'latest_checkpoint.pt'

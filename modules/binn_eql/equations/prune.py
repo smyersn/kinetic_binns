@@ -11,7 +11,12 @@ Applied once after training, in order:
     5. zero weak terms again
 
 Weights and gates exist only for *free* rows of the EQL head, so every edit
-indexes free rows; mirror species follow automatically. Hill (n, K) are
+indexes free rows; mirror species follow automatically.
+
+Gates are indexed through gate.gate_of(column): with gate_per_term=True
+several columns (the copies of one term) share a gate, and a gate is closed
+only once none of its columns carries weight. With one gate per column this
+is exactly the original behaviour. Hill (n, K) are
 shared by all rows, so Hill merges move weight on every row.
 """
 import numpy as np
@@ -25,14 +30,29 @@ CLOSED_GATE = -10.0  # log_alpha for a gate that is effectively always closed
 # ----------------------------------------------------------------------
 # Primitive edits
 # ----------------------------------------------------------------------
-def _move_term(eql, row, src, dst):
-    """Add column src's weight into dst on one row, zero src, and close its gate."""
+def _close_unused_gates(eql, row):
+    """Close every gate on `row` none of whose columns carries weight."""
+    gate = eql.l0_gates[row]
     W = eql.fc.weight.data
-    log_alpha = eql.l0_gates[row].log_alpha.data
+    for g in range(gate.num_gates):
+        if all(torch.abs(W[row, c]) < 1e-8 for c in gate.columns_of(g)):
+            gate.log_alpha.data[g] = CLOSED_GATE
+
+
+def _move_term(eql, row, src, dst):
+    """Add column src's weight into dst on one row, zero src, and close its gate if unused."""
+    W = eql.fc.weight.data
+    gate = eql.l0_gates[row]
+    log_alpha = gate.log_alpha.data
+    g_src, g_dst = gate.gate_of(src), gate.gate_of(dst)
     W[row, dst] += W[row, src]
     W[row, src] = 0.0
-    log_alpha[dst] = torch.max(log_alpha[dst], log_alpha[src])
-    log_alpha[src] = CLOSED_GATE
+    if g_src != g_dst:
+        # Shared gate (copies of one term): nothing to move, and it must stay
+        # open for dst. Different gates: dst takes the more open of the two.
+        log_alpha[g_dst] = torch.max(log_alpha[g_dst], log_alpha[g_src])
+        if all(torch.abs(W[row, c]) < 1e-8 for c in gate.columns_of(g_src)):
+            log_alpha[g_src] = CLOSED_GATE
 
 
 def _is_active(eql, col):
@@ -65,7 +85,7 @@ def zero_weak_terms(eql, threshold):
         _, _, effective = effective_weights(eql, s_idx)
         weak = torch.abs(effective) < threshold
         eql.fc.weight.data[row, weak] = 0.0
-        eql.l0_gates[row].log_alpha.data[weak] = CLOSED_GATE
+        _close_unused_gates(eql, row)
 
 
 def merge_duplicate_polynomials(eql):

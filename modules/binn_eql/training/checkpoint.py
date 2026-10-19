@@ -11,8 +11,10 @@ def load_weights(model, path, device=None):
 
 
 def save_checkpoint(path, *, epoch, model, optimizer, scheduler,
-                    train_losses, val_losses, param_history, loss_state):
+                    train_losses, val_losses, param_history, loss_state, extra=None):
+    """extra: optional dict of further entries (e.g. the surface weight average)."""
     torch.save({
+        **(extra or {}),
         'epoch': epoch,
         'model_state': model.state_dict(),
         'optimizer_state': optimizer.state_dict(),

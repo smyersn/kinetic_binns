@@ -12,7 +12,12 @@ Trainer.fit runs the four-phase schedule of training/phases.py. Each epoch:
 
 One-time work at phase boundaries (restoring the best surface, measuring the
 loss scales) is done in _enter_phase.
+
+With surface_ema_epochs set, Phase 1 also keeps a running average of the
+surface's weights (training/ema.py). Validation, best-surface selection and
+the surface restored for Phases 2-4 then all use the averaged weights.
 """
+import contextlib
 import os
 import time
 
@@ -22,6 +27,7 @@ from modules.binn_eql.equations.extract import extract_params
 from modules.binn_eql.equations.format import write_equations
 from modules.binn_eql.training.checkpoint import (
     load_checkpoint, load_weights, save_checkpoint, save_weights)
+from modules.binn_eql.training.ema import WeightEMA
 from modules.binn_eql.training.phases import PhaseSchedule
 from modules.utils.time_remaining import time_remaining
 
@@ -79,12 +85,19 @@ class Trainer:
                  resolution of the data affects only the surface fit (Phase 1)
                  and runs at different resolutions get identical reaction
                  training.
+    surface_ema_epochs
+                 None (default): off. A number: during Phase 1, keep an
+                 exponential moving average of the surface's weights spanning
+                 roughly this many epochs, and use the averaged weights for
+                 validation, best-surface selection and the surface restored
+                 for Phases 2-4. Given in epochs so it means the same at any
+                 data size; converted to a per-step decay in fit().
     """
 
     def __init__(self, model, loss_fn, optimizer, scheduler=None, out_dir='.',
                  save_prefix=None, mass_weight=1.0, validation='sampled',
                  log_every=1000, checkpoint_minutes=10.0, floor_track_every=100,
-                 physics_steps_per_epoch=None):
+                 physics_steps_per_epoch=None, surface_ema_epochs=None):
         if validation not in ('sampled', 'full_cache'):
             raise ValueError(f"validation must be 'sampled' or 'full_cache', got {validation!r}")
         self.model = model
@@ -96,6 +109,11 @@ class Trainer:
         self.mass_weight = mass_weight
         self.validation = validation
         self.physics_steps_per_epoch = physics_steps_per_epoch
+        if surface_ema_epochs is not None and surface_ema_epochs <= 0:
+            raise ValueError(f"surface_ema_epochs must be positive, got {surface_ema_epochs}")
+        self.surface_ema_epochs = surface_ema_epochs
+        self.surface_ema = None            # created in fit() if Phase 1 still has epochs to run
+        self._pending_ema_state = None     # from a checkpoint, applied when the EMA is created
         self.log_every = log_every
         self.checkpoint_minutes = checkpoint_minutes
         self.floor_track_every = floor_track_every
@@ -142,6 +160,8 @@ class Trainer:
         if initial_epoch == 0:
             self.param_history = _empty_param_history()
 
+        self._setup_surface_ema(initial_epoch, schedule, data_steps)
+
         # Best surface (Phase 1) and best model (Phase 4), recovered from the
         # loss history when resuming.
         best_surface = BestTracker.from_history(
@@ -185,14 +205,22 @@ class Trainer:
                          self._run_epoch(train_data, batch_size, weights, phase, train=True))
             if self.scheduler is not None and phase.steps_scheduler:
                 self.scheduler.step()
-            self._record(self.val_loss_dict,
-                         self._run_epoch(val_data, batch_size, weights, phase, train=False))
+            # In Phase 1 with weight averaging, validate and select with the
+            # averaged surface; the best one saved is what Phase 2 restores.
+            averaged = (self.surface_ema.applied()
+                        if self.surface_ema is not None and phase.number == 1
+                        else contextlib.nullcontext())
+            with averaged:
+                self._record(self.val_loss_dict,
+                             self._run_epoch(val_data, batch_size, weights, phase, train=False))
 
-            # --- 4. Model selection -------------------------------------
+                # --- 4. Model selection ---------------------------------
+                if phase.number == 1:
+                    # GLS, not total loss: only the surface trains in Phase 1.
+                    if best_surface.update(self.val_loss_dict['gls'][-1], epoch):
+                        save_weights(self.model, self._weights_path('best_phase1'))
+
             if phase.number == 1:
-                # GLS, not total loss: only the surface trains in Phase 1.
-                if best_surface.update(self.val_loss_dict['gls'][-1], epoch):
-                    save_weights(self.model, self._weights_path('best_phase1'))
                 if (phase1_early_stopping is not None and self._scheduler_finished(epoch)
                         and epoch - best_surface.epoch >= phase1_early_stopping):
                     print(f"Phase 1 early stopping at epoch {epoch} (no val GLS "
@@ -237,7 +265,10 @@ class Trainer:
                 if os.path.exists(path):
                     load_weights(self.model, path, device=train_data.device)
                     print(f"Restored best Phase-1 surface from epoch {best_surface.epoch} "
-                          f"(val GLS = {best_surface.value:.4e})", flush=True)
+                          f"(val GLS = {best_surface.value:.4e})"
+                          + (" [weight-averaged]" if self.surface_ema_epochs else ""),
+                          flush=True)
+                self.surface_ema = None       # Phase 1 is over; the average is no longer needed
                 self._surface_restored = True
             self.loss_fn.calibrate_physics(train_data)
 
@@ -274,6 +305,25 @@ class Trainer:
         for name, net in subnets.items():
             if net is not None:
                 net.requires_grad_(name in phase.trains)
+
+    def _setup_surface_ema(self, initial_epoch, schedule, data_steps):
+        """Create the Phase 1 surface weight average, if enabled and Phase 1 is not over."""
+        if not self.surface_ema_epochs or initial_epoch >= schedule.phase_1_end:
+            return
+        steps = self.surface_ema_epochs * data_steps
+        decay = 1.0 - 1.0 / max(steps, 1.0)
+        self.surface_ema = WeightEMA(self.model.surface_fitter, decay)
+        print(f"Phase 1 surface weight averaging over ~{self.surface_ema_epochs:g} epochs "
+              f"({data_steps} steps/epoch, decay {decay:.6f}); validation, best-surface "
+              f"selection and the restored surface use the average.", flush=True)
+        if self._pending_ema_state is not None:
+            self.surface_ema.load_state_dict(self._pending_ema_state)
+            print(f"Resumed the surface weight average "
+                  f"({self.surface_ema.num_updates} updates so far).", flush=True)
+        elif initial_epoch > 0:
+            print("Checkpoint has no surface weight average; it restarts from the "
+                  "current weights.", flush=True)
+        self._pending_ema_state = None
 
     def _check_scheduler_length(self, schedule):
         steps = getattr(self.scheduler, 'total_steps', None)
@@ -379,6 +429,8 @@ class Trainer:
             total.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
+            if self.surface_ema is not None and 'surface' in phase.trains:
+                self.surface_ema.update()
 
         return torch.stack([total, weighted[0], weighted[1],
                             weighted[2] + terms.soft_wall, mass]).detach()
@@ -457,7 +509,9 @@ class Trainer:
             os.path.join(self.out_dir, 'latest_checkpoint.pt'),
             epoch=epoch, model=self.model, optimizer=self.optimizer, scheduler=self.scheduler,
             train_losses=self.train_loss_dict, val_losses=self.val_loss_dict,
-            param_history=self.param_history, loss_state=self.loss_fn.state_dict())
+            param_history=self.param_history, loss_state=self.loss_fn.state_dict(),
+            extra={'surface_ema': (self.surface_ema.state_dict()
+                                   if self.surface_ema is not None else None)})
 
     def resume(self, path, device='cuda'):
         """Restore a checkpoint written by this Trainer. Returns the epoch to resume from."""
@@ -465,6 +519,7 @@ class Trainer:
         self.train_loss_dict = checkpoint['train_loss_dict']
         self.val_loss_dict = checkpoint['val_loss_dict']
         self.param_history = checkpoint['param_history']
+        self._pending_ema_state = checkpoint.get('surface_ema')
         if 'loss_state' in checkpoint:
             self.loss_fn.load_state_dict(checkpoint['loss_state'])
         else:

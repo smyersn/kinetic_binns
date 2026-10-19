@@ -60,6 +60,9 @@ class BINN(nn.Module):
     include_*             which term families populate the library
     include_constant      add a constant term to the polynomial library, for
                           reactions with a source or feed rate
+    gate_per_term         one L0 gate per library term, shared by its
+                          `duplicates` copies (see library/eql_layer.py);
+                          False = one gate per copy (original behaviour)
     param_bounds          soft bound on |w| (see BINNLoss.soft_wall)
     mcas                  two-state conserved system: learn one F, apply +F/-F
                           (see library/eql_layer.py)
@@ -75,7 +78,7 @@ class BINN(nn.Module):
                  mcas=False, species_names=None,
                  pde_t_cutoff=None, gls_max_weight=50.0,
                  include_poly=True, include_increasing_hill=True, include_decreasing_hill=True,
-                 include_constant=False):
+                 include_constant=False, gate_per_term=False):
         super().__init__()
         self.dimensions = dimensions
         self.species = species
@@ -119,7 +122,8 @@ class BINN(nn.Module):
             degree=degree, include_poly=include_poly,
             include_increasing_hill=include_increasing_hill,
             include_decreasing_hill=include_decreasing_hill,
-            include_constant=include_constant, mcas=mcas)
+            include_constant=include_constant, mcas=mcas,
+            gate_per_term=gate_per_term)
 
     # ------------------------------------------------------------------
     # Data-derived buffers

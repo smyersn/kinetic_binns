@@ -1,0 +1,14 @@
+{
+    "save_path": "/hpc/home/nsmyers1/projects/kinetic_binns/data/three_species/",
+    "reaction": "mcrd3_m3",
+    "diff_coeffs": [
+        0.01,
+        1.0,
+        0.04
+    ],
+    "k1": 1.85,
+    "k6": 1.13,
+    "k9": 1.44,
+    "k11": 1.2,
+    "u_total": 5.5
+}

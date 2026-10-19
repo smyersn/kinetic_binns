@@ -6,18 +6,22 @@ INTERFACE CONTRACT
 -------------------
 Every reaction function below has the exact same signature and return type:
 
-    reaction_fn(uv, params) -> (Fu, Fv)
+    reaction_fn(uv, params) -> (F_1, ..., F_S)
 
-`uv` is an (N, 2) array of [u, v] pairs; `params` is a plain list of
-scalars in the order given in REACTION_REGISTRY's "param_keys" below.
-Fu and Fv are always both returned -- there is no separate "conserved"
-calling convention to remember at the call site. Mass-conserving systems
+`uv` is an (N, S) array of concentrations, one column per species (S = 2
+unless the REACTION_SPECS entry says "species": 3); `params` is a plain list
+of scalars in the order given in REACTION_REGISTRY's "param_keys" below.
+One reaction term per species is always returned -- (Fu, Fv) for the
+two-species systems -- so there is no separate "conserved" calling
+convention to remember at the call site. Two-state mass-conserving systems
 enforce Fv = -Fu directly in the function body.
 
 ORGANIZATION
 ------------
     1. MASS-CONSERVING REACTIONS -- total u + v is conserved (Fv = -Fu).
     2. NON-CONSERVING REACTIONS  -- independent Fu, Fv.
+    2b. THREE-SPECIES MASS-CONSERVING REACTIONS -- u1 + u2 + u3 conserved,
+       one equation per species.
     3. INITIAL CONDITION BUILDERS
     4. REACTION_REGISTRY          -- full registry for compute-node code
                                       (paper_simulation.py etc.): each
@@ -116,9 +120,124 @@ def schnakenberg(uv, params):
 
 
 # ===========================================================
+# 2b. THREE-SPECIES MASS-CONSERVING REACTIONS
+# ===========================================================
+# Sostar & Dzeroski, "Minimal mass-conserving reaction-diffusion networks
+# for cell polarity", Table 2, models 1-3: the minimal four-reaction,
+# second-order mass-action networks that polarize. Species are u1, u2, u3
+# (columns 0, 1, 2; u, v, w in the BINN's naming). Each reaction only moves
+# mass between species, so F1 + F2 + F3 = 0 identically. Rate constants keep
+# the paper's numbering from its 24-reaction library (Table 1). The last
+# parameter, u_total, is for the initial condition and is ignored here.
+# In models 1-3, u2 is the fast-diffusing (cytosolic) component.
+
+def mcrd3_m1(uv, params):
+    """U1 -> U2 (k1), U2+U3 -> U1+U2 (k15), U2+U3 -> U1+U3 (k16), 2U1 -> U1+U3 (k20).
+    Params: k1, k15, k16, k20, u_total."""
+    u1, u2, u3 = uv[:, 0], uv[:, 1], uv[:, 2]
+    k1, k15, k16, k20 = params[:4]
+    F1 = -k1 * u1 + (k15 + k16) * u2 * u3 - k20 * u1**2
+    F2 = k1 * u1 - k16 * u2 * u3
+    F3 = -k15 * u2 * u3 + k20 * u1**2
+    return F1, F2, F3
+
+
+def mcrd3_m2(uv, params):
+    """U1 -> U2 (k1), U3 -> U2 (k6), U1+U2 -> U1+U3 (k9), 2U3 -> U1+U3 (k23).
+    Params: k1, k6, k9, k23, u_total."""
+    u1, u2, u3 = uv[:, 0], uv[:, 1], uv[:, 2]
+    k1, k6, k9, k23 = params[:4]
+    F1 = k23 * u3**2 - k1 * u1
+    F2 = k1 * u1 + k6 * u3 - k9 * u1 * u2
+    F3 = -k23 * u3**2 - k6 * u3 + k9 * u1 * u2
+    return F1, F2, F3
+
+
+def mcrd3_m3(uv, params):
+    """U1 -> U2 (k1), U1+U2 -> U1+U3 (k9), U3 -> U2 (k6), U1+U3 -> 2U1 (k11).
+    Params: k1, k6, k9, k11, u_total."""
+    u1, u2, u3 = uv[:, 0], uv[:, 1], uv[:, 2]
+    k1, k6, k9, k11 = params[:4]
+    F1 = k11 * u1 * u3 - k1 * u1
+    F2 = k1 * u1 + k6 * u3 - k9 * u1 * u2
+    F3 = k9 * u1 * u2 - k6 * u3 - k11 * u1 * u3
+    return F1, F2, F3
+
+
+def _numeric_jacobian(reaction, u, params, h=1e-7):
+    """d F_i / d u_j of reaction at the single state u (length S), by central differences."""
+    S = len(u)
+    J = np.zeros((S, S))
+    for j in range(S):
+        step = h * max(1.0, abs(u[j]))
+        up, um = u.copy(), u.copy()
+        up[j] += step
+        um[j] -= step
+        Fp = np.array(reaction(up[None, :], params), dtype=float).reshape(S)
+        Fm = np.array(reaction(um[None, :], params), dtype=float).reshape(S)
+        J[:, j] = (Fp - Fm) / (2 * step)
+    return J
+
+
+def mass_conserving_steady_state(reaction, params, u_total, species, n_starts=200, seed=0):
+    """
+    The homogeneous steady state u* (F(u*) = 0, sum(u*) = u_total, all u* > 0)
+    that is stable WITHOUT diffusion, as in the paper: the pattern then grows
+    from a Turing (diffusion-driven) instability of a state the reaction alone
+    would return to.
+
+    Newton's method from many fixed (seeded, so reproducible) starting points,
+    with the last equation replaced by the mass constraint (F sums to zero, so
+    that equation is redundant). A conserved system always has one zero
+    eigenvalue (shifting total mass); "stable" means every OTHER eigenvalue
+    has a negative real part.
+
+    Raises ValueError if no stable positive state exists -- with those
+    parameters there is nothing for a Turing pattern to grow from.
+    """
+    rng = np.random.default_rng(seed)
+    found = []
+    for _ in range(n_starts):
+        u = rng.dirichlet(np.ones(species)) * u_total
+        for _ in range(100):
+            F = np.array(reaction(u[None, :], params), dtype=float).reshape(species)
+            F[-1] = u.sum() - u_total
+            J = _numeric_jacobian(reaction, u, params)
+            J[-1, :] = 1.0
+            try:
+                du = np.linalg.solve(J, -F)
+            except np.linalg.LinAlgError:
+                break
+            u = u + du
+            if not np.all(np.isfinite(u)):
+                break
+            if np.max(np.abs(du)) < 1e-13 * max(1.0, u_total):
+                break
+        F = np.array(reaction(u[None, :], params), dtype=float).reshape(species)
+        if (np.all(np.isfinite(u)) and np.all(u > 1e-8 * u_total)
+                and np.max(np.abs(F)) < 1e-9 * max(1.0, u_total)
+                and not any(np.allclose(u, v, rtol=1e-6) for v in found)):
+            found.append(u)
+
+    stable = []
+    for u in found:
+        eig = np.sort(np.linalg.eigvals(_numeric_jacobian(reaction, u, params)).real)[::-1]
+        if eig[1] < -1e-8:          # eig[0] ~ 0 is the conserved-mass direction
+            stable.append(u)
+    if not stable:
+        raise ValueError(f"No positive steady state stable without diffusion for "
+                         f"params={params}, u_total={u_total} (found {len(found)} unstable).")
+    if len(stable) > 1:
+        print(f"WARNING: {len(stable)} stable steady states; using the first: "
+              f"{[np.round(u, 4).tolist() for u in stable]}", flush=True)
+    return stable[0]
+
+
+# ===========================================================
 # 3. INITIAL CONDITION BUILDERS
 # ===========================================================
-# Each returns a (u0, v0) tuple of NxN arrays. Signature is uniform --
+# Each returns a tuple of NxN arrays, one per species ((u0, v0) for the
+# two-species systems). Signature is uniform --
 # ic_builder(N, params_dict) -- even where a given builder ignores
 # params_dict, so REACTION_REGISTRY can call every entry the same way.
 
@@ -194,6 +313,25 @@ def ic_homogeneous_plus_noise(N, u_ss, v_ss, noise=0.01):
     return u, v
 
 
+def ic_steady_state_plus_noise(N, reaction, params, u_total, species, noise=0.01):
+    """
+    Mass-conserving Turing convention (the three-species polarity models):
+    the homogeneous steady state with total concentration u_total that is
+    stable without diffusion (mass_conserving_steady_state), times
+    (1 + noise * uniform(-1/2, 1/2)) independently at every point and for
+    every species. The paper uses a 30 dB perturbation (about 3% of u*);
+    noise=0.01 is gentler, and the pattern still forms by t ~ 45.
+
+    Relative rather than absolute noise keeps every species positive however
+    small its steady state is.
+    """
+    u_ss = mass_conserving_steady_state(reaction, params, u_total, species)
+    print(f"Homogeneous steady state (u_total={u_total}): {np.round(u_ss, 5).tolist()}",
+          flush=True)
+    return tuple(u_ss[s] * (1 + noise * (np.random.rand(N, N) - 0.5))
+                 for s in range(species))
+
+
 def ic_pulse_stimulus(N, rest=(0.0, 0.0), stim_u=1.0, stim_frac=0.1):
     """FitzHugh-Nagumo convention: resting state everywhere, with a
     localized stimulus strip along one edge to trigger an inward-
@@ -258,3 +396,21 @@ REACTION_REGISTRY = {
             N, u_ss=p["a"] + p["b"], v_ss=p["b"] / (p["a"] + p["b"]) ** 2),
     },
 }
+
+
+# --- Three-species, mass-conserving ---
+# The IC needs the reaction itself (to find the steady state), so these are
+# added in a loop rather than written out one by one.
+def _mcrd3_ic(fn, keys):
+    def builder(N, p):
+        return ic_steady_state_plus_noise(N, fn, [p[k] for k in keys],
+                                          u_total=p["u_total"], species=3)
+    return builder
+
+
+for _name, _fn in (("mcrd3_m1", mcrd3_m1), ("mcrd3_m2", mcrd3_m2), ("mcrd3_m3", mcrd3_m3)):
+    REACTION_REGISTRY[_name] = {
+        **REACTION_SPECS[_name],
+        "fn": _fn,
+        "ic_builder": _mcrd3_ic(_fn, REACTION_SPECS[_name]["param_keys"]),
+    }

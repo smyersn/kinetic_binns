@@ -1,0 +1,36 @@
+{
+    "training_data_path": "/hpc/home/nsmyers1/projects/kinetic_binns/data/three_species/mcrd3_m3_D_0.01_1.0_0.04_k1_1.85_k6_1.13_k9_1.44_k11_1.2_u_total_5.5.pt",
+    "reaction": "mcrd3_m3",
+    "params": [
+        1.85,
+        1.13,
+        1.44,
+        1.2,
+        5.5
+    ],
+    "batch_size": 50000,
+    "species": 3,
+    "dimensions": 2,
+    "epsilon": 0,
+    "points": 50,
+    "diff_coeffs": [
+        0.01,
+        1.0,
+        0.04
+    ],
+    "duplicates": 3,
+    "degree": 2,
+    "l0_weight": 1,
+    "l0_divide_by_equations": true,
+    "fourier_scale": 1.0,
+    "fourier_mapping_size": 64,
+    "surface_weight_decay": 0.001,
+    "surface_lr_schedule": "constant",
+    "surface_ema_epochs": null,
+    "gate_per_term": false,
+    "param_bounds": 10,
+    "mcas": false,
+    "include_poly": true,
+    "include_increasing_hill": false,
+    "include_decreasing_hill": false
+}

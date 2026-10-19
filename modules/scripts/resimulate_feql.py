@@ -145,9 +145,11 @@ def set_coefficient(binn, species, term, value):
 
     for d in range(eql.duplicates):
         eql.fc.weight[row, i + d * n_single] = 0.0
-    log_alpha = eql.l0_gates[row].log_alpha
-    log_alpha[i] = 10.0 if value != 0 else -10.0
-    gate = gate_values(eql.l0_gates[row])[i].item()
+    # With gate_per_term the copies share one gate; its index is gate_of(i).
+    # Copies 2.. were zeroed above, so opening/closing it affects only column i.
+    gate_module = eql.l0_gates[row]
+    gate_module.log_alpha[gate_module.gate_of(i)] = 10.0 if value != 0 else -10.0
+    gate = gate_values(gate_module)[i].item()
     eql.fc.weight[row, i] = value / gate if value != 0 else 0.0
 
 

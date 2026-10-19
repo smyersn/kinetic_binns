@@ -58,7 +58,21 @@ class HardConcreteGate(nn.Module):
       - deterministic gate in eval()
       - optional hard (binary) straight-through discretization
       - expected-L0 analytic estimate for the L0 penalty
-    
+      - optional tying: several columns can share one gate (column_index)
+
+    Tied gates
+    ----------
+    By default there is one gate per column. With column_index, num_gates
+    independent gates (log_alpha has num_gates entries) are spread over
+    len(column_index) columns: column c uses gate column_index[c]. Every
+    copy of a library term then opens and closes together, and the L0
+    penalty (expected_l0) counts terms, not copies.
+
+    forward(), get_gates() and get_binary_mask() always return one value per
+    COLUMN, so code that reads gates column by column works unchanged.
+    expected_l0() returns one value per GATE. Code that WRITES log_alpha
+    must go through gate_of(column) / columns_of(gate).
+
     Usage:
         gate = HardConcreteGate(num_gates)
         z = gate(sample=True, hard=False)   # training: stochastic continuous in (0,1)
@@ -72,9 +86,20 @@ class HardConcreteGate(nn.Module):
                  zeta=1.1,
                  eps=1e-6,
                  device=None,
-                 dtype=None):
+                 dtype=None,
+                 column_index=None):
         super().__init__()
         factory_kwargs = {'device': device, 'dtype': dtype}
+        # Column -> gate map. Non-persistent: it is rebuilt from the library
+        # on construction, so checkpoints are unchanged and old runs load.
+        if column_index is None:
+            column_index = torch.arange(num_gates)
+        column_index = torch.as_tensor(column_index, dtype=torch.long)
+        if column_index.numel() and (column_index.min() < 0 or column_index.max() >= num_gates):
+            raise ValueError(f"column_index must lie in [0, {num_gates}), got "
+                             f"[{column_index.min().item()}, {column_index.max().item()}]")
+        self.register_buffer('column_index', column_index.to(device), persistent=False)
+        self.tied = not torch.equal(column_index.cpu(), torch.arange(num_gates))
         # learnable log-alpha parameter controls gate probability
         self.log_alpha = nn.Parameter(torch.full((num_gates,), float(init_log_alpha), **factory_kwargs))
         # hard-concrete hyperparams (paper defaults used commonly)
@@ -112,7 +137,9 @@ class HardConcreteGate(nn.Module):
                          estimator (useful if you want discrete gates during forward while
                          keeping gradients through continuous relaxation).
         Returns:
-            z (Tensor): shape (num_gates,) with values in [0,1] (or {0,1} if hard=True).
+            z (Tensor): shape (num_columns,) with values in [0,1] (or {0,1} if hard=True).
+                        Tied columns share one sample, so copies of a term always
+                        see the same gate value.
         """
         device = self.log_alpha.device
         if self.training and sample:
@@ -131,7 +158,24 @@ class HardConcreteGate(nn.Module):
             z_hard = (z >= 0.5).to(z.dtype)
             # STE trick: replace forward value with z_hard but let gradients flow to z
             z = z_hard.detach() - z.detach() + z
-        return z
+        # One value per gate -> one value per column (identity when untied).
+        return z[self.column_index]
+
+    @property
+    def num_gates(self):
+        return self.log_alpha.numel()
+
+    @property
+    def num_columns(self):
+        return self.column_index.numel()
+
+    def gate_of(self, column):
+        """Index into log_alpha of the gate that controls `column`."""
+        return int(self.column_index[column].item())
+
+    def columns_of(self, gate):
+        """All columns controlled by gate `gate` (a list of ints)."""
+        return (self.column_index == gate).nonzero().reshape(-1).tolist()
     
     def get_gates(self):
         """
@@ -150,7 +194,8 @@ class HardConcreteGate(nn.Module):
     
     def expected_l0(self):
         """
-        Returns a vector of probabilities P(z > 0) for each gate.
+        Returns a vector of probabilities P(z > 0) for each gate
+        (num_gates entries: one per TERM when tied, not one per column).
         """
         factor = - (self.gamma) / (self.zeta)
         
