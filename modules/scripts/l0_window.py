@@ -208,7 +208,7 @@ def analyse_run(run_dir, device, cache_size, seed, ref):
     if cfg.reaction not in TRUE_SUPPORT:
         print(f"  no TRUE_SUPPORT entry for {cfg.reaction!r}; skipped")
         return None
-    if cfg.mcas:
+    if cfg.mcas or getattr(cfg, 'mass_conserved', False):
         print("  mcas run (one shared F); this script handles non-conserved runs only; skipped")
         return None
 

@@ -233,7 +233,8 @@ class BINNLoss:
         """'auto' resolved against the model: one equation (mcas) -> global."""
         if self.l0_pricing != 'auto':
             return self.l0_pricing
-        return 'global' if self.model.mcas else 'per_species'
+        conserved = self.model.mcas or getattr(self.model, 'mass_conserved', False)
+        return 'global' if conserved else 'per_species'
 
     @torch.no_grad()
     def full_cache_pde_per_species(self, zero_reaction=False):

@@ -47,7 +47,7 @@ class BaselineConfig:
     training_data_path: str
     reaction: str                 # key into REACTION_REGISTRY (ground truth)
     params: list                  # ground-truth reaction parameters
-    epsilon: float                # multiplicative noise level
+    epsilon: float                # noise level (meaning set by noise_model)
     points: int                   # interpolation grid (0 = native)
     diff_coeffs: list             # fixed D per species; [] to learn D
     degree: int = 3
@@ -57,6 +57,7 @@ class BaselineConfig:
     dimensions: int = 2
     true_diff_coeffs: list = field(default_factory=list)   # for scoring learned D only
     seed: int = 0                 # noise realisation, row subsampling, network init
+    noise_model: str = "multiplicative"   # see utils/noise_and_interpolate.py
     pde_t_cutoff: Optional[float] = None   # None: detect like the BINN does
     simulate: bool = True         # integrate the learned PDE and score the pattern
     options: dict = field(default_factory=dict)   # method-specific settings
@@ -104,7 +105,7 @@ def load_grid_data(cfg, n_reference=200_000):
     data = raw
     if cfg.epsilon != 0 or cfg.points != 0:
         data = noise_and_interpolate(raw.clone(), cfg.points, cfg.epsilon, cfg.dimensions,
-                                     cfg.species, multiplicative_noise=True)
+                                     cfg.species, noise_model=cfg.noise_model, seed=cfg.seed)
 
     U, x, t = format_training_data_to_u_array(data)
     U = U.double().numpy()
@@ -115,7 +116,8 @@ def load_grid_data(cfg, n_reference=200_000):
         cutoff = float(cfg.pde_t_cutoff)
     else:
         cutoff = unresolved_t_cutoff(data, cfg.dimensions, cfg.species)
-    print(f"Grid: {U.shape[0]} frames x {U.shape[1]} x {U.shape[2]}, noise {cfg.epsilon}; "
+    print(f"Grid: {U.shape[0]} frames x {U.shape[1]} x {U.shape[2]}, "
+          f"noise {cfg.epsilon} ({cfg.noise_model}, seed {cfg.seed}); "
           f"PDE t cutoff {cutoff:.4g} ({int((t < cutoff).sum())} leading frames left out)",
           flush=True)
 
@@ -565,4 +567,3 @@ def _json_default(obj):
     if isinstance(obj, tuple):
         return list(obj)
     raise TypeError(f"not JSON serialisable: {type(obj)}")
-

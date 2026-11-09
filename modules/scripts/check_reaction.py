@@ -47,7 +47,10 @@ def printed_reaction(binn, x):
     # Map reported equations back onto species (mcas mirrors are -1 x their row).
     cols = []
     for role, row in eql.species_role:
-        cols.append(rows[row] if role == 'free' else -rows[row])
+        if role == 'derived':
+            cols.append(-sum(rows))
+        else:
+            cols.append(rows[row] if role == 'free' else -rows[row])
     return torch.stack(cols, dim=1)
 
 

@@ -2,7 +2,37 @@ import torch
 import itertools
 import torch.nn.functional as F
 
-def noise_and_interpolate(training_data, num_points, epsilon, dimensions, species, multiplicative_noise=False):
+NOISE_MODELS = ('multiplicative', 'additive_std', 'additive')
+
+
+def noise_and_interpolate(training_data, num_points, epsilon, dimensions, species,
+                          multiplicative_noise=False, noise_model=None, seed=None):
+    """
+    Bilinear interpolation of every frame to num_points per side, then noise.
+
+    noise_model (None: 'multiplicative' if multiplicative_noise else 'additive'):
+        'multiplicative'  u * (1 + epsilon * N(0, 1)), clipped at 0: noise
+                          proportional to the value (the BINN literature's
+                          proportional-error model, which the GLS loss assumes)
+        'additive_std'    u + epsilon * std(u_s) * N(0, 1), NOT clipped: the
+                          SINDy / PDE-FIND convention, epsilon = noise as a
+                          fraction of each species' standard deviation over the
+                          whole (interpolated, noise-free) dataset. Use this to
+                          compare against PDE-FIND, weak SINDy, DeepMoD.
+        'additive'        u + epsilon * N(0, 1), clipped at 0 (absolute size;
+                          kept for old configs)
+
+    seed: if given, the noise comes from a torch.Generator seeded with it, so
+        the same (data, points, epsilon, noise_model, seed) always gives the
+        same noisy data -- the BINN and every baseline can be trained on
+        IDENTICAL noise. On CPU this draws the same numbers as
+        torch.manual_seed(seed) followed by the unseeded call.
+        None: the global random state (the original behaviour).
+    """
+    if noise_model is None:
+        noise_model = 'multiplicative' if multiplicative_noise else 'additive'
+    if noise_model not in NOISE_MODELS:
+        raise ValueError(f"noise_model must be one of {NOISE_MODELS}, got {noise_model!r}")
     device = training_data.device
     dtype = training_data.dtype
 
@@ -58,15 +88,28 @@ def noise_and_interpolate(training_data, num_points, epsilon, dimensions, specie
 
     training_data_interp = torch.cat(training_data_interp, dim=0)
 
-    if multiplicative_noise:
+    signal = training_data_interp[:, dimensions+1:]
+    if seed is None:
+        standard_normal = torch.randn_like(signal)
+    else:
+        generator = torch.Generator(device=signal.device).manual_seed(int(seed))
+        standard_normal = torch.randn(signal.shape, generator=generator,
+                                      device=signal.device, dtype=signal.dtype)
+
+    if noise_model == 'multiplicative':
         # Multiplicative noise
-        signal = training_data_interp[:, dimensions+1:]
-        relative_noise = 1 + torch.randn_like(signal) * epsilon
+        relative_noise = 1 + standard_normal * epsilon
         training_data_interp[:, dimensions+1:] = torch.clamp(signal * relative_noise, min=0)
-        
-    else: 
+
+    elif noise_model == 'additive_std':
+        # Additive Gaussian noise scaled per species to its standard deviation
+        # over the whole noise-free dataset; no clipping, as in the SINDy papers.
+        scale = signal.std(dim=0, keepdim=True)
+        training_data_interp[:, dimensions+1:] = signal + standard_normal * epsilon * scale
+
+    else:
         # Additive Gaussian noise and clip at zero
-        noise = torch.randn_like(training_data_interp[:, dimensions+1:]) * epsilon
-        training_data_interp[:, dimensions+1:] = torch.clamp(training_data_interp[:, dimensions+1:] + noise, min=0)
+        noise = standard_normal * epsilon
+        training_data_interp[:, dimensions+1:] = torch.clamp(signal + noise, min=0)
 
     return training_data_interp

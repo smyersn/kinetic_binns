@@ -122,10 +122,12 @@ def row_l0_scales(null, floor, eql, species_names):
 
     explainable = [n - f for n, f in zip(null, floor)]
 
-    # Which species each free row drives (its own, plus any mirrors of it).
+    # Which species each free row drives (its own, plus any mirrors of it;
+    # a derived species is driven by every free row).
     rows = [[] for _ in range(eql.n_free)]
-    for s, (_, row) in enumerate(eql.species_role):
-        rows[row].append(s)
+    for s, (role, row) in enumerate(eql.species_role):
+        for r in (range(eql.n_free) if role == 'derived' else [row]):
+            rows[r].append(s)
 
     print("\n--- L0 scale diagnostics (per-species pricing) ---")
     print(f"  Library: {eql.n_gates} gates")

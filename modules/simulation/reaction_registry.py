@@ -69,6 +69,28 @@ REACTION_SPECS = {
                     "T": 60, "early_stop": False, "dt_cap": 0.002},
     "schnakenberg": {"param_keys": ["a", "b"], "conserved": False,
                      "T": 300, "early_stop": False, "dt_cap": 0.005},
+    # Two-variable Oregonator (Tyson-Fife), the Belousov-Zhabotinsky reaction:
+    # eps du/dt = u - u^2 - f v (u - q)/(u + q),  dv/dt = u - v. Both are
+    # concentrations (positive). Excitable for f > ~1 + sqrt(2), where a broken
+    # wavefront curls into BZ spiral waves. The rational term is exactly
+    # -f v + 2 f v * [1 / (1 + u/q)]: a polynomial term plus a cross decreasing
+    # Hill term (v times a Hill function of u, n = 1, half-saturation q).
+    # Fast kinetics (rate ~1/eps), hence the small dt_cap. "wavefront_ic" gives
+    # the excited and refractory levels for the broken-wavefront initial condition.
+    # Barkley model: the minimal polynomial excitable medium.
+    # du/dt = k u (1 - u) (u - (v + b)/a) / eps,  dv/dt = k (u - v).
+    # Expanded, a degree-3 polynomial in u, v (u, u^2, u^3, u v, u^2 v; no
+    # constant, no Hill term). u stays in [0, 1] and v >= 0. A broken wavefront
+    # (u = 1 strip, refractory v = 0.8 behind it) curls into a spiral pair.
+    # k is an overall rate (a choice of time unit): k < 1 shrinks every
+    # coefficient by k with IDENTICAL patterns, provided D is multiplied by k
+    # and T, t_start by 1/k. The textbook model is k = 1.
+    "barkley": {"param_keys": ["a", "b", "eps", "k"], "conserved": False,
+                "T": 15, "early_stop": False, "dt_cap": 0.002,
+                "wavefront_ic": {"excited_u": 1.0, "refractory_v": 0.8}},
+    "oregonator": {"param_keys": ["eps", "f", "q"], "conserved": False,
+                   "T": 15, "early_stop": False, "dt_cap": 0.0005,
+                   "wavefront_ic": {"excited_u": 0.8, "refractory_v": 0.5}},
 
     # --- Three-species, mass-conserving (Sostar & Dzeroski, minimal MCRD
     # networks for cell polarity, Table 2 models 1-3) ---

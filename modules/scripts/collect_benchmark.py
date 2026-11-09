@@ -69,8 +69,10 @@ def score_binn(run_dir, device, simulate):
                          reaction=tcfg.reaction, params=tcfg.params, epsilon=tcfg.epsilon,
                          points=tcfg.points, diff_coeffs=list(tcfg.diff_coeffs or []),
                          degree=tcfg.degree, include_constant=tcfg.include_constant,
-                         mcas=tcfg.mcas, species=tcfg.species, dimensions=tcfg.dimensions,
-                         seed=seed)
+                         mcas=tcfg.mcas or (tcfg.mass_conserved and tcfg.species == 2),
+                         species=tcfg.species, dimensions=tcfg.dimensions,
+                         seed=tcfg.noise_seed if tcfg.noise_seed is not None else seed,
+                         noise_model=tcfg.noise_model)
     grid = load_grid_data(cfg)
 
     # Rebuild exactly as trained, load the best-validation weights, prune.

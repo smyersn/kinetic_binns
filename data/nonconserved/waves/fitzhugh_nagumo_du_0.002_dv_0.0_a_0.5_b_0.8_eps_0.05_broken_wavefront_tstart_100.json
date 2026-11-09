@@ -1,0 +1,13 @@
+{
+    "save_path": "/hpc/home/nsmyers1/projects/kinetic_binns/data/nonconserved/waves",
+    "reaction": "fitzhugh_nagumo",
+    "du": 0.002,
+    "dv": 0.0,
+    "a": 0.5,
+    "b": 0.8,
+    "eps": 0.05,
+    "T": 200,
+    "t_start": 100,
+    "num_frames": 101,
+    "ic": "broken_wavefront"
+}

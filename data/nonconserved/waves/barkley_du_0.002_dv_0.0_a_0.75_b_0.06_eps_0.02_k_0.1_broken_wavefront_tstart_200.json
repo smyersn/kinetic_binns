@@ -1,0 +1,15 @@
+{
+    "save_path": "/hpc/home/nsmyers1/projects/kinetic_binns/data/nonconserved/waves",
+    "reaction": "barkley",
+    "du": 0.002,
+    "dv": 0.0,
+    "a": 0.75,
+    "b": 0.06,
+    "eps": 0.02,
+    "k": 0.1,
+    "T": 150,
+    "t_start": 200,
+    "num_frames": 101,
+    "ic": "broken_wavefront",
+    "dt_cap": 0.02
+}

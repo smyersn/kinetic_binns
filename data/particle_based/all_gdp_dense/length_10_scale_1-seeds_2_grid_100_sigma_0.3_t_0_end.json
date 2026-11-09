@@ -1,0 +1,39 @@
+{
+  "source_xyz": "/hpc/home/nsmyers1/projects/kinetic_binns/modules/pbs/runs/all_gdp_dense/length_10_scale_1-seeds_2.xyz",
+  "source_cfg": "/hpc/home/nsmyers1/projects/kinetic_binns/modules/pbs/runs/all_gdp_dense/length_10_scale_1-seeds_2.cfg",
+  "L": 10.0,
+  "grid_res": 100,
+  "sigma": 0.3,
+  "units": "molecules/um^2",
+  "species_names": [
+    "active",
+    "inactive"
+  ],
+  "pool_members": {
+    "active": [
+      "Cdc42T",
+      "BemGEF42",
+      "complex_Ra_Cdc42T",
+      "complex_Cdc42Dm_BemGEF42"
+    ],
+    "inactive": [
+      "Cdc42Dm",
+      "Cdc42Dc",
+      "complex_Cdc42Dm_BemGEF42",
+      "complex_Cdc42Dm_BemGEFm",
+      "complex_Cdc42D_Ra"
+    ]
+  },
+  "diff_coeffs": [
+    0.0025000000000000027,
+    3.976741855622159
+  ],
+  "diff_coeffs_theory_inactive": 3.9814285714285718,
+  "t_offset": 0.0,
+  "t_min": 0.0,
+  "t_max": null,
+  "stride": 1,
+  "n_frames": 201,
+  "total_molecules_spread": 0.0,
+  "missing_required": []
+}

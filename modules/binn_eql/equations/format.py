@@ -43,7 +43,8 @@ def generate_equation(binn, eps=1e-12, species_names=None):
                     terms.append(_hill(float(c), term, float(K), float(n), names, increasing))
 
         label = f"F({', '.join(names)})" if binn.mcas else names[eq_idx]
-        equations.append({'species': label, 'terms': terms})
+        derived = binn.reaction.eql_layer.species_role[eq_idx][0] == 'derived'
+        equations.append({'species': label, 'terms': terms, 'derived': derived})
     return equations
 
 
@@ -51,7 +52,13 @@ def equations_as_strings(binn, eps=1e-12, species_names=None):
     """Flat list of lines: a header per equation followed by its terms."""
     lines = []
     for eq in generate_equation(binn, eps=eps, species_names=species_names):
-        lines.append(f"{eq['species']} =" if binn.mcas else f"d{eq['species']}/dt =")
+        if binn.mcas:
+            lines.append(f"{eq['species']} =")
+        elif eq.get('derived'):
+            others = " + ".join(f"d{n}/dt" for n in (species_names or binn.species_names)[:-1])
+            lines.append(f"d{eq['species']}/dt = -({others}) =   [derived: mass conserved]")
+        else:
+            lines.append(f"d{eq['species']}/dt =")
         lines.extend(eq['terms'] or ['0'])
     return lines
 

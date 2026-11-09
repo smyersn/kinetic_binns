@@ -1,5 +1,19 @@
 #!/bin/bash
 
+# Species written to the .xyz (molpos). Cdc42 pools:
+#   active   (biosensor NR channel): Cdc42T, BemGEF42, complex_Ra_Cdc42T
+#   inactive (membrane, GFP - NR):   Cdc42Dm (+ the Dm-containing complexes)
+#   cytosol  (not seen in TIRF):     Cdc42Dc
+# The complexes last a single time step (catalysis probability 1), so they are
+# tiny, but writing them makes the Cdc42 total exact. BemGEF* are ground truth
+# for checking the reduced (quasi-steady GEF) model.
+OUTPUT_SPECIES=(
+    Cdc42T Cdc42Dm Cdc42Dc BemGEF42
+    complex_Cdc42Dm_BemGEF42 complex_Cdc42Dm_BemGEFm
+    complex_Ra_Cdc42T complex_Cdc42D_Ra
+    BemGEFm BemGEFc
+)
+
 # --- Configuration Generator Function ---
 generate_cfg() {
     local fileprefix="$1"
@@ -18,7 +32,7 @@ generate_cfg() {
     # Physics Parameters
     local rho=0.05
     local dt=0.0001
-    
+
     # Calculate rates (using bc for floating point arithmetic)
     local k1a=10
     local k1b=40
@@ -156,21 +170,61 @@ compartment_mol $n_FarGEF FarGEF full_domain
 compartment_mol 500 Ric full_domain
 compartment_mol 2000 Ram full_domain
 output_files $xyz_name
-cmd N $samplingrate molpos Cdc42T $xyz_name
-cmd N $samplingrate molpos Cdc42Dm $xyz_name
-cmd N $samplingrate molpos Cdc42Dc $xyz_name
 EOF
+
+    # Output coordinates: every species that carries Cdc42, plus Bem1-GEF, so any
+    # observation model (biosensor channels, TIRF footprint) can be built later
+    # from the ground truth. One line per species per output time, in this order;
+    # pbs_to_training_data.py reads the order from these cmd lines.
+    for species in "${OUTPUT_SPECIES[@]}"; do
+        echo "cmd N $samplingrate molpos $species $xyz_name" >> "$cfg_name"
+    done
 }
 
 # --- Main Script ---
 
-dir_name="second_go"
-directory="runs/${dir_name}"
+# --- Cluster settings (edit these) ---
+# Smoldyn executable (built with cmake inside the source folder)
+smoldyn_exec="/hpc/home/nsmyers1/smoldyn-2.75/build/smoldyn"
+# CPU partition and time limit (check the partition's maximum with: sinfo -o "%P %l")
+partition="common"
+time_limit="48:00:00"
+# Where runs are written. The .xyz files are large (see disk note below), so point
+# this at a scratch/project filesystem if your home directory has a quota.
+runs_root="runs"
+# After Smoldyn finishes, each job converts its .xyz into training data (.pt, .json)
+# and an animation (.gif) with pbs_to_training_data.py (kept next to this script).
+# That needs torch, numpy and matplotlib, so run this script with the env active:
+#   conda activate binns && bash run_sims.sh
+python_exec="$(command -v python)"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+converter="${script_dir}/pbs_to_training_data.py"
+
+if [ ! -f "$converter" ]; then
+    echo "ERROR: $converter not found; put pbs_to_training_data.py next to run_sims.sh" >&2
+    exit 1
+fi
+if ! "$python_exec" -c "import torch, numpy, matplotlib" 2>/dev/null; then
+    echo "ERROR: '$python_exec' cannot import torch/numpy/matplotlib; run 'conda activate binns' first" >&2
+    exit 1
+fi
+if [ ! -x "$smoldyn_exec" ]; then
+    echo "ERROR: Smoldyn not found at $smoldyn_exec" >&2
+    exit 1
+fi
+
+dir_name="third_go"
+directory="${runs_root}/${dir_name}"
 mkdir -p "$directory"
 
 # Simulation parameters
-tstop=1000
-samplingrate=50000
+# Output every samplingrate * dt = 50000 * 1e-4 = 5 s -> 101 frames over 500 s.
+# (tstop=300 with samplingrate=30000 also gives 101 frames, 3 s apart, all in the
+# window where the spot forms and coarsens.)
+# Disk: ~17 bytes per molecule per frame, so length 30 / scale 3 (~117k molecules)
+# is ~2 MB per frame, ~0.2 GB per run. Check quota before submitting.
+tstop=300
+samplingrate=30000
 k_l=8.8623
 
 # Concentrations
@@ -178,24 +232,21 @@ c_cdc42=$(echo "3000 / ($k_l^2)" | bc -l)
 c_BemGEF=$(echo "400 / ($k_l^2)" | bc -l)
 c_FarGEF=$(echo "30 / ($k_l^2)" | bc -l)
 
-# Smoldyn Executable Path
-smoldyn_exec="/nas/longleaf/home/smyersn/software/smoldyn_install/bin/smoldyn"
-
 # Ranges
 # Seeds: 1 to 5
-# Lengths: 20 to 50 step 10
+# Lengths: 20 to 30 step 10
 # Scales: 1 to 3
 
-for j in {1..5}; do
-    for l in {20..30..10}; do
-        for scale in {1..3}; do
+for j in {1..3}; do
+    for l in 10; do
+        for scale in 3 5; do        
             curr_seed=$j
             curr_length=$l
             curr_fileprefix="length_${curr_length}_scale_${scale}-seeds_${curr_seed}"
-            
+
             # Calculate molecule counts
             l_sq=$(echo "$l * $l" | bc)
-            
+
             # Cdc42
             raw_n_Cdc42=$(echo "$c_cdc42 * $l_sq" | bc -l)
             rounded_n_Cdc42=$(printf "%.0f" "$raw_n_Cdc42")
@@ -225,13 +276,15 @@ for j in {1..5}; do
 
             # 2. Submit the job immediately
             cfg_file="${curr_fileprefix}.cfg"
-            
+
             echo "Submitting job for $cfg_file..."
-            
+
             # -D sets working directory to $directory so xyz outputs go there
             # -J sets job name
-            sbatch -p general -N 1 -J Smoldyn -t 264:00:00 --mem=5g -D "$directory" --wrap="$smoldyn_exec $cfg_file"
-            
+            # The conversion runs only if Smoldyn finished successfully (&&); its
+            # output (D_eff, mass check, saved paths) goes to the job's slurm-*.out.
+            sbatch -p "$partition" -N 1 -J Smoldyn -t "$time_limit" --mem=5g -D "$directory" --wrap="$smoldyn_exec $cfg_file && $python_exec $converter ${curr_fileprefix}.xyz --gif"
+
         done
     done
 done

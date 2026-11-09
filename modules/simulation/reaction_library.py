@@ -87,6 +87,27 @@ def fitzhugh_nagumo(uv, params):
     return Fu, Fv
 
 
+def barkley(uv, params):
+    """Barkley excitable medium. Params: a, b, eps, k. Polynomial (degree 3),
+    u in [0, 1], v >= 0; spiral waves from a broken wavefront. k is an overall
+    rate (time unit): it scales every coefficient without changing the patterns."""
+    u, v = uv[:, 0], uv[:, 1]
+    a, b, eps, k = params
+    Fu = k * u * (1 - u) * (u - (v + b) / a) / eps
+    Fv = k * (u - v)
+    return Fu, Fv
+
+
+def oregonator(uv, params):
+    """Two-variable Oregonator (Belousov-Zhabotinsky). Params: eps, f, q.
+    Positive concentrations; excitable spiral waves for f > ~1 + sqrt(2)."""
+    u, v = uv[:, 0], uv[:, 1]
+    eps, f, q = params
+    Fu = (u - u**2 - f * v * (u - q) / (u + q)) / eps
+    Fv = u - v
+    return Fu, Fv
+
+
 def gray_scott(uv, params):
     """Autocatalytic v; u is fed/replenished. Params: feed, kill.
     Spots, stripes, mitosis-like splitting, or chaos depending on the pair."""
@@ -332,6 +353,122 @@ def ic_steady_state_plus_noise(N, reaction, params, u_total, species, noise=0.01
                  for s in range(species))
 
 
+def ode_limit_cycle(reaction, params, start, h=1e-3, settle=200.0, max_time=2000.0, n_samples=400):
+    """
+    One period of the well-mixed (no diffusion) limit cycle of a two-species
+    oscillator, as (u_samples, v_samples, period), sampled at n_samples equal
+    time steps starting from an upward crossing of u through start[0].
+    start: the homogeneous steady state; the ODE is kicked 1% off it, run for
+    `settle` time units onto the cycle, then followed for one period.
+    Raises ValueError if the steady state does not oscillate.
+    """
+    u, v = start[0] * 1.01, start[1]
+
+    def step(u, v):
+        fu, fv = reaction(np.array([[u, v]]), params)
+        return u + h * float(fu[0]), v + h * float(fv[0])
+
+    for _ in range(int(settle / h)):
+        u, v = step(u, v)
+    us, vs, crossings, t, prev = [], [], [], 0.0, u
+    while len(crossings) < 2:
+        u, v = step(u, v)
+        t += h
+        if prev < start[0] <= u:
+            crossings.append(t)
+        if crossings:
+            us.append(u)
+            vs.append(v)
+        prev = u
+        if t > max_time:
+            raise ValueError("no limit cycle: the steady state does not oscillate for these "
+                             "parameters, so a spiral initial condition cannot be built "
+                             "(use parameters past the Hopf bifurcation).")
+    idx = np.linspace(0, len(us) - 1, n_samples).astype(int)
+    return np.array(us)[idx], np.array(vs)[idx], crossings[1] - crossings[0]
+
+
+def ic_spiral_pair(N, reaction, params, steady_state, separation=0.5, L=10.0):
+    """
+    Counter-rotating spiral pair for an oscillatory (Hopf) system: every
+    point starts on the ODE limit cycle, at the phase given by the angle
+    around core 1 minus the angle around core 2. The cores sit at
+    (L/2 -+ separation*L/2, L/2). A periodic box needs zero net winding,
+    which is why spirals come in opposite-handed pairs; with
+    separation = 0.5 the cores are equally far apart directly and across
+    the boundary, so the pair stays put.
+
+    Compared with steady state + noise, which seeds a random number of
+    cores at random places inside a bulk oscillation, this gives one clean,
+    symmetric pair of spirals whose waves take over the whole domain.
+    """
+    lu, lv, period = ode_limit_cycle(reaction, params, steady_state)
+    x = np.linspace(0, L, N)                      # the simulator's grid coordinates
+    X, Y = np.meshgrid(x, x)
+    d = separation * L / 2
+    theta1 = np.arctan2(Y - L / 2, X - (L / 2 - d))
+    theta2 = np.arctan2(Y - L / 2, X - (L / 2 + d))
+    phase = np.mod(theta1 - theta2, 2 * np.pi) / (2 * np.pi)          # 0..1 around the cycle
+    k = np.minimum((phase * len(lu)).astype(int), len(lu) - 1)
+    print(f"Spiral-pair IC: limit-cycle period {period:.2f}, u on cycle in "
+          f"[{lu.min():.3f}, {lu.max():.3f}], cores {2 * d:.2f} apart", flush=True)
+    return lu[k].astype(np.float64), lv[k].astype(np.float64)
+
+
+def ode_rest_state(reaction, params, start=(0.1, 0.1), h=0.001, max_time=1000.0, tol=1e-8):
+    """Stable well-mixed rest state of a two-species excitable system, found by
+    integrating the ODE from `start` until it stops moving. The default start
+    avoids (0, 0), which is a (non-rest) fixed point of the Oregonator."""
+    u, v = start
+    for _ in range(int(max_time / h)):
+        fu, fv = reaction(np.array([[u, v]]), params)
+        fu, fv = float(fu[0]), float(fv[0])
+        u, v = u + h * fu, v + h * fv
+        if abs(fu) < tol and abs(fv) < tol:
+            return u, v
+    raise ValueError("no stable rest state reached: a broken-wavefront spiral needs an "
+                     "EXCITABLE medium (stable rest state), not an oscillatory one.")
+
+
+def ic_broken_wavefront(N, reaction, params, length_frac=0.5, width=0.4, refractory_depth=1.0,
+                        L=10.0, excited_u=None, refractory_v=None):
+    """
+    Spiral initiation in an EXCITABLE medium (FitzHugh-Nagumo here): the
+    classic broken-wavefront ("cross-field") protocol. Everything starts at
+    rest except
+      * an excited strip (fast variable on its other branch, u = -sign(u_rest) * 1.2)
+        of the given width, spanning the middle length_frac of the domain at y = L/2;
+      * a refractory band of depth refractory_depth directly below it (slow
+        variable pushed toward the excited side), so the wave can only travel up.
+    Both free ends of the strip curl into spirals: a counter-rotating pair
+    (a periodic box needs zero net winding), in the middle of the domain, that
+    keeps emitting tightly wound waves for as long as the run lasts.
+    excited_u / refractory_v: the excited fast-variable level and refractory
+    slow-variable level. None = the FitzHugh-Nagumo defaults (other branch of
+    the cubic; slow variable pushed toward it). Positive-concentration models
+    (oregonator) give their own via REACTION_SPECS[...]["wavefront_ic"].
+    """
+    u_r, v_r = ode_rest_state(reaction, params)
+    u_ex = -np.sign(u_r) * 1.2 if excited_u is None else excited_u
+    v_ref = v_r + 0.6 * (u_ex - u_r) if refractory_v is None else refractory_v
+    x = np.linspace(0, L, N)                      # the simulator's grid coordinates
+    X, Y = np.meshgrid(x, x)
+    span = np.abs(X - L / 2) < length_frac * L / 2
+    u = np.full((N, N), u_r, dtype=np.float64)
+    v = np.full((N, N), v_r, dtype=np.float64)
+    u[span & (Y > L / 2) & (Y < L / 2 + width)] = u_ex
+    v[span & (Y <= L / 2) & (Y > L / 2 - refractory_depth)] = v_ref
+    print(f"Broken-wavefront IC: rest ({u_r:.3f}, {v_r:.3f}), excited u = {u_ex:.2f}, "
+          f"strip length {length_frac * L:.2f}", flush=True)
+    return u, v
+
+
+def ic_oregonator_rest(N, p, noise=0.001):
+    """Oregonator rest state (the positive fixed point, u = v) + small noise."""
+    u_r, v_r = ode_rest_state(oregonator, [p["eps"], p["f"], p["q"]])
+    return ic_homogeneous_plus_noise(N, u_r, v_r, noise=noise)
+
+
 def ic_pulse_stimulus(N, rest=(0.0, 0.0), stim_u=1.0, stim_frac=0.1):
     """FitzHugh-Nagumo convention: resting state everywhere, with a
     localized stimulus strip along one edge to trigger an inward-
@@ -388,6 +525,20 @@ REACTION_REGISTRY = {
         **REACTION_SPECS["brusselator"],
         "fn": brusselator,
         "ic_builder": lambda N, p: ic_homogeneous_plus_noise(N, u_ss=p["a"], v_ss=p["b"] / p["a"]),
+    },
+    "barkley": {
+        **REACTION_SPECS["barkley"],
+        "fn": barkley,
+        # Default: the rest state (0, 0) plus small POSITIVE noise (stays at rest
+        # -- the medium is excitable). Use "ic": "broken_wavefront" for spirals.
+        "ic_builder": lambda N, p: ic_homogeneous_plus_noise(N, 0.005, 0.005, noise=0.01),
+    },
+    "oregonator": {
+        **REACTION_SPECS["oregonator"],
+        "fn": oregonator,
+        # Default: homogeneous rest state + small noise (stays at rest -- the
+        # medium is excitable). Use "ic": "broken_wavefront" for spirals.
+        "ic_builder": lambda N, p: ic_oregonator_rest(N, p),
     },
     "schnakenberg": {
         **REACTION_SPECS["schnakenberg"],

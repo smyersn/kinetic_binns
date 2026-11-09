@@ -23,8 +23,15 @@ def gate_values(gate):
 def effective_weights(eql, s_idx):
     """
     (raw w, gates z, effective w*z) for species s_idx, as detached tensors.
-    Mirror species are reported as -1 x their primary.
+    Mirror species are reported as -1 x their primary. A derived species
+    (mass_conserved) is minus the sum of every free row's effective
+    coefficients; it has no weights or gates of its own, so raw = effective
+    and the gates are reported as 1.
     """
+    role, _ = eql.species_role[s_idx]
+    if role == 'derived':
+        effective = -sum(effective_weights(eql, s)[2] for s in eql.free_species)
+        return effective.clone(), torch.ones_like(effective), effective
     w_row, gate, sign = eql.get_species_weight_and_gate(s_idx)
     raw = (sign * w_row).detach()
     gates = gate_values(gate)

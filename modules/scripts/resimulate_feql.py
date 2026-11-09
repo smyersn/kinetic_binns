@@ -134,7 +134,8 @@ def set_coefficient(binn, species, term, value):
 
     role, row = eql.species_role[names.index(species)]
     if role != 'free':
-        raise ValueError(f"{species} mirrors another species (mcas); set that one instead")
+        raise ValueError(f"{species} is not learned directly (mcas mirror or mass_conserved "
+                         f"derived species); set the free species' terms instead")
 
     powers = parse_term(term, names)
     if powers not in eql.poly.powers:

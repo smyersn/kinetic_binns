@@ -15,6 +15,11 @@ mcas=True   Two-state active/inactive systems (species == 2 only). One
             reaction F is learned for species 0; species 1 is a *mirror*
             that receives exactly -F (same weights, same gate sample), so
             u + v is conserved by construction rather than by training.
+mass_conserved=True, species >= 3
+            The first S-1 species are free; the last is *derived*:
+            F_last = -(F_1 + ... + F_{S-1}), so u_1 + ... + u_S is conserved
+            by construction. (With species == 2 the BINN uses the mcas path,
+            which is the same thing.)
 
 Gates per copy or per term
 --------------------------
@@ -40,12 +45,19 @@ from modules.binn_eql.library.hill import DuplicateHillFeatures
 from modules.binn_eql.library.polynomial import PolynomialFeatures
 
 
-def resolve_species_roles(species, mcas):
+def resolve_species_roles(species, mcas, mass_conserved=False):
     """
     Returns (species_role, free_species):
-        species_role[s]  ('free', row) or ('mirror', row of its primary)
+        species_role[s]  ('free', row), ('mirror', row of its primary), or
+                         ('derived', None): minus the sum of every free row
         free_species     species indices that own a row of fc.weight, in row order
     """
+    if mass_conserved and not mcas:
+        if species < 3:
+            raise ValueError("EQLLayer mass_conserved is for species >= 3; two-species "
+                             "conserved systems use mcas=True (BINN does this for you).")
+        return ([('free', i) for i in range(species - 1)] + [('derived', None)],
+                list(range(species - 1)))
     if not mcas:
         return [('free', i) for i in range(species)], list(range(species))
     if species != 2:
@@ -60,7 +72,7 @@ class EQLLayer(nn.Module):
     def __init__(self, species, duplicates, max_scale, degree,
                  include_poly=True, include_increasing_hill=True,
                  include_decreasing_hill=True, include_constant=False,
-                 mcas=False, gate_per_term=False):
+                 mcas=False, gate_per_term=False, mass_conserved=False):
         super().__init__()
         if not (include_poly or include_increasing_hill or include_decreasing_hill):
             raise ValueError("EQLLayer needs at least one of include_poly, "
@@ -73,6 +85,7 @@ class EQLLayer(nn.Module):
         self.include_increasing_hill = include_increasing_hill
         self.include_decreasing_hill = include_decreasing_hill
         self.mcas = mcas
+        self.mass_conserved = mass_conserved
         self.gate_per_term = gate_per_term
         self.register_buffer('max_scale', max_scale)  # (1, species): 99th pct of |u|
 
@@ -111,7 +124,8 @@ class EQLLayer(nn.Module):
         self.total_features = self.num_poly_features + self.num_hill_features
 
         # --- One linear head and one gate per free species ---------------
-        self.species_role, self.free_species = resolve_species_roles(species, mcas)
+        self.species_role, self.free_species = resolve_species_roles(species, mcas,
+                                                                     mass_conserved)
         self.n_free = len(self.free_species)
         self.fc = nn.Linear(self.total_features, self.n_free, bias=False)
         column_index = self._column_terms() if gate_per_term else None
@@ -167,7 +181,11 @@ class EQLLayer(nn.Module):
         reference implementation in hill.py), column for column.
         """
         n, K = self.hill_parameters()
-        x_n = x[:, self.hill_input_idx].pow(n)                 # (batch, num_hill)
+        # Concentrations are physically >= 0, but the surface can dip slightly
+        # below 0 where the data are near 0 (e.g. with additive noise, which
+        # is not clipped). x^n with non-integer n is NaN for x < 0, so Hill
+        # inputs are clamped; polynomial features are left as they are.
+        x_n = x[:, self.hill_input_idx].clamp_min(0).pow(n)   # (batch, num_hill)
         denominator = 1 + K * x_n
         numerator = torch.where(self.hill_is_increasing, x_n, torch.ones_like(x_n))
         features = numerator / denominator
@@ -191,11 +209,16 @@ class EQLLayer(nn.Module):
         # is exactly -F rather than an independent sample.
         gates = [self.l0_gates[i]() for i in range(self.n_free)]
 
+        rows = [(features * (self.fc.weight[r] * gates[r])).sum(dim=1, keepdim=True)
+                for r in range(self.n_free)]
         outputs = []
         for role, row in self.species_role:
-            sign = 1.0 if role == 'free' else -1.0
-            outputs.append((features * (sign * self.fc.weight[row] * gates[row]))
-                           .sum(dim=1, keepdim=True))
+            if role == 'free':
+                outputs.append(rows[row])
+            elif role == 'mirror':
+                outputs.append(-rows[row])
+            else:                                   # derived: conserves the total exactly
+                outputs.append(-torch.stack(rows, dim=0).sum(dim=0))
         return torch.cat(outputs, dim=1)
 
     def get_species_weight_and_gate(self, s_idx):
@@ -205,6 +228,9 @@ class EQLLayer(nn.Module):
         have no row of their own to modify.
         """
         role, row = self.species_role[s_idx]
+        if role == 'derived':
+            raise ValueError(f"species {s_idx} is derived (-sum of the free rows) and has no "
+                             f"weight row of its own; use equations.extract.effective_weights")
         sign = 1.0 if role == 'free' else -1.0
         return self.fc.weight[row], self.l0_gates[row], sign
 

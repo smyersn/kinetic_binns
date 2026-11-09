@@ -45,6 +45,10 @@ methods = {
 # --- SWEEP HYPERPARAMETERS (These compute every combination) ---
 repeats = 3                 # noise realisations; repeat k uses seed k
 epsilons = [0.0, 0.01, 0.05, 0.1]
+# Noise model (see utils/noise_and_interpolate.py):
+#   "additive_std"   u + eps * std(u) * N(0,1): the PDE-FIND / SINDy convention
+#   "multiplicative" u * (1 + eps * N(0,1)): the BINN proportional-error model
+noise_models = ["additive_std"]
 points = [50, 100]
 degrees = [3]
 include_constant_list = [True]
@@ -52,9 +56,9 @@ learn_diffusion_list = [False]          # [False, True] to also learn D
 selection_tols = [0.01]                 # SINDy methods: term must hold > tol of the explainable range
 simulate = True                         # integrate each learned PDE (pattern check)
 
-keys = ['dataset_config', 'method_name', 'eps', 'pt', 'deg', 'const', 'learn_D', 'tol']
+keys = ['dataset_config', 'method_name', 'eps', 'pt', 'deg', 'const', 'learn_D', 'tol', 'noise']
 iterables = [dataset_configs, list(methods), epsilons, points, degrees,
-             include_constant_list, learn_diffusion_list, selection_tols]
+             include_constant_list, learn_diffusion_list, selection_tols, noise_models]
 
 python_script = "/hpc/home/nsmyers1/projects/kinetic_binns/modules/scripts/run_baseline.py"
 
@@ -84,6 +88,8 @@ for combo in itertools.product(*iterables):
     base = Path(data_path).stem
     base_model_name = f"{dir_path}/{base}/{c['method_name']}_"
     if c['eps'] != 0.0:      base_model_name += f"epsilon_{c['eps']}_"
+    if c['eps'] != 0.0 and c['noise'] != "multiplicative":
+        base_model_name += "addstd_" if c['noise'] == "additive_std" else f"{c['noise']}_"
     if c['pt'] != 0:         base_model_name += f"points_{c['pt']}_"
     base_model_name += f"degree_{c['deg']}_"
     if c['const']:           base_model_name += "const_"
@@ -111,6 +117,7 @@ for combo in itertools.product(*iterables):
             "include_constant": c['const'],
             "mcas": mcas,
             "seed": repeat,
+            "noise_model": c['noise'],
             "simulate": simulate,
             "options": options,
         }

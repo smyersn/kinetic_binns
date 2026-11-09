@@ -66,6 +66,10 @@ class BINN(nn.Module):
     param_bounds          soft bound on |w| (see BINNLoss.soft_wall)
     mcas                  two-state conserved system: learn one F, apply +F/-F
                           (see library/eql_layer.py)
+    mass_conserved        the total of all species is conserved by construction:
+                          equations are learned for the first S-1 species and the
+                          last is minus their sum. With species == 2 this is
+                          exactly mcas (and runs through the same code).
     pde_t_cutoff          earliest time used in the PDE residual; None to detect
                           an unresolved initial transient automatically
     gls_max_weight        maximum per-frame GLS activity weight; 1.0 disables
@@ -78,7 +82,7 @@ class BINN(nn.Module):
                  mcas=False, species_names=None,
                  pde_t_cutoff=None, gls_max_weight=50.0,
                  include_poly=True, include_increasing_hill=True, include_decreasing_hill=True,
-                 include_constant=False, gate_per_term=False):
+                 include_constant=False, gate_per_term=False, mass_conserved=False):
         super().__init__()
         self.dimensions = dimensions
         self.species = species
@@ -86,13 +90,21 @@ class BINN(nn.Module):
         self.duplicates = duplicates
         self.degree = degree
         self.param_bounds = param_bounds
+        if mass_conserved and species == 2:
+            mcas = True                 # identical model; keeps the 2-species path unchanged
         self.mcas = mcas
+        self.mass_conserved = bool(mass_conserved or mcas)
         self.species_names = species_names or default_species_names(species)
 
         # mcas changes how many equations are *reported*, not how many
         # species are simulated: both species still get a PDE residual.
         self.n_equations = 1 if mcas else species
-        self.conservation_groups = [[0, 1]] if mcas else []
+        if mcas:
+            self.conservation_groups = [[0, 1]]
+        elif mass_conserved:
+            self.conservation_groups = [list(range(species))]
+        else:
+            self.conservation_groups = []
 
         # Buffers are built on CPU here, whatever train_data's device, so
         # that __init__ never mixes devices; .to(device) later moves them
@@ -123,7 +135,8 @@ class BINN(nn.Module):
             include_increasing_hill=include_increasing_hill,
             include_decreasing_hill=include_decreasing_hill,
             include_constant=include_constant, mcas=mcas,
-            gate_per_term=gate_per_term)
+            gate_per_term=gate_per_term,
+            mass_conserved=bool(mass_conserved and not mcas))
 
     # ------------------------------------------------------------------
     # Data-derived buffers
@@ -180,6 +193,11 @@ class BINN(nn.Module):
     def forward(self, inputs):
         """Surface-fitter concentrations (batch, species) at physical (x, t)."""
         return self.surface_fitter(self.normalize(inputs))
+
+    @property
+    def n_learned_equations(self):
+        """Equations with their own coefficients (mirrors and derived species excluded)."""
+        return self.reaction.eql_layer.n_free
 
     @property
     def learns_diffusion(self):

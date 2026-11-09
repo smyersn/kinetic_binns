@@ -193,7 +193,7 @@ def fast_laplacian(mat, out_lap):
 
 def simulate_reaction_cpu(reaction, params, diff_coeffs, initial_condition,
                            T=50, early_stop=True, min_steady_state_check_frac=0.1,
-                           num_frames=101, dt_cap=0.0001):
+                           num_frames=101, dt_cap=0.0001, t_start=0.0):
     """
     reaction: callable (uv, params) -> (F_1, ..., F_S), with uv an (N*N, S)
         array. Every entry in REACTION_REGISTRY['...']['fn'] already matches
@@ -219,6 +219,13 @@ def simulate_reaction_cpu(reaction, params, diff_coeffs, initial_condition,
         neither stiff kinetics nor large diffusion coefficients can
         silently destabilize the integration. Comes from
         REACTION_SPECS[name]['dt_cap'].
+    t_start: burn-in. The system is integrated from the initial condition
+        for t_start time units WITHOUT saving, then num_frames snapshots are
+        saved across the next T time units. Saved times are shifted so the
+        first saved frame is t = 0 (simulate_feql starts from the t == 0
+        frame). Use it to skip the near-uniform growth from noise, e.g. so
+        every frame of an oscillatory system already contains waves and the
+        learned PDE is simulated from a developed wave state. 0 = off.
     """
     species = len(initial_condition)
     N = N_GRID
@@ -242,10 +249,13 @@ def simulate_reaction_cpu(reaction, params, diff_coeffs, initial_condition,
     cfl_limit = dx**2 / (4 * max_D) if max_D > 0 else float('inf')
     dt = min(dt_cap, cfl_safety * cfl_limit)
 
-    nits = int(T / dt)
+    n_burn = int(round(t_start / dt))  # burn-in steps, not saved
+    nits = n_burn + int(T / dt)        # last step index
     limiter = 'reaction dt_cap' if dt_cap <= cfl_safety * cfl_limit else 'diffusion CFL'
     print(f"Using dt={dt:.3e} ({limiter} is binding; CFL limit={cfl_limit:.3e} "
-          f"for max D={max_D}, dt_cap={dt_cap:.3e}) -> {nits:,} steps", flush=True)
+          f"for max D={max_D}, dt_cap={dt_cap:.3e}) -> {nits:,} steps"
+          + (f" ({n_burn:,} burn-in steps to t={t_start:g}, not saved; saved times start at 0)"
+             if n_burn else ""), flush=True)
 
     inv_dx2 = 1.0 / (dx**2)
 
@@ -257,15 +267,15 @@ def simulate_reaction_cpu(reaction, params, diff_coeffs, initial_condition,
 
     # Save a snapshot every `save_interval` steps, chosen so exactly
     # num_frames snapshots span the full run.
-    save_interval = max(1, nits // (num_frames - 1))
+    save_interval = max(1, (nits - n_burn) // (num_frames - 1))
 
     frames, t_list = [], []           # frames[k] is a list of one NxN array per species
     min_steady_state_check_time = min_steady_state_check_frac * T
 
     for t in range(nits + 1):
-        if t % save_interval == 0 or t == nits:
+        if t >= n_burn and ((t - n_burn) % save_interval == 0 or t == nits):
             frames.append([f.copy() for f in fields])
-            t_list.append(t * dt)
+            t_list.append((t - n_burn) * dt)
 
             if early_stop and len(t_list) > 1 and t_list[-1] > min_steady_state_check_time:
                 diff = max(np.max(np.abs(a - b)) for a, b in zip(frames[-1], frames[-2]))
@@ -332,23 +342,53 @@ if __name__ == '__main__':
     params_dict = {k: config[k] for k in spec["param_keys"]}
     params = [params_dict[k] for k in spec["param_keys"]]
 
+    # "seed": seeds the random initial condition, so several datasets with the
+    # same parameters but different random starts can be made (absent = unseeded).
+    if config.get("seed") is not None:
+        np.random.seed(int(config["seed"]))
     initial_condition = spec["ic_builder"](N_GRID, params_dict)
+    # "ic": "spiral_pair" (two-species oscillators such as brusselator and
+    # schnakenberg past their Hopf bifurcation): replace the registry IC with a
+    # counter-rotating spiral pair on the ODE limit cycle. The registry IC is
+    # still built first; its mean is the homogeneous steady state the cycle is
+    # found from. "spiral_separation" (fraction of L, default 0.5) sets how far
+    # apart the two cores are.
+    # "ic": "broken_wavefront" (excitable media, i.e. fitzhugh_nagumo): an
+    # excited strip with a refractory band behind it, whose two free ends curl
+    # into a tightly wound counter-rotating spiral pair. "strip_length_frac"
+    # (default 0.5) sets how much of the domain the strip spans.
+    ic_name = config.get("ic", "default")
+    if ic_name == "spiral_pair":
+        from modules.simulation.reaction_library import ic_spiral_pair
+        steady_state = [float(f.mean()) for f in initial_condition]
+        initial_condition = ic_spiral_pair(N_GRID, spec["fn"], params, steady_state,
+                                           separation=config.get("spiral_separation", 0.5))
+    elif ic_name == "broken_wavefront":
+        from modules.simulation.reaction_library import ic_broken_wavefront
+        initial_condition = ic_broken_wavefront(N_GRID, spec["fn"], params,
+                                                length_frac=config.get("strip_length_frac", 0.5),
+                                                **spec.get("wavefront_ic", {}))
+    elif ic_name != "default":
+        raise ValueError(f'unknown "ic": {ic_name!r} '
+                         f'(use "default", "spiral_pair" or "broken_wavefront")')
     T = config.get("T", spec["T"])
     early_stop = config.get("early_stop", spec["early_stop"])
     num_frames = config.get("num_frames", 101)  # keep dataset size consistent across reactions
                                                  # regardless of how large T needs to be
     dt_cap = config.get("dt_cap", spec["dt_cap"])
+    t_start = config.get("t_start", 0.0)        # burn-in before the first saved frame
 
     json_filename = os.path.basename(config_path)
     base_name = json_filename.replace('.json', '')
     save_name = os.path.join(save_path, base_name)
 
-    print(f"Starting simulation for: {save_name} (T={T}, early_stop={early_stop})", flush=True)
+    print(f"Starting simulation for: {save_name} (T={T}, early_stop={early_stop}, "
+          f"t_start={t_start}, seed={config.get('seed')}, ic={ic_name})", flush=True)
 
     u_array, x_array, t_array = simulate_reaction_cpu(
         spec["fn"], params, diff_coeffs,
         initial_condition=initial_condition, T=T, early_stop=early_stop,
-        num_frames=num_frames, dt_cap=dt_cap)
+        num_frames=num_frames, dt_cap=dt_cap, t_start=t_start)
     animate_u_array(u_array, t_array, name=f'{save_name}.gif',
                     titles=tuple(SPECIES_TITLES[:u_array.shape[-1]]))
 
